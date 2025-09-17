@@ -6,6 +6,24 @@ const jwt = require('jsonwebtoken');
 const app = express();
 app.use(express.json());
 
+// Middleware: Verify JWT Token
+function authenticateToken(req, res, next) {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1]; // Expecting "Bearer <token>"
+
+  if (!token) {
+    return res.status(401).json({ error: 'Access denied. Token required.' });
+  }
+
+  jwt.verify(token, process.env.JWT_SECRET || 'supersecretkey', (err, user) => {
+    if (err) {
+      return res.status(403).json({ error: 'Invalid or expired token' });
+    }
+    req.user = user; // store user info in request
+    next();
+  });
+}
+
 // PostgreSQL connection
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -90,6 +108,33 @@ app.post('/api/users/login', async (req, res) => {
       token,
       user: { id: user.id, name: user.name, email: user.email, whatsapp_number: user.whatsapp_number }
     });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Add Fuel Log (Protected)
+app.post('/api/fuel/add', authenticateToken, async (req, res) => {
+  try {
+    const { amount, price_per_liter, odometer } = req.body;
+
+    if (!amount || !price_per_liter || !odometer) {
+      return res.status(400).json({ error: 'Amount, price per liter, and odometer are required' });
+    }
+
+    // Calculate liters
+    const liters = amount / price_per_liter;
+
+    // Insert into DB
+    const result = await pool.query(
+      `INSERT INTO fuel_logs (user_id, amount, price_per_liter, liters, odometer)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING id, amount, price_per_liter, liters, odometer, created_at`,
+      [req.user.id, amount, price_per_liter, liters, odometer]
+    );
+
+    res.status(201).json({ fuel_log: result.rows[0] });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Server error' });
