@@ -330,14 +330,29 @@ app.post('/api/reminders/mark-sent', authenticateToken, async (req, res) => {
 
 
 
+
 const PORT = process.env.PORT || 3000;
 
-// Cron job: check documents daily at 8 AM
-cron.schedule('0 8 * * *', async () => {
-  console.log("⏰ Running daily expiry check...");
+// Manual trigger for expiry check (Protected)
+app.post('/api/reminders/run-check', authenticateToken, async (req, res) => {
+  try {
+    await runExpiryCheck();
+    res.json({ message: "Expiry check executed manually ✅" });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Manual expiry check failed' });
+  }
+});
+
+// Cron job: run daily at 8 AM
+cron.schedule('0 8 * * *', runExpiryCheck);
+
+// Function: Check for expiring documents and create reminders
+async function runExpiryCheck() {
+  console.log("⏰ Running expiry check now...");
   try {
     const result = await pool.query(`
-      SELECT d.id, d.doc_type, d.number, d.expiry_date, u.email, u.whatsapp_number
+      SELECT d.id, d.doc_type, d.number, d.expiry_date, u.email, u.whatsapp_number, u.id as user_id
       FROM documents d
       JOIN users u ON d.user_id = u.id
       WHERE d.expiry_date <= NOW() + INTERVAL '14 days'
@@ -345,22 +360,21 @@ cron.schedule('0 8 * * *', async () => {
 
     for (let row of result.rows) {
       await pool.query(
-      `INSERT INTO reminders (user_id, document_id, reminder_date)
-       SELECT $1, $2, NOW()
-       WHERE NOT EXISTS (
-       SELECT 1 FROM reminders 
-       WHERE document_id = $2 
-      AND sent = false
-    )`,
-    [row.user_id, row.id]
-);
+        `INSERT INTO reminders (user_id, document_id, reminder_date)
+         SELECT $1, $2, NOW()
+         WHERE NOT EXISTS (
+           SELECT 1 FROM reminders 
+           WHERE document_id = $2 AND sent = false
+         )`,
+        [row.user_id, row.id]
+      );
 
-      // TODO: Send email/WhatsApp via API
-      console.log(`Reminder prepared for ${row.doc_type} expiring on ${row.expiry_date} for ${row.email}`);
+      console.log(`✅ Reminder prepared for ${row.doc_type} expiring on ${row.expiry_date} for ${row.email}`);
     }
   } catch (err) {
-    console.error("Cron job error:", err);
+    console.error("Expiry check error:", err);
   }
-});
+}
+
 
 app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
