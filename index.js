@@ -1,6 +1,7 @@
 const express = require('express');
 const { Pool } = require('pg');
 const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken'); 
 
 const app = express();
 app.use(express.json());
@@ -49,6 +50,52 @@ app.post('/api/users/register', async (req, res) => {
     }
   }
 });
+
+// User Login API
+app.post('/api/users/login', async (req, res) => {
+  try {
+    const { email, whatsapp_number, password } = req.body;
+
+    if ((!email && !whatsapp_number) || !password) {
+      return res.status(400).json({ error: 'Email or WhatsApp and password are required' });
+    }
+
+    // Find user by email OR WhatsApp
+    const result = await pool.query(
+      `SELECT * FROM users WHERE email = $1 OR whatsapp_number = $2`,
+      [email || null, whatsapp_number || null]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(400).json({ error: 'User not found' });
+    }
+
+    const user = result.rows[0];
+
+    // Compare password
+    const match = await bcrypt.compare(password, user.password_hash);
+    if (!match) {
+      return res.status(400).json({ error: 'Invalid password' });
+    }
+
+    // Generate JWT token (valid for 7 days)
+    const token = jwt.sign(
+      { id: user.id, email: user.email },
+      process.env.JWT_SECRET || 'supersecretkey',
+      { expiresIn: '7d' }
+    );
+
+    res.json({ 
+      message: 'Login successful',
+      token,
+      user: { id: user.id, name: user.name, email: user.email, whatsapp_number: user.whatsapp_number }
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
