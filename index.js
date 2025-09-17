@@ -186,6 +186,30 @@ app.get('/api/fuel/history', authenticateToken, async (req, res) => {
   }
 });
 
+// Add Service Log (Protected)
+app.post('/api/service/add', authenticateToken, async (req, res) => {
+  try {
+    const { description, cost, odometer } = req.body;
+
+    if (!description || !cost || !odometer) {
+      return res.status(400).json({ error: 'Description, cost, and odometer are required' });
+    }
+
+    const result = await pool.query(
+      `INSERT INTO service_logs (user_id, description, cost, odometer)
+       VALUES ($1, $2, $3, $4)
+       RETURNING id, description, cost, odometer, created_at`,
+      [req.user.id, description, cost, odometer]
+    );
+
+    res.status(201).json({ service_log: result.rows[0] });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+
 
 
 const PORT = process.env.PORT || 3000;
