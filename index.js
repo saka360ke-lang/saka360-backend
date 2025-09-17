@@ -209,6 +209,92 @@ app.post('/api/service/add', authenticateToken, async (req, res) => {
   }
 });
 
+// Get Service History with Totals (Protected)
+app.get('/api/service/history', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, description, cost, odometer, created_at
+       FROM service_logs
+       WHERE user_id = $1
+       ORDER BY created_at DESC`,
+      [req.user.id]
+    );
+
+    const service_logs = result.rows;
+
+    if (service_logs.length === 0) {
+      return res.json({ service_logs: [], totals: null });
+    }
+
+    // Totals
+    const total_spent = service_logs.reduce((sum, log) => sum + Number(log.cost), 0);
+    const avg_cost = total_spent / service_logs.length;
+
+    res.json({
+      service_logs,
+      totals: {
+        total_spent,
+        avg_cost,
+        count: service_logs.length
+      }
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Add Document/License (Protected)
+app.post('/api/docs/add', authenticateToken, async (req, res) => {
+  try {
+    const { doc_type, number, expiry_date } = req.body;
+
+    if (!doc_type || !expiry_date) {
+      return res.status(400).json({ error: 'Document type and expiry date are required' });
+    }
+
+    const result = await pool.query(
+      `INSERT INTO documents (user_id, doc_type, number, expiry_date)
+       VALUES ($1, $2, $3, $4)
+       RETURNING id, doc_type, number, expiry_date, created_at`,
+      [req.user.id, doc_type, number || null, expiry_date]
+    );
+
+    res.status(201).json({ document: result.rows[0] });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Get All Documents (Protected)
+app.get('/api/docs/history', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, doc_type, number, expiry_date, created_at
+       FROM documents
+       WHERE user_id = $1
+       ORDER BY expiry_date ASC`,
+      [req.user.id]
+    );
+
+    const documents = result.rows;
+
+    // Add "days left" field
+    const today = new Date();
+    documents.forEach(doc => {
+      const expiry = new Date(doc.expiry_date);
+      const diffTime = expiry - today;
+      doc.days_left = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+    });
+
+    res.json({ documents });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
 
 
 
