@@ -2,6 +2,8 @@ const express = require('express');
 const { Pool } = require('pg');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken'); 
+const cron = require('node-cron');
+
 
 const app = express();
 app.use(express.json());
@@ -295,8 +297,70 @@ app.get('/api/docs/history', authenticateToken, async (req, res) => {
   }
 });
 
+// Mark Reminder as Sent (Protected)
+app.post('/api/reminders/mark-sent', authenticateToken, async (req, res) => {
+  try {
+    const { reminder_id } = req.body;
+
+    if (!reminder_id) {
+      return res.status(400).json({ error: 'Reminder ID is required' });
+    }
+
+    // Update reminder to sent=true
+    const result = await pool.query(
+      `UPDATE reminders
+       SET sent = true
+       WHERE id = $1 AND user_id = $2
+       RETURNING id, document_id, sent, reminder_date`,
+      [reminder_id, req.user.id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Reminder not found or not owned by user' });
+    }
+
+    res.json({ message: 'Reminder marked as sent ✅', reminder: result.rows[0] });
+  } catch (err) {
+    console.error("Mark-sent error:", err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+
 
 
 
 const PORT = process.env.PORT || 3000;
+
+// Cron job: check documents daily at 8 AM
+cron.schedule('0 8 * * *', async () => {
+  console.log("⏰ Running daily expiry check...");
+  try {
+    const result = await pool.query(`
+      SELECT d.id, d.doc_type, d.number, d.expiry_date, u.email, u.whatsapp_number
+      FROM documents d
+      JOIN users u ON d.user_id = u.id
+      WHERE d.expiry_date <= NOW() + INTERVAL '14 days'
+    `);
+
+    for (let row of result.rows) {
+      await pool.query(
+      `INSERT INTO reminders (user_id, document_id, reminder_date)
+       SELECT $1, $2, NOW()
+       WHERE NOT EXISTS (
+       SELECT 1 FROM reminders 
+       WHERE document_id = $2 
+      AND sent = false
+    )`,
+    [row.user_id, row.id]
+);
+
+      // TODO: Send email/WhatsApp via API
+      console.log(`Reminder prepared for ${row.doc_type} expiring on ${row.expiry_date} for ${row.email}`);
+    }
+  } catch (err) {
+    console.error("Cron job error:", err);
+  }
+});
+
 app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
