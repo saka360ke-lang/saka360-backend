@@ -141,7 +141,7 @@ app.post('/api/fuel/add', authenticateToken, async (req, res) => {
   }
 });
 
-// Get Fuel History (Protected)
+// Get Fuel History with Totals (Protected)
 app.get('/api/fuel/history', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
@@ -152,12 +152,40 @@ app.get('/api/fuel/history', authenticateToken, async (req, res) => {
       [req.user.id]
     );
 
-    res.json({ fuel_logs: result.rows });
+    const fuel_logs = result.rows;
+
+    if (fuel_logs.length === 0) {
+      return res.json({ fuel_logs: [], totals: null });
+    }
+
+    // Totals
+    const total_spent = fuel_logs.reduce((sum, log) => sum + Number(log.amount), 0);
+    const total_liters = fuel_logs.reduce((sum, log) => sum + Number(log.liters), 0);
+
+    // Average cost per liter
+    const avg_price_per_liter = total_spent / total_liters;
+
+    // Cost per km (using difference in odometer readings)
+    const first_odometer = fuel_logs[fuel_logs.length - 1].odometer; // oldest
+    const last_odometer = fuel_logs[0].odometer; // latest
+    const distance = last_odometer - first_odometer;
+    const cost_per_km = distance > 0 ? total_spent / distance : null;
+
+    res.json({
+      fuel_logs,
+      totals: {
+        total_spent,
+        total_liters,
+        avg_price_per_liter,
+        cost_per_km
+      }
+    });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Server error' });
   }
 });
+
 
 
 const PORT = process.env.PORT || 3000;
