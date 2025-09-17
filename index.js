@@ -235,18 +235,30 @@ app.get('/api/fuel/history/:vehicle_id', authenticateToken, async (req, res) => 
 // ======================
 // Routes: Service
 // ======================
+// Add Service Log (Protected, Vehicle-specific)
 app.post('/api/service/add', authenticateToken, async (req, res) => {
   try {
-    const { description, cost, odometer } = req.body;
-    if (!description || !cost || !odometer) {
-      return res.status(400).json({ error: 'Description, cost, and odometer are required' });
+    const { vehicle_id, description, cost, odometer } = req.body;
+
+    if (!vehicle_id || !description || !cost || !odometer) {
+      return res.status(400).json({ error: 'Vehicle ID, description, cost, and odometer are required' });
+    }
+
+    // Check vehicle ownership
+    const vcheck = await pool.query(
+      `SELECT id FROM vehicles WHERE id = $1 AND user_id = $2`,
+      [vehicle_id, req.user.id]
+    );
+
+    if (vcheck.rows.length === 0) {
+      return res.status(403).json({ error: 'Vehicle not found or not owned by this user' });
     }
 
     const result = await pool.query(
-      `INSERT INTO service_logs (user_id, description, cost, odometer)
-       VALUES ($1, $2, $3, $4)
-       RETURNING id, description, cost, odometer, created_at`,
-      [req.user.id, description, cost, odometer]
+      `INSERT INTO service_logs (user_id, vehicle_id, description, cost, odometer)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING id, vehicle_id, description, cost, odometer, created_at`,
+      [req.user.id, vehicle_id, description, cost, odometer]
     );
 
     res.status(201).json({ service_log: result.rows[0] });
@@ -256,12 +268,27 @@ app.post('/api/service/add', authenticateToken, async (req, res) => {
   }
 });
 
-app.get('/api/service/history', authenticateToken, async (req, res) => {
+// Get Service History with Totals (Protected, per vehicle)
+app.get('/api/service/history/:vehicle_id', authenticateToken, async (req, res) => {
   try {
+    const vehicle_id = req.params.vehicle_id;
+
+    // Check vehicle ownership
+    const vcheck = await pool.query(
+      `SELECT id FROM vehicles WHERE id = $1 AND user_id = $2`,
+      [vehicle_id, req.user.id]
+    );
+
+    if (vcheck.rows.length === 0) {
+      return res.status(403).json({ error: 'Vehicle not found or not owned by this user' });
+    }
+
     const result = await pool.query(
-      `SELECT id, description, cost, odometer, created_at
-       FROM service_logs WHERE user_id = $1 ORDER BY created_at DESC`,
-      [req.user.id]
+      `SELECT id, vehicle_id, description, cost, odometer, created_at
+       FROM service_logs
+       WHERE user_id = $1 AND vehicle_id = $2
+       ORDER BY created_at DESC`,
+      [req.user.id, vehicle_id]
     );
 
     const service_logs = result.rows;
@@ -285,18 +312,30 @@ app.get('/api/service/history', authenticateToken, async (req, res) => {
 // ======================
 // Routes: Documents
 // ======================
+// Add Document/License (Protected, Vehicle-specific)
 app.post('/api/docs/add', authenticateToken, async (req, res) => {
   try {
-    const { doc_type, number, expiry_date } = req.body;
-    if (!doc_type || !expiry_date) {
-      return res.status(400).json({ error: 'Document type and expiry date are required' });
+    const { vehicle_id, doc_type, number, expiry_date } = req.body;
+
+    if (!vehicle_id || !doc_type || !expiry_date) {
+      return res.status(400).json({ error: 'Vehicle ID, document type, and expiry date are required' });
+    }
+
+    // Check vehicle ownership
+    const vcheck = await pool.query(
+      `SELECT id FROM vehicles WHERE id = $1 AND user_id = $2`,
+      [vehicle_id, req.user.id]
+    );
+
+    if (vcheck.rows.length === 0) {
+      return res.status(403).json({ error: 'Vehicle not found or not owned by this user' });
     }
 
     const result = await pool.query(
-      `INSERT INTO documents (user_id, doc_type, number, expiry_date)
-       VALUES ($1, $2, $3, $4)
-       RETURNING id, doc_type, number, expiry_date, created_at`,
-      [req.user.id, doc_type, number || null, expiry_date]
+      `INSERT INTO documents (user_id, vehicle_id, doc_type, number, expiry_date)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING id, vehicle_id, doc_type, number, expiry_date, created_at`,
+      [req.user.id, vehicle_id, doc_type, number || null, expiry_date]
     );
 
     res.status(201).json({ document: result.rows[0] });
@@ -306,12 +345,27 @@ app.post('/api/docs/add', authenticateToken, async (req, res) => {
   }
 });
 
-app.get('/api/docs/history', authenticateToken, async (req, res) => {
+// Get All Documents for a Vehicle (Protected)
+app.get('/api/docs/history/:vehicle_id', authenticateToken, async (req, res) => {
   try {
+    const vehicle_id = req.params.vehicle_id;
+
+    // Check vehicle ownership
+    const vcheck = await pool.query(
+      `SELECT id FROM vehicles WHERE id = $1 AND user_id = $2`,
+      [vehicle_id, req.user.id]
+    );
+
+    if (vcheck.rows.length === 0) {
+      return res.status(403).json({ error: 'Vehicle not found or not owned by this user' });
+    }
+
     const result = await pool.query(
-      `SELECT id, doc_type, number, expiry_date, created_at
-       FROM documents WHERE user_id = $1 ORDER BY expiry_date ASC`,
-      [req.user.id]
+      `SELECT id, vehicle_id, doc_type, number, expiry_date, created_at
+       FROM documents
+       WHERE user_id = $1 AND vehicle_id = $2
+       ORDER BY expiry_date ASC`,
+      [req.user.id, vehicle_id]
     );
 
     const documents = result.rows;
@@ -369,7 +423,7 @@ app.post('/api/reminders/run-check', authenticateToken, async (req, res) => {
 });
 
 // ======================
-// Add a vehicle
+// Route: Vehicle
 // ======================
 app.post('/api/vehicles/add', authenticateToken, async (req, res) => {
   try {
