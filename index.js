@@ -141,6 +141,24 @@ app.post('/api/fuel/add', authenticateToken, async (req, res) => {
   }
 });
 
+// Get Fuel History (Protected)
+app.get('/api/fuel/history', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, amount, price_per_liter, liters, odometer, created_at
+       FROM fuel_logs
+       WHERE user_id = $1
+       ORDER BY created_at DESC`,
+      [req.user.id]
+    );
+
+    res.json({ fuel_logs: result.rows });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
