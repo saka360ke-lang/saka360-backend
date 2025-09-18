@@ -41,7 +41,8 @@ async function runExpiryCheck() {
   console.log("⏰ Running expiry check now...");
   try {
     const result = await pool.query(`
-      SELECT d.id, d.doc_type, d.number, d.expiry_date, u.email, u.whatsapp_number, u.id as user_id
+      SELECT d.id, d.vehicle_id, d.doc_type, d.number, d.expiry_date,
+             u.email, u.whatsapp_number, u.id AS user_id
       FROM documents d
       JOIN users u ON d.user_id = u.id
       WHERE d.expiry_date <= NOW() + INTERVAL '14 days'
@@ -49,16 +50,16 @@ async function runExpiryCheck() {
 
     for (let row of result.rows) {
       await pool.query(
-        `INSERT INTO reminders (user_id, document_id, reminder_date)
-         SELECT $1, $2, NOW()
+        `INSERT INTO reminders (user_id, document_id, vehicle_id, reminder_date)
+         SELECT $1, $2, $3, NOW()
          WHERE NOT EXISTS (
-           SELECT 1 FROM reminders 
+           SELECT 1 FROM reminders
            WHERE document_id = $2 AND sent = false
          )`,
-        [row.user_id, row.id]
+        [row.user_id, row.id, row.vehicle_id]
       );
 
-      console.log(`✅ Reminder prepared for ${row.doc_type} expiring on ${row.expiry_date} for ${row.email}`);
+      console.log(`✅ Reminder prepared for ${row.doc_type} (veh ${row.vehicle_id}) expiring ${row.expiry_date} for ${row.email}`);
     }
   } catch (err) {
     console.error("Expiry check error:", err);
@@ -386,6 +387,7 @@ app.get('/api/docs/history/:vehicle_id', authenticateToken, async (req, res) => 
 // ======================
 // Routes: Reminders
 // ======================
+// Mark Reminder as Sent (Protected)
 app.post('/api/reminders/mark-sent', authenticateToken, async (req, res) => {
   try {
     const { reminder_id } = req.body;
@@ -397,7 +399,7 @@ app.post('/api/reminders/mark-sent', authenticateToken, async (req, res) => {
       `UPDATE reminders
        SET sent = true
        WHERE id = $1 AND user_id = $2
-       RETURNING id, document_id, sent, reminder_date`,
+       RETURNING id, document_id, vehicle_id, sent, reminder_date`,
       [reminder_id, req.user.id]
     );
 
@@ -412,10 +414,60 @@ app.post('/api/reminders/mark-sent', authenticateToken, async (req, res) => {
   }
 });
 
+
 app.post('/api/reminders/run-check', authenticateToken, async (req, res) => {
   try {
     await runExpiryCheck();
     res.json({ message: "Expiry check executed manually ✅" });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Manual expiry check failed' });
+  }
+});
+
+// Get pending reminders (unsent), enriched with doc + vehicle details (Protected)
+app.get('/api/reminders/pending', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `
+      SELECT r.id AS reminder_id,
+             r.reminder_date,
+             r.vehicle_id,
+             v.name AS vehicle_name,
+             v.plate_number,
+             d.id AS document_id,
+             d.doc_type,
+             d.number AS doc_number,
+             d.expiry_date
+      FROM reminders r
+      JOIN documents d ON r.document_id = d.id
+      LEFT JOIN vehicles v ON r.vehicle_id = v.id
+      WHERE r.user_id = $1
+        AND r.sent = false
+      ORDER BY d.expiry_date ASC, r.reminder_date DESC
+      `,
+      [req.user.id]
+    );
+
+    const today = new Date();
+    const reminders = result.rows.map(row => {
+      const days_left = Math.ceil((new Date(row.expiry_date) - today) / (1000 * 60 * 60 * 24));
+      return { ...row, days_left };
+    });
+
+    res.json({ reminders });
+  } catch (err) {
+    console.error("Pending reminders error:", err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.post('/api/reminders/run-check', authenticateToken, async (req, res) => {
+  try {
+    const before = await pool.query(`SELECT COUNT(*)::int AS c FROM reminders WHERE user_id = $1`, [req.user.id]);
+    await runExpiryCheck();
+    const after = await pool.query(`SELECT COUNT(*)::int AS c FROM reminders WHERE user_id = $1`, [req.user.id]);
+    res.json({ message: "Expiry check executed manually ✅", new_reminders: after.rows[0].c - before.rows[0].c });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Manual expiry check failed' });
