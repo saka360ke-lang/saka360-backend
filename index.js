@@ -39,40 +39,44 @@ const pool = new Pool({
 // ======================
 // Utility Functions
 // ======================
+// Function: Check for expiring documents and create reminders + send emails
 async function runExpiryCheck() {
   console.log("⏰ Running expiry check now...");
   try {
     const result = await pool.query(`
-      SELECT d.id, d.vehicle_id, d.doc_type, d.number, d.expiry_date,
-             u.email, u.whatsapp_number, u.id AS user_id
+      SELECT d.id, d.doc_type, d.number, d.expiry_date, u.email, u.whatsapp_number, u.id as user_id
       FROM documents d
       JOIN users u ON d.user_id = u.id
       WHERE d.expiry_date <= NOW() + INTERVAL '14 days'
     `);
 
-    await sendEmail(
-  row.email,
-  `Reminder: ${row.doc_type} expires soon`,
-  `Hello, your ${row.doc_type} (Number: ${row.number || "N/A"}) will expire on ${row.expiry_date}. Please renew in time.`,
-  `<p>Hello,</p>
-   <p>Your <b>${row.doc_type}</b> (Number: ${row.number || "N/A"}) will expire on <b>${new Date(row.expiry_date).toDateString()}</b>.</p>
-   <p>Please renew in time.</p>
-   <p>– Saka360 Team</p>`
-);
-
-
     for (let row of result.rows) {
-      await pool.query(
-        `INSERT INTO reminders (user_id, document_id, vehicle_id, reminder_date)
-         SELECT $1, $2, $3, NOW()
+      // Insert reminder if not already existing
+      const insert = await pool.query(
+        `INSERT INTO reminders (user_id, document_id, reminder_date)
+         SELECT $1, $2, NOW()
          WHERE NOT EXISTS (
-           SELECT 1 FROM reminders
+           SELECT 1 FROM reminders 
            WHERE document_id = $2 AND sent = false
-         )`,
-        [row.user_id, row.id, row.vehicle_id]
+         )
+         RETURNING id`,
+        [row.user_id, row.id]
       );
 
-      console.log(`✅ Reminder prepared for ${row.doc_type} (veh ${row.vehicle_id}) expiring ${row.expiry_date} for ${row.email}`);
+      // If new reminder was created → send email
+      if (insert.rows.length > 0) {
+        const subject = `Reminder: ${row.doc_type} expiring soon`;
+        const text = `Hello,
+
+Your ${row.doc_type} (No: ${row.number || "N/A"}) will expire on ${new Date(row.expiry_date).toDateString()}.
+
+Please renew it to remain compliant.
+
+– Saka360`;
+
+        await sendEmail(row.email, subject, text);
+        console.log(`📧 Reminder email sent to ${row.email} for ${row.doc_type}`);
+      }
     }
   } catch (err) {
     console.error("Expiry check error:", err);
