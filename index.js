@@ -5,7 +5,7 @@ const { Pool } = require('pg');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken'); 
 const cron = require('node-cron');
-
+const nodemailer = require('nodemailer');
 const app = express();
 app.use(express.json());
 
@@ -49,6 +49,17 @@ async function runExpiryCheck() {
       JOIN users u ON d.user_id = u.id
       WHERE d.expiry_date <= NOW() + INTERVAL '14 days'
     `);
+
+    await sendEmail(
+  row.email,
+  `Reminder: ${row.doc_type} expires soon`,
+  `Hello, your ${row.doc_type} (Number: ${row.number || "N/A"}) will expire on ${row.expiry_date}. Please renew in time.`,
+  `<p>Hello,</p>
+   <p>Your <b>${row.doc_type}</b> (Number: ${row.number || "N/A"}) will expire on <b>${new Date(row.expiry_date).toDateString()}</b>.</p>
+   <p>Please renew in time.</p>
+   <p>– Saka360 Team</p>`
+);
+
 
     for (let row of result.rows) {
       await pool.query(
@@ -840,6 +851,56 @@ app.get('/api/fleet/report/pdf', authenticateToken, async (req, res) => {
     res.status(500).json({ error: 'PDF generation failed' });
   }
 });
+
+
+// Setup SMTP transport (Hostinger)
+const transporter = nodemailer.createTransport({
+  host: "smtp.hostinger.com",
+  port: 465,
+  secure: true, // use SSL
+  auth: {
+    user: "no-reply@saka360.com",
+    pass: "Nugget119." // ⚠️ move this to .env later
+  }
+});
+
+// Send email helper
+async function sendEmail(to, subject, text, html = null) {
+  try {
+    const info = await transporter.sendMail({
+      from: '"Saka360" <no-reply@saka360.com>',
+      to,
+      subject,
+      text,
+      html: html || text,
+    });
+    console.log("📧 Email sent:", info.messageId);
+    return true;
+  } catch (err) {
+    console.error("❌ Email error:", err);
+    return false;
+  }
+}
+
+// Test email route
+app.post('/api/test-email', authenticateToken, async (req, res) => {
+  const { to } = req.body;
+  if (!to) return res.status(400).json({ error: "Recipient email required" });
+
+  const sent = await sendEmail(
+    to,
+    "Saka360 Test Email",
+    "Hello! 👋 This is a test email from your Saka360 backend."
+  );
+
+  if (sent) {
+    res.json({ message: "Test email sent ✅" });
+  } else {
+    res.status(500).json({ error: "Failed to send email" });
+  }
+});
+
+
 
 // ======================
 // Cron Job
