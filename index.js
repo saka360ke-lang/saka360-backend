@@ -1,3 +1,5 @@
+const PDFDocument = require('pdfkit');
+const fs = require('fs');
 const express = require('express');
 const { Pool } = require('pg');
 const bcrypt = require('bcrypt');
@@ -503,6 +505,341 @@ app.post('/api/vehicles/add', authenticateToken, async (req, res) => {
   }
 });
 
+// Get Fuel Report per Vehicle
+app.get('/api/fuel/report/:vehicle_id', authenticateToken, async (req, res) => {
+  try {
+    const { vehicle_id } = req.params;
+
+    // Ensure vehicle belongs to the user
+    const check = await pool.query(
+      `SELECT id FROM vehicles WHERE id = $1 AND user_id = $2`,
+      [vehicle_id, req.user.id]
+    );
+    if (check.rows.length === 0) {
+      return res.status(404).json({ error: 'Vehicle not found or not owned by user' });
+    }
+
+    const result = await pool.query(
+      `SELECT id, amount, price_per_liter, liters, odometer, created_at
+       FROM fuel_logs
+       WHERE user_id = $1 AND vehicle_id = $2
+       ORDER BY created_at ASC`,
+      [req.user.id, vehicle_id]
+    );
+
+    const fuel_logs = result.rows;
+
+    if (fuel_logs.length === 0) {
+      return res.json({ vehicle_id, fuel_logs: [], totals: null });
+    }
+
+    // Totals
+    const total_spent = fuel_logs.reduce((s, r) => s + Number(r.amount), 0);
+    const total_liters = fuel_logs.reduce((s, r) => s + Number(r.liters), 0);
+    const avg_price_per_liter = total_spent / total_liters;
+
+    const first_odometer = fuel_logs[0].odometer;
+    const last_odometer = fuel_logs[fuel_logs.length - 1].odometer;
+    const distance = last_odometer - first_odometer;
+    const cost_per_km = distance > 0 ? total_spent / distance : null;
+
+    res.json({
+      vehicle_id,
+      fuel_logs,
+      totals: {
+        total_spent,
+        total_liters,
+        avg_price_per_liter,
+        cost_per_km,
+        distance
+      }
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Get Service Report per Vehicle
+app.get('/api/service/report/:vehicle_id', authenticateToken, async (req, res) => {
+  try {
+    const { vehicle_id } = req.params;
+
+    const check = await pool.query(
+      `SELECT id FROM vehicles WHERE id = $1 AND user_id = $2`,
+      [vehicle_id, req.user.id]
+    );
+    if (check.rows.length === 0) {
+      return res.status(404).json({ error: 'Vehicle not found or not owned by user' });
+    }
+
+    const result = await pool.query(
+      `SELECT id, description, cost, odometer, created_at
+       FROM service_logs
+       WHERE user_id = $1 AND vehicle_id = $2
+       ORDER BY created_at ASC`,
+      [req.user.id, vehicle_id]
+    );
+
+    const service_logs = result.rows;
+
+    if (service_logs.length === 0) {
+      return res.json({ vehicle_id, service_logs: [], totals: null });
+    }
+
+    const total_spent = service_logs.reduce((s, r) => s + Number(r.cost), 0);
+    const avg_cost = total_spent / service_logs.length;
+
+    res.json({
+      vehicle_id,
+      service_logs,
+      totals: {
+        total_spent,
+        avg_cost,
+        count: service_logs.length
+      }
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Get Combined Vehicle Report
+app.get('/api/vehicles/report/:vehicle_id', authenticateToken, async (req, res) => {
+  try {
+    const { vehicle_id } = req.params;
+
+    const check = await pool.query(
+      `SELECT id, name FROM vehicles WHERE id = $1 AND user_id = $2`,
+      [vehicle_id, req.user.id]
+    );
+    if (check.rows.length === 0) {
+      return res.status(404).json({ error: 'Vehicle not found or not owned by user' });
+    }
+
+    // Query fuel + service in parallel
+    const [fuel, service] = await Promise.all([
+      pool.query(`SELECT amount, liters, price_per_liter, odometer, created_at 
+                  FROM fuel_logs WHERE user_id=$1 AND vehicle_id=$2 ORDER BY created_at ASC`, 
+                  [req.user.id, vehicle_id]),
+      pool.query(`SELECT description, cost, odometer, created_at 
+                  FROM service_logs WHERE user_id=$1 AND vehicle_id=$2 ORDER BY created_at ASC`, 
+                  [req.user.id, vehicle_id])
+    ]);
+
+    const fuel_logs = fuel.rows;
+    const service_logs = service.rows;
+
+    // Totals
+    const total_fuel = fuel_logs.reduce((s, r) => s + Number(r.amount), 0);
+    const total_service = service_logs.reduce((s, r) => s + Number(r.cost), 0);
+
+    res.json({
+      vehicle_id,
+      fuel_logs,
+      service_logs,
+      totals: {
+        total_fuel,
+        total_service,
+        grand_total: total_fuel + total_service
+      }
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Fleet Report (All Vehicles for Current User)
+// Fleet Report (All Vehicles for Current User with Date Filtering)
+app.get('/api/fleet/report', authenticateToken, async (req, res) => {
+  try {
+    // Query params: ?from=YYYY-MM-DD&to=YYYY-MM-DD
+    const { from, to } = req.query;
+
+    // Build date filter condition
+    let dateFilter = "";
+    let params = [req.user.id];
+
+    if (from && to) {
+      dateFilter = "AND created_at BETWEEN $2 AND $3";
+      params.push(from, to);
+    } else if (from) {
+      dateFilter = "AND created_at >= $2";
+      params.push(from);
+    } else if (to) {
+      dateFilter = "AND created_at <= $2";
+      params.push(to);
+    }
+
+    // Fetch all user’s vehicles
+    const vehicles = await pool.query(
+      `SELECT id, name, type, plate_number
+       FROM vehicles
+       WHERE user_id = $1`,
+      [req.user.id]
+    );
+
+    if (vehicles.rows.length === 0) {
+      return res.json({ vehicles: [], fleet_totals: null });
+    }
+
+    const reports = [];
+
+    // Loop through vehicles
+    for (let v of vehicles.rows) {
+      const fuel = await pool.query(
+        `SELECT amount, liters, price_per_liter, odometer, created_at
+         FROM fuel_logs 
+         WHERE user_id=$1 AND vehicle_id=$2 ${dateFilter}
+         ORDER BY created_at ASC`,
+         [req.user.id, v.id, ...(params.slice(1))]
+      );
+
+      const service = await pool.query(
+        `SELECT description, cost, odometer, created_at
+         FROM service_logs 
+         WHERE user_id=$1 AND vehicle_id=$2 ${dateFilter}
+         ORDER BY created_at ASC`,
+         [req.user.id, v.id, ...(params.slice(1))]
+      );
+
+      const fuel_logs = fuel.rows;
+      const service_logs = service.rows;
+
+      // Totals per vehicle
+      const total_fuel = fuel_logs.reduce((s, r) => s + Number(r.amount), 0);
+      const total_liters = fuel_logs.reduce((s, r) => s + Number(r.liters), 0);
+      const avg_price_per_liter = total_liters > 0 ? total_fuel / total_liters : null;
+      const total_service = service_logs.reduce((s, r) => s + Number(r.cost), 0);
+
+      reports.push({
+        vehicle_id: v.id,
+        name: v.name,
+        type: v.type,
+        plate_number: v.plate_number,
+        totals: {
+          total_fuel,
+          total_service,
+          grand_total: total_fuel + total_service,
+          avg_price_per_liter,
+        }
+      });
+    }
+
+    // Fleet-wide totals
+    const fleet_totals = {
+      total_fuel: reports.reduce((s, r) => s + r.totals.total_fuel, 0),
+      total_service: reports.reduce((s, r) => s + r.totals.total_service, 0),
+      grand_total: reports.reduce((s, r) => s + r.totals.grand_total, 0)
+    };
+
+    res.json({ vehicles: reports, fleet_totals });
+  } catch (err) {
+    console.error("Fleet report error:", err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Fleet Report PDF (Protected)
+app.get('/api/fleet/report/pdf', authenticateToken, async (req, res) => {
+  try {
+    const { from, to } = req.query;
+
+    // Reuse logic from JSON report
+    const vehicles = await pool.query(
+      `SELECT id, name, type, plate_number
+       FROM vehicles
+       WHERE user_id = $1`,
+      [req.user.id]
+    );
+
+    if (vehicles.rows.length === 0) {
+      return res.status(404).json({ error: "No vehicles found" });
+    }
+
+    let reports = [];
+    for (let v of vehicles.rows) {
+      const fuel = await pool.query(
+        `SELECT amount, liters, price_per_liter, odometer, created_at
+         FROM fuel_logs WHERE user_id=$1 AND vehicle_id=$2 ORDER BY created_at ASC`,
+         [req.user.id, v.id]
+      );
+
+      const service = await pool.query(
+        `SELECT description, cost, odometer, created_at
+         FROM service_logs WHERE user_id=$1 AND vehicle_id=$2 ORDER BY created_at ASC`,
+         [req.user.id, v.id]
+      );
+
+      const total_fuel = fuel.rows.reduce((s, r) => s + Number(r.amount), 0);
+      const total_liters = fuel.rows.reduce((s, r) => s + Number(r.liters), 0);
+      const avg_price_per_liter = total_liters > 0 ? total_fuel / total_liters : null;
+      const total_service = service.rows.reduce((s, r) => s + Number(r.cost), 0);
+
+      reports.push({
+        name: v.name,
+        plate: v.plate_number,
+        totals: {
+          total_fuel,
+          total_service,
+          grand_total: total_fuel + total_service,
+          avg_price_per_liter
+        }
+      });
+    }
+
+    const fleet_totals = {
+      total_fuel: reports.reduce((s, r) => s + r.totals.total_fuel, 0),
+      total_service: reports.reduce((s, r) => s + r.totals.total_service, 0),
+      grand_total: reports.reduce((s, r) => s + r.totals.grand_total, 0)
+    };
+
+    // ---- Generate PDF ----
+    const doc = new PDFDocument();
+    let filename = `fleet_report_${Date.now()}.pdf`;
+    res.setHeader('Content-disposition', `attachment; filename=${filename}`);
+    res.setHeader('Content-type', 'application/pdf');
+    doc.pipe(res);
+
+    // Title
+    doc.fontSize(18).text("Fleet Report", { align: 'center' });
+    doc.moveDown();
+
+    // Date range
+    if (from || to) {
+      doc.fontSize(12).text(`Report Range: ${from || "beginning"} to ${to || "today"}`);
+    }
+    doc.moveDown();
+
+    // Vehicle breakdown
+    reports.forEach((r, i) => {
+      doc.fontSize(14).text(`Vehicle ${i+1}: ${r.name} (${r.plate})`);
+      doc.fontSize(12).list([
+        `Total Fuel: KES ${r.totals.total_fuel.toFixed(2)}`,
+        `Total Service: KES ${r.totals.total_service.toFixed(2)}`,
+        `Grand Total: KES ${r.totals.grand_total.toFixed(2)}`,
+        `Avg Price/Liter: ${r.totals.avg_price_per_liter ? r.totals.avg_price_per_liter.toFixed(2) : "N/A"}`
+      ]);
+      doc.moveDown();
+    });
+
+    // Fleet totals
+    doc.fontSize(16).text("Fleet Totals", { underline: true });
+    doc.fontSize(12).list([
+      `Total Fuel: KES ${fleet_totals.total_fuel.toFixed(2)}`,
+      `Total Service: KES ${fleet_totals.total_service.toFixed(2)}`,
+      `Grand Total: KES ${fleet_totals.grand_total.toFixed(2)}`
+    ]);
+
+    doc.end();
+
+  } catch (err) {
+    console.error("Fleet report PDF error:", err);
+    res.status(500).json({ error: 'PDF generation failed' });
+  }
+});
 
 // ======================
 // Cron Job
