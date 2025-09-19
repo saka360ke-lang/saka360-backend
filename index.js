@@ -7,6 +7,8 @@ const jwt = require('jsonwebtoken');
 const cron = require('node-cron');
 const nodemailer = require('nodemailer');
 const app = express();
+const twilio = require('twilio');
+
 app.use(express.json());
 
 // ======================
@@ -885,6 +887,46 @@ async function sendEmail(to, subject, text, html = null) {
     return false;
   }
 }
+
+// ----------------------
+// WhatsApp (Twilio)
+// ----------------------
+const twilioClient = twilio(
+  process.env.TWILIO_ACCOUNT_SID,
+  process.env.TWILIO_AUTH_TOKEN
+);
+const TWILIO_WHATSAPP_FROM = process.env.TWILIO_WHATSAPP_FROM; // e.g. 'whatsapp:+1415...'
+
+function toWhatsAppAddr(num) {
+  // Expect num in E.164, e.g. +2547XXXXXXXX
+  return num.startsWith('whatsapp:') ? num : `whatsapp:${num}`;
+}
+
+async function sendWhatsAppText(toNumberE164, body) {
+  if (!toNumberE164 || !body) throw new Error("to and body required");
+  const msg = await twilioClient.messages.create({
+    from: TWILIO_WHATSAPP_FROM,
+    to: toWhatsAppAddr(toNumberE164),
+    body
+  });
+  console.log("📲 WhatsApp sent:", msg.sid, msg.status);
+  return msg;
+}
+
+// Simple test route
+app.post('/api/test-whatsapp', authenticateToken, async (req, res) => {
+  try {
+    const { to, body } = req.body;
+    if (!to) return res.status(400).json({ error: "Recipient 'to' (E.164) required" });
+
+    const msg = await sendWhatsAppText(to, body || "Hello from Saka360 👋 This is a WhatsApp test.");
+    res.json({ message: "WhatsApp sent ✅", sid: msg.sid, status: msg.status });
+  } catch (err) {
+    console.error("WA test error:", err);
+    res.status(500).json({ error: "Failed to send WhatsApp", detail: err.message });
+  }
+});
+
 
 // Test email route
 app.post('/api/test-email', authenticateToken, async (req, res) => {
