@@ -85,6 +85,66 @@ Please renew it to remain compliant.
   }
 }
 
+function fmtDate(d) {
+  const dt = new Date(d);
+  return dt.toLocaleDateString('en-KE', { year: 'numeric', month: 'short', day: 'numeric' });
+}
+
+// Function: Check for expiring documents and create reminders + send emails & WhatsApp
+async function runExpiryCheck() {
+  console.log("⏰ Running expiry check now...");
+  try {
+    const result = await pool.query(`
+      SELECT d.id, d.vehicle_id, d.doc_type, d.number, d.expiry_date,
+             u.email, u.whatsapp_number, u.id as user_id
+      FROM documents d
+      JOIN users u ON d.user_id = u.id
+      WHERE d.expiry_date <= NOW() + INTERVAL '14 days'
+    `);
+
+    for (let row of result.rows) {
+      const insert = await pool.query(
+        `INSERT INTO reminders (user_id, document_id, vehicle_id, reminder_date)
+         SELECT $1, $2, $3, NOW()
+         WHERE NOT EXISTS (
+           SELECT 1 FROM reminders 
+           WHERE document_id = $2 AND sent = false
+         )
+         RETURNING id`,
+        [row.user_id, row.id, row.vehicle_id]
+      );
+
+      if (insert.rows.length > 0) {
+        // Email
+        const subject = `Reminder: ${row.doc_type} expiring soon`;
+        const text = `Hello,
+
+Your ${row.doc_type} (No: ${row.number || "N/A"}) will expire on ${fmtDate(row.expiry_date)}.
+
+Please renew it to remain compliant.
+
+– Saka360`;
+        await sendEmail(row.email, subject, text);
+        console.log(`📧 Email reminder sent to ${row.email}`);
+
+        // WhatsApp (only if sandbox joined & number is E.164)
+        if (row.whatsapp_number) {
+          const waBody = `Saka360: Your ${row.doc_type} (${row.number || "N/A"}) expires on ${fmtDate(row.expiry_date)}. Please renew in time to avoid penalties.`;
+          try {
+            await sendWhatsAppText(row.whatsapp_number, waBody);
+            console.log(`📲 WhatsApp reminder sent to ${row.whatsapp_number}`);
+          } catch (e) {
+            console.error("WhatsApp send failed:", e.message);
+          }
+        }
+      }
+    }
+  } catch (err) {
+    console.error("Expiry check error:", err);
+  }
+}
+
+
 // ======================
 // Routes: Health
 // ======================
