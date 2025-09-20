@@ -1,16 +1,19 @@
-// ---------------- Core ----------------
+// Core / Built-in
+const fs = require('fs');
+
+// Third-party packages
 const express = require('express');
 const { Pool } = require('pg');
 const bcrypt = require('bcrypt');
-const jwt = require('jsonwebtoken');
-
-// ---------------- Utilities ----------------
+const jwt = require('jsonwebtoken'); 
 const cron = require('node-cron');
-const twilio = require('twilio');
+const nodemailer = require('nodemailer');
 const PDFDocument = require('pdfkit');
 
-// ---------------- App Setup ----------------
-const app = express();
+// AWS S3
+const { S3Client, PutObjectCommand, GetObjectCommand } = require('@aws-sdk/client-s3');
+const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
+
 app.use(express.json());
 
 
@@ -44,6 +47,39 @@ const pool = new Pool({
 // ======================
 // Utility Functions
 // ======================
+// -------- AWS S3 (report storage) --------
+const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
+const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
+
+const s3 = new S3Client({
+  region: process.env.AWS_REGION,
+  credentials: {
+    accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY
+  }
+});
+
+// Upload buffer, return a presigned GET url (expiresIn seconds)
+async function uploadReportAndGetLink(buffer, key, expiresIn = 7 * 24 * 60 * 60) {
+  // 1) upload the object
+  await s3.send(new PutObjectCommand({
+    Bucket: process.env.S3_BUCKET,
+    Key: key,
+    Body: buffer,
+    ContentType: 'application/pdf',
+  }));
+
+  // 2) presign a GET URL
+  const url = await getSignedUrl(
+    s3,
+    new PutObjectCommand({ // NOTE: For GET you’d normally use GetObjectCommand
+      // Workaround: use GetObjectCommand instead of PutObjectCommand
+    }),
+    { expiresIn }
+  );
+  return url;
+}
+
 // Function: Check for expiring documents and create reminders + send emails
 async function runExpiryCheck() {
   console.log("⏰ Running expiry check now...");
@@ -1187,13 +1223,12 @@ cron.schedule('0 8 * * *', runExpiryCheck);
 
 // ---------------- Monthly Fleet Reports ----------------
 // Run on the 1st of every month at 9 AM
-cron.schedule('* * * * *', async () => {
+cron.schedule('0 9 1 * *', async () => {
   console.log("📊 Running monthly fleet report generation...");
 
   try {
-    // Get all fleets with their owners
     const fleets = await pool.query(`
-      SELECT DISTINCT fleet_id, user_id, u.email
+      SELECT DISTINCT fleet_id, user_id, u.email, u.whatsapp_number
       FROM vehicles v
       JOIN users u ON v.user_id = u.id
       WHERE v.fleet_id IS NOT NULL
@@ -1201,36 +1236,50 @@ cron.schedule('* * * * *', async () => {
 
     for (let f of fleets.rows) {
       try {
-        // Generate PDF in memory
         const PDFDocument = require('pdfkit');
         const { PassThrough } = require('stream');
-        const stream = new PassThrough();
-        const doc = new PDFDocument();
 
+        // Build PDF in memory
+        const doc = new PDFDocument({ bufferPages: true });
         let chunks = [];
-        doc.on('data', (chunk) => chunks.push(chunk));
+        doc.on('data', (c) => chunks.push(c));
         doc.on('end', async () => {
           const pdfBuffer = Buffer.concat(chunks);
 
-          // Email with PDF attachment
-          const subject = `Saka360 Monthly Fleet Report (Fleet ID: ${f.fleet_id})`;
+          // 1) Upload to S3 and get link (7 days)
+          const key = `reports/fleet_${f.fleet_id}_${new Date().toISOString().slice(0,10)}.pdf`;
+          const signedUrl = await uploadReportAndGetLink(pdfBuffer, key, 7*24*60*60);
+
+          // 2) Email attachment (still send)
+          const subject = `Saka360 Monthly Fleet Report (Fleet ${f.fleet_id})`;
           const text = `Hello,
 
-Please find attached your monthly fleet performance report.
+Your monthly fleet report is ready. We’ve attached the PDF and included a download link:
+${signedUrl}
 
 – Saka360`;
-
           await sendEmailWithAttachment(f.email, subject, text, pdfBuffer, `fleet_${f.fleet_id}_report.pdf`);
           console.log(`✅ Fleet report emailed to ${f.email}`);
+
+          // 3) WhatsApp link (if number exists)
+          if (f.whatsapp_number) {
+            const waText = `Saka360: Your monthly fleet report (Fleet ${f.fleet_id}) is ready.\nDownload: ${signedUrl}\n(Link expires in 7 days)`;
+            try {
+              await sendWhatsAppText(f.whatsapp_number, waText);
+              console.log(`📲 WA link sent to ${f.whatsapp_number}`);
+            } catch (e) {
+              console.error("WhatsApp send failed:", e.message);
+            }
+          }
         });
 
-        // Write PDF header
+        // Compose PDF content
         doc.fontSize(18).text(`Saka360 Fleet Report – Fleet ID: ${f.fleet_id}`, { align: 'center' });
         doc.moveDown();
 
-        // Fetch all vehicles in this fleet
+        // Vehicles in this fleet
         const vehicles = await pool.query(
-          `SELECT id, make, model, reg_no FROM vehicles WHERE fleet_id = $1 AND user_id = $2`,
+          `SELECT id, name, type, plate_number FROM vehicles WHERE fleet_id = $1 AND user_id = $2`,
           [f.fleet_id, f.user_id]
         );
 
@@ -1238,44 +1287,44 @@ Please find attached your monthly fleet performance report.
         let fleetTotalService = 0;
 
         for (let v of vehicles.rows) {
-          doc.fontSize(14).text(`Vehicle: ${v.make} ${v.model} (${v.reg_no})`, { underline: true });
+          doc.fontSize(14).text(`Vehicle: ${v.name} (${v.plate_number})`, { underline: true });
           doc.moveDown(0.5);
 
-          // Fuel totals
           const fuel = await pool.query(
             `SELECT COALESCE(SUM(amount),0) as total_amount,
                     COALESCE(SUM(liters),0) as total_liters
              FROM fuel_logs WHERE vehicle_id = $1`,
             [v.id]
           );
-          const fuelData = fuel.rows[0];
-
-          // Service totals
           const service = await pool.query(
             `SELECT COALESCE(SUM(cost),0) as total_cost,
                     COUNT(*) as count
              FROM service_logs WHERE vehicle_id = $1`,
             [v.id]
           );
-          const serviceData = service.rows[0];
 
-          fleetTotalFuel += Number(fuelData.total_amount);
-          fleetTotalService += Number(serviceData.total_cost);
+          const fa = Number(fuel.rows[0].total_amount);
+          const fl = Number(fuel.rows[0].total_liters);
+          const sc = Number(service.rows[0].total_cost);
+          const scount = Number(service.rows[0].count);
+          fleetTotalFuel += fa;
+          fleetTotalService += sc;
 
           doc.fontSize(12)
-            .text(`Total Fuel Spend: KES ${fuelData.total_amount}`)
-            .text(`Total Fuel Liters: ${fuelData.total_liters}`)
-            .text(`Total Service Spend: KES ${serviceData.total_cost}`)
-            .text(`Number of Services: ${serviceData.count}`)
+            .text(`Total Fuel Spend: KES ${fa}`)
+            .text(`Total Fuel Liters: ${fl}`)
+            .text(`Total Service Spend: KES ${sc}`)
+            .text(`Number of Services: ${scount}`)
             .moveDown();
         }
 
-        // Fleet totals
+        // Totals
         doc.moveDown();
         doc.fontSize(14).text("Fleet Totals", { underline: true });
         doc.fontSize(12)
-          .text(`Total Fuel Spend (all vehicles): KES ${fleetTotalFuel}`)
-          .text(`Total Service Spend (all vehicles): KES ${fleetTotalService}`);
+          .text(`Total Fuel Spend: KES ${fleetTotalFuel}`)
+          .text(`Total Service Spend: KES ${fleetTotalService}`)
+          .text(`Grand Total: KES ${fleetTotalFuel + fleetTotalService}`);
 
         doc.end();
       } catch (fleetErr) {
