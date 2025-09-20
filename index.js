@@ -7,6 +7,9 @@ const jwt = require('jsonwebtoken');
 const cron = require('node-cron');
 const nodemailer = require('nodemailer');
 const app = express();
+const PDFDocument = require('pdfkit');
+const fs = require('fs'); // not needed on Render, but useful locally
+
 const twilio = require('twilio');
 
 app.use(express.json());
@@ -1006,6 +1009,97 @@ app.post('/api/test-email', authenticateToken, async (req, res) => {
   }
 });
 
+// Generate Vehicle Report as PDF (Protected)
+app.get('/api/reports/vehicle/:id/pdf', authenticateToken, async (req, res) => {
+  try {
+    const vehicleId = req.params.id;
+
+    // 1. Fetch Vehicle Info
+    const vResult = await pool.query(
+      `SELECT * FROM vehicles WHERE id = $1 AND user_id = $2`,
+      [vehicleId, req.user.id]
+    );
+    if (vResult.rows.length === 0) {
+      return res.status(404).json({ error: "Vehicle not found" });
+    }
+    const vehicle = vResult.rows[0];
+
+    // 2. Fetch Fuel Logs
+    const fuelResult = await pool.query(
+      `SELECT * FROM fuel_logs WHERE vehicle_id = $1 ORDER BY created_at`,
+      [vehicleId]
+    );
+
+    // 3. Fetch Service Logs
+    const serviceResult = await pool.query(
+      `SELECT * FROM service_logs WHERE vehicle_id = $1 ORDER BY created_at`,
+      [vehicleId]
+    );
+
+    // 4. Fetch Documents
+    const docsResult = await pool.query(
+      `SELECT * FROM documents WHERE vehicle_id = $1 ORDER BY expiry_date`,
+      [vehicleId]
+    );
+
+    // ---------------- PDF GENERATION ----------------
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", `inline; filename=vehicle_${vehicleId}_report.pdf`);
+
+    const doc = new PDFDocument();
+    doc.pipe(res); // stream directly to response
+
+    // Header
+    doc.fontSize(18).text(`Saka360 Vehicle Report`, { align: "center" });
+    doc.moveDown();
+    doc.fontSize(14).text(`Vehicle: ${vehicle.make || ''} ${vehicle.model || ''} (${vehicle.registration_no || ''})`);
+    doc.text(`Owner: ${req.user.name} | Date: ${new Date().toLocaleDateString()}`);
+    doc.moveDown();
+
+    // Fuel Logs
+    doc.fontSize(16).text("⛽ Fuel Logs", { underline: true });
+    if (fuelResult.rows.length === 0) {
+      doc.text("No fuel logs available");
+    } else {
+      fuelResult.rows.forEach(log => {
+        doc.text(
+          `Date: ${new Date(log.created_at).toLocaleDateString()} | Amount: ${log.amount} | Liters: ${log.liters.toFixed(2)} | Odo: ${log.odometer}`
+        );
+      });
+    }
+    doc.moveDown();
+
+    // Service Logs
+    doc.fontSize(16).text("🔧 Service Logs", { underline: true });
+    if (serviceResult.rows.length === 0) {
+      doc.text("No service logs available");
+    } else {
+      serviceResult.rows.forEach(log => {
+        doc.text(
+          `Date: ${new Date(log.created_at).toLocaleDateString()} | ${log.description} | Cost: ${log.cost} | Odo: ${log.odometer}`
+        );
+      });
+    }
+    doc.moveDown();
+
+    // Documents
+    doc.fontSize(16).text("📄 Documents", { underline: true });
+    if (docsResult.rows.length === 0) {
+      doc.text("No documents available");
+    } else {
+      docsResult.rows.forEach(docRow => {
+        doc.text(
+          `${docRow.doc_type} (${docRow.number || "N/A"}) → Expires: ${new Date(docRow.expiry_date).toLocaleDateString()}`
+        );
+      });
+    }
+
+    doc.end();
+  } catch (err) {
+    console.error("PDF error:", err);
+    res.status(500).json({ error: "Failed to generate PDF" });
+  }
+});
 
 
 // ======================
