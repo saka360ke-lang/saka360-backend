@@ -951,32 +951,6 @@ async function sendEmail(to, subject, text, html = null) {
   }
 }
 
-async function sendEmailWithAttachment(to, subject, text, buffer, filename) {
-  const nodemailer = require('nodemailer');
-  let transporter = nodemailer.createTransport({
-    host: process.env.SMTP_HOST,
-    port: process.env.SMTP_PORT,
-    secure: true,
-    auth: {
-      user: process.env.SMTP_USER,
-      pass: process.env.SMTP_PASS,
-    },
-  });
-
-  await transporter.sendMail({
-    from: `"Saka360" <${process.env.SMTP_USER}>`,
-    to,
-    subject,
-    text,
-    attachments: [
-      {
-        filename,
-        content: buffer,
-      },
-    ],
-  });
-}
-
 
 // ----------------------
 // WhatsApp (Twilio)
@@ -1213,7 +1187,7 @@ cron.schedule('0 8 * * *', runExpiryCheck);
 
 // ---------------- Monthly Fleet Reports ----------------
 // Run on the 1st of every month at 9 AM
-cron.schedule('0 9 1 * *', async () => {
+cron.schedule('* * * * *', async () => {
   console.log("📊 Running monthly fleet report generation...");
 
   try {
