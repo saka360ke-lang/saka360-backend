@@ -48,9 +48,6 @@ const pool = new Pool({
 // Utility Functions
 // ======================
 // -------- AWS S3 (report storage) --------
-const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
-const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
-
 const s3 = new S3Client({
   region: process.env.AWS_REGION,
   credentials: {
