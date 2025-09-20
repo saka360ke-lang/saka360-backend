@@ -61,7 +61,6 @@ const s3 = new S3Client({
 
 // Upload buffer, return a presigned GET url (expiresIn seconds)
 async function uploadReportAndGetLink(buffer, key, expiresIn = 7 * 24 * 60 * 60) {
-  // 1) upload the object
   await s3.send(new PutObjectCommand({
     Bucket: process.env.S3_BUCKET,
     Key: key,
@@ -69,12 +68,9 @@ async function uploadReportAndGetLink(buffer, key, expiresIn = 7 * 24 * 60 * 60)
     ContentType: 'application/pdf',
   }));
 
-  // 2) presign a GET URL
   const url = await getSignedUrl(
     s3,
-    new PutObjectCommand({ // NOTE: For GET you’d normally use GetObjectCommand
-      // Workaround: use GetObjectCommand instead of PutObjectCommand
-    }),
+    new GetObjectCommand({ Bucket: process.env.S3_BUCKET, Key: key }),
     { expiresIn }
   );
   return url;
