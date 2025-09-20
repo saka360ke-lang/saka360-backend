@@ -7,7 +7,6 @@ const jwt = require('jsonwebtoken');
 const cron = require('node-cron');
 const nodemailer = require('nodemailer');
 const app = express();
-const PDFDocument = require('pdfkit');
 const fs = require('fs'); // not needed on Render, but useful locally
 
 const twilio = require('twilio');
