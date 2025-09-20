@@ -951,6 +951,33 @@ async function sendEmail(to, subject, text, html = null) {
   }
 }
 
+async function sendEmailWithAttachment(to, subject, text, buffer, filename) {
+  const nodemailer = require('nodemailer');
+  let transporter = nodemailer.createTransport({
+    host: process.env.SMTP_HOST,
+    port: process.env.SMTP_PORT,
+    secure: true,
+    auth: {
+      user: process.env.SMTP_USER,
+      pass: process.env.SMTP_PASS,
+    },
+  });
+
+  await transporter.sendMail({
+    from: `"Saka360" <${process.env.SMTP_USER}>`,
+    to,
+    subject,
+    text,
+    attachments: [
+      {
+        filename,
+        content: buffer,
+      },
+    ],
+  });
+}
+
+
 // ----------------------
 // WhatsApp (Twilio)
 // ----------------------
@@ -1183,6 +1210,109 @@ app.get('/api/fleet/:fleetId/report', authenticateToken, async (req, res) => {
 // Cron Job
 // ======================
 cron.schedule('0 8 * * *', runExpiryCheck);
+
+// ---------------- Monthly Fleet Reports ----------------
+// Run on the 1st of every month at 9 AM
+cron.schedule('0 9 1 * *', async () => {
+  console.log("📊 Running monthly fleet report generation...");
+
+  try {
+    // Get all fleets with their owners
+    const fleets = await pool.query(`
+      SELECT DISTINCT fleet_id, user_id, u.email
+      FROM vehicles v
+      JOIN users u ON v.user_id = u.id
+      WHERE v.fleet_id IS NOT NULL
+    `);
+
+    for (let f of fleets.rows) {
+      try {
+        // Generate PDF in memory
+        const PDFDocument = require('pdfkit');
+        const { PassThrough } = require('stream');
+        const stream = new PassThrough();
+        const doc = new PDFDocument();
+
+        let chunks = [];
+        doc.on('data', (chunk) => chunks.push(chunk));
+        doc.on('end', async () => {
+          const pdfBuffer = Buffer.concat(chunks);
+
+          // Email with PDF attachment
+          const subject = `Saka360 Monthly Fleet Report (Fleet ID: ${f.fleet_id})`;
+          const text = `Hello,
+
+Please find attached your monthly fleet performance report.
+
+– Saka360`;
+
+          await sendEmailWithAttachment(f.email, subject, text, pdfBuffer, `fleet_${f.fleet_id}_report.pdf`);
+          console.log(`✅ Fleet report emailed to ${f.email}`);
+        });
+
+        // Write PDF header
+        doc.fontSize(18).text(`Saka360 Fleet Report – Fleet ID: ${f.fleet_id}`, { align: 'center' });
+        doc.moveDown();
+
+        // Fetch all vehicles in this fleet
+        const vehicles = await pool.query(
+          `SELECT id, make, model, reg_no FROM vehicles WHERE fleet_id = $1 AND user_id = $2`,
+          [f.fleet_id, f.user_id]
+        );
+
+        let fleetTotalFuel = 0;
+        let fleetTotalService = 0;
+
+        for (let v of vehicles.rows) {
+          doc.fontSize(14).text(`Vehicle: ${v.make} ${v.model} (${v.reg_no})`, { underline: true });
+          doc.moveDown(0.5);
+
+          // Fuel totals
+          const fuel = await pool.query(
+            `SELECT COALESCE(SUM(amount),0) as total_amount,
+                    COALESCE(SUM(liters),0) as total_liters
+             FROM fuel_logs WHERE vehicle_id = $1`,
+            [v.id]
+          );
+          const fuelData = fuel.rows[0];
+
+          // Service totals
+          const service = await pool.query(
+            `SELECT COALESCE(SUM(cost),0) as total_cost,
+                    COUNT(*) as count
+             FROM service_logs WHERE vehicle_id = $1`,
+            [v.id]
+          );
+          const serviceData = service.rows[0];
+
+          fleetTotalFuel += Number(fuelData.total_amount);
+          fleetTotalService += Number(serviceData.total_cost);
+
+          doc.fontSize(12)
+            .text(`Total Fuel Spend: KES ${fuelData.total_amount}`)
+            .text(`Total Fuel Liters: ${fuelData.total_liters}`)
+            .text(`Total Service Spend: KES ${serviceData.total_cost}`)
+            .text(`Number of Services: ${serviceData.count}`)
+            .moveDown();
+        }
+
+        // Fleet totals
+        doc.moveDown();
+        doc.fontSize(14).text("Fleet Totals", { underline: true });
+        doc.fontSize(12)
+          .text(`Total Fuel Spend (all vehicles): KES ${fleetTotalFuel}`)
+          .text(`Total Service Spend (all vehicles): KES ${fleetTotalService}`);
+
+        doc.end();
+      } catch (fleetErr) {
+        console.error("Fleet report error for fleet:", f.fleet_id, fleetErr);
+      }
+    }
+  } catch (err) {
+    console.error("Monthly fleet report cron error:", err);
+  }
+});
+
 
 // ======================
 // Start Server
