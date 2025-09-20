@@ -1,15 +1,18 @@
-const PDFDocument = require('pdfkit');
-const fs = require('fs');
+// ---------------- Core ----------------
 const express = require('express');
 const { Pool } = require('pg');
 const bcrypt = require('bcrypt');
-const jwt = require('jsonwebtoken'); 
-const cron = require('node-cron');
-const nodemailer = require('nodemailer');
-const app = express();
-const twilio = require('twilio');
+const jwt = require('jsonwebtoken');
 
+// ---------------- Utilities ----------------
+const cron = require('node-cron');
+const twilio = require('twilio');
+const PDFDocument = require('pdfkit');
+
+// ---------------- App Setup ----------------
+const app = express();
 app.use(express.json());
+
 
 // ======================
 // Middleware
@@ -1095,6 +1098,83 @@ app.get('/api/reports/vehicle/:id/pdf', authenticateToken, async (req, res) => {
   } catch (err) {
     console.error("PDF error:", err);
     res.status(500).json({ error: "Failed to generate PDF" });
+  }
+});
+
+// ---------------- Fleet PDF Report ----------------
+app.get('/api/fleet/:fleetId/report', authenticateToken, async (req, res) => {
+  try {
+    const { fleetId } = req.params;
+
+    // Verify user owns fleet (for now assume fleet_id is tied to user_id)
+    const vehicles = await pool.query(
+      `SELECT id, make, model, reg_no
+       FROM vehicles
+       WHERE fleet_id = $1 AND user_id = $2`,
+      [fleetId, req.user.id]
+    );
+
+    if (vehicles.rows.length === 0) {
+      return res.status(404).json({ error: "No vehicles found for this fleet" });
+    }
+
+    // Create PDF
+    const doc = new PDFDocument();
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename=fleet_${fleetId}_report.pdf`);
+    doc.pipe(res);
+
+    // Header
+    doc.fontSize(18).text(`Saka360 Fleet Report – Fleet ID: ${fleetId}`, { align: 'center' });
+    doc.moveDown();
+
+    let fleetTotalFuel = 0;
+    let fleetTotalService = 0;
+
+    for (let v of vehicles.rows) {
+      doc.fontSize(14).text(`Vehicle: ${v.make} ${v.model} (${v.reg_no})`, { underline: true });
+      doc.moveDown(0.5);
+
+      // Fuel totals
+      const fuel = await pool.query(
+        `SELECT COALESCE(SUM(amount),0) as total_amount,
+                COALESCE(SUM(liters),0) as total_liters
+         FROM fuel_logs WHERE vehicle_id = $1`,
+        [v.id]
+      );
+      const fuelData = fuel.rows[0];
+
+      // Service totals
+      const service = await pool.query(
+        `SELECT COALESCE(SUM(cost),0) as total_cost,
+                COUNT(*) as count
+         FROM service_logs WHERE vehicle_id = $1`,
+        [v.id]
+      );
+      const serviceData = service.rows[0];
+
+      fleetTotalFuel += Number(fuelData.total_amount);
+      fleetTotalService += Number(serviceData.total_cost);
+
+      doc.fontSize(12)
+        .text(`Total Fuel Spend: KES ${fuelData.total_amount}`)
+        .text(`Total Fuel Liters: ${fuelData.total_liters}`)
+        .text(`Total Service Spend: KES ${serviceData.total_cost}`)
+        .text(`Number of Services: ${serviceData.count}`)
+        .moveDown();
+    }
+
+    // Fleet totals
+    doc.moveDown();
+    doc.fontSize(14).text("Fleet Totals", { underline: true });
+    doc.fontSize(12)
+      .text(`Total Fuel Spend (all vehicles): KES ${fleetTotalFuel}`)
+      .text(`Total Service Spend (all vehicles): KES ${fleetTotalService}`);
+
+    doc.end();
+  } catch (err) {
+    console.error("Fleet report error:", err);
+    res.status(500).json({ error: "Server error generating fleet report" });
   }
 });
 
