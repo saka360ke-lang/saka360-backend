@@ -31,6 +31,17 @@ router.post("/register", async (req, res) => {
   }
 });
 
+const { sendEmail } = require("../utils/mailer");
+
+const verificationLink = `https://saka360.com/verify?token=12345`;
+
+await sendEmail(
+  email,
+  "Verify your Saka360 account",
+  "verification",
+  { verification_link: verificationLink }
+);
+
 // Login
 router.post("/login", async (req, res) => {
   try {
