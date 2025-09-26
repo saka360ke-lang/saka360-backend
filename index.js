@@ -42,5 +42,25 @@ app.get('/api/health', async (req, res) => {
   }
 });
 
+// Simple GET test route for email (no authentication required)
+app.get('/api/test-email', async (req, res) => {
+  try {
+    const sent = await sendEmail(
+      "huguadventures@gmail.com",   // hardcoded test email
+      "Saka360 Test Email",
+      "Hello! 👋 This is a public test email from Saka360 backend."
+    );
+
+    if (sent) {
+      res.json({ message: "Test email sent ✅" });
+    } else {
+      res.status(500).json({ error: "Failed to send test email" });
+    }
+  } catch (err) {
+    console.error("Test email route error:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
