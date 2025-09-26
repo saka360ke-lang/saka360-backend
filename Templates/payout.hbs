@@ -1,0 +1,27 @@
+<table style="width:100%;max-width:600px;margin:auto;font-family:Arial,sans-serif;background:#f9f9f9;border-radius:8px;padding:20px;">
+  <tr>
+    <td>
+      <h2 style="color:#ff6600;">Affiliate Payout Receipt</h2>
+      <p>Hi {{affiliate_name}},</p>
+      <p>Thank you for your partnership with Saka360! Here are your payout details for <strong>{{month_period}}</strong>:</p>
+      
+      <table style="width:100%;margin:20px 0;border-collapse:collapse;">
+        <tr style="background:#f2f2f2;">
+          <td style="padding:8px;">Total Bookings</td>
+          <td style="padding:8px;">{{bookings_count}}</td>
+        </tr>
+        <tr>
+          <td style="padding:8px;">Commission Earned</td>
+          <td style="padding:8px;">KES {{commission_amount}}</td>
+        </tr>
+        <tr>
+          <td style="padding:8px;">Date Paid</td>
+          <td style="padding:8px;">{{payout_date}}</td>
+        </tr>
+      </table>
+
+      <p style="color:#555;">Funds have been deposited to your preferred payout method.</p>
+      <p>– The Saka360 Team</p>
+    </td>
+  </tr>
+</table>

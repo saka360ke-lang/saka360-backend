@@ -1,0 +1,30 @@
+<table style="width:100%;max-width:600px;margin:auto;font-family:Arial,sans-serif;background:#f9f9f9;border-radius:8px;padding:20px;">
+  <tr>
+    <td>
+      <h2 style="color:#ff6600;">Your Monthly Fleet Report</h2>
+      <p>Hi {{user_name}},</p>
+      <p>Your fleet summary for <strong>{{report_month}}</strong> is ready.</p>
+      
+      <table style="width:100%;margin:20px 0;border-collapse:collapse;">
+        <tr style="background:#f2f2f2;">
+          <td style="padding:8px;">Total Fuel Spend</td>
+          <td style="padding:8px;">KES {{total_fuel}}</td>
+        </tr>
+        <tr>
+          <td style="padding:8px;">Total Service Spend</td>
+          <td style="padding:8px;">KES {{total_service}}</td>
+        </tr>
+        <tr>
+          <td style="padding:8px;">Grand Total</td>
+          <td style="padding:8px;">KES {{grand_total}}</td>
+        </tr>
+      </table>
+
+      <p>You can download the detailed report here:</p>
+      <a href="{{download_link}}" style="display:inline-block;padding:12px 24px;background:#ff6600;color:#fff;text-decoration:none;border-radius:6px;">Download Report</a>
+
+      <p style="color:#555;">This link will expire in 7 days for security.</p>
+      <p>– The Saka360 Team</p>
+    </td>
+  </tr>
+</table>

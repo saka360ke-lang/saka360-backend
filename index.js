@@ -1,5 +1,42 @@
-// Load environment variables first
+// Load environment variables
 require('dotenv').config();
+
+// Mailer
+const { sendEmail } = require("./utils/mailer");
+
+app.post("/api/users/register", async (req, res) => {
+  try {
+    const { email, name } = req.body;
+
+    // Generate a fake verification link for demo
+    const verificationLink = `https://saka360.com/verify?token=12345`;
+
+    // Call the email utility
+    await sendEmail(
+      email,
+      "Verify your Saka360 account",
+      "verification", // template file name (verification.hbs)
+      { verification_link: verificationLink }
+    );
+
+    res.json({ message: "User registered. Verification email sent ✅" });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+await sendEmail(
+  user.email,
+  "Your Saka360 Subscription Invoice",
+  "invoice", // invoice.hbs
+  {
+    user_name: user.name,
+    plan_name: "Premium",
+    amount: "2500",
+    date: new Date().toLocaleDateString()
+  }
+);
 
 // Core
 const express = require('express');
