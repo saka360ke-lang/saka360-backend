@@ -1,5 +1,8 @@
 // Load environment variables
 require('dotenv').config();
+const express = require('express');
+const app = express();
+app.use(express.json());
 
 // Mailer
 const { sendEmail } = require("./utils/mailer");
@@ -10,7 +13,6 @@ app.use("/api", testEmailRoutes);
 
 
 // Core
-const express = require('express');
 const { Pool } = require('pg');
 const cron = require('node-cron');
 
@@ -24,9 +26,6 @@ const twilio = require('twilio');
 // AWS S3
 const { S3Client, PutObjectCommand, GetObjectCommand } = require('@aws-sdk/client-s3');
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
-
-const app = express();
-app.use(express.json());
 
 // Example: database connection (uses env var)
 const pool = new Pool({
