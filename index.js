@@ -62,5 +62,21 @@ app.get('/api/test-email', async (req, res) => {
   }
 });
 
+// Simple GET test route for WhatsApp (no authentication required)
+app.get('/api/test-whatsapp', async (req, res) => {
+  try {
+    const testNumber = "+254720641985"; // replace with your WhatsApp number in E.164 format
+    const msg = await sendWhatsAppText(
+      testNumber,
+      "Hello 👋 This is a public test WhatsApp message from Saka360 backend!"
+    );
+
+    res.json({ message: "WhatsApp sent ✅", sid: msg.sid, status: msg.status });
+  } catch (err) {
+    console.error("Test WhatsApp route error:", err);
+    res.status(500).json({ error: "Failed to send WhatsApp", detail: err.message });
+  }
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
