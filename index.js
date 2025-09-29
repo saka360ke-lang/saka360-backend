@@ -1,32 +1,70 @@
-// Load environment variables
-require('dotenv').config();
-const express = require('express');
+// ======================
+// Core / Built-in
+// ======================
+const fs = require("fs");
+
+// ======================
+// Third-party Packages
+// ======================
+const express = require("express");
+const { Pool } = require("pg");
+const bcrypt = require("bcrypt");
+const jwt = require("jsonwebtoken");
+const cron = require("node-cron");
+const nodemailer = require("nodemailer");
+const PDFDocument = require("pdfkit");
+const twilio = require("twilio");
+
+// ======================
+// AWS S3
+// ======================
+const { S3Client, PutObjectCommand, GetObjectCommand } = require("@aws-sdk/client-s3");
+const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
+
+// ======================
+// Express App
+// ======================
 const app = express();
-const { sendEmail } = require("./utils/mailer");
-const twilio = require("twilio");
-const testEmailRoutes = require("./routes/testEmail");
-const { Pool } = require('pg');
-const cron = require('node-cron');
-const bcrypt = require('bcrypt');
-const jwt = require('jsonwebtoken');
-const nodemailer = require('nodemailer');
-const PDFDocument = require('pdfkit');
-const twilio = require('twilio');
 app.use(express.json());
-app.use("/api", testEmailRoutes);
 
-// ----------------------
-// WhatsApp (Twilio)
-// ----------------------
-const twilio = require("twilio");
+// ======================
+// Middleware
+// ======================
+function authenticateToken(req, res, next) {
+  const authHeader = req.headers["authorization"];
+  const token = authHeader && authHeader.split(" ")[1]; // Expecting "Bearer <token>"
 
+  if (!token) {
+    return res.status(401).json({ error: "Access denied. Token required." });
+  }
+
+  jwt.verify(token, process.env.JWT_SECRET || "supersecretkey", (err, user) => {
+    if (err) {
+      return res.status(403).json({ error: "Invalid or expired token" });
+    }
+    req.user = user;
+    next();
+  });
+}
+
+// ======================
+// Database
+// ======================
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+});
+
+// ======================
+// Twilio WhatsApp Setup
+// ======================
 const twilioClient = twilio(
   process.env.TWILIO_ACCOUNT_SID,
   process.env.TWILIO_AUTH_TOKEN
 );
-const TWILIO_WHATSAPP_FROM = process.env.TWILIO_WHATSAPP_FROM; // e.g. 'whatsapp:+14155238886'
+const TWILIO_WHATSAPP_FROM = process.env.TWILIO_WHATSAPP_FROM; // e.g. 'whatsapp:+1415...'
 
 function toWhatsAppAddr(num) {
+  // Expect num in E.164, e.g. +2547XXXXXXXX
   return num.startsWith("whatsapp:") ? num : `whatsapp:${num}`;
 }
 
@@ -40,11 +78,6 @@ async function sendWhatsAppText(toNumberE164, body) {
   console.log("📲 WhatsApp sent:", msg.sid, msg.status);
   return msg;
 }
-
-
-// AWS S3
-const { S3Client, PutObjectCommand, GetObjectCommand } = require('@aws-sdk/client-s3');
-const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 
 // Example: database connection (uses env var)
 const pool = new Pool({
