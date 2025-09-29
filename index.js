@@ -77,7 +77,7 @@ app.get("/api/test-email", async (req, res) => {
 // 3) Test WhatsApp message
 app.get("/api/test-whatsapp", async (req, res) => {
   try {
-    const to = "254720641985"; // replace with your verified WhatsApp number
+    const to = "+254720641985"; // replace with your verified WhatsApp number
     const msg = await sendWhatsAppText(
       to,
       "Hello 👋 This is a Saka360 WhatsApp test message ✅"
