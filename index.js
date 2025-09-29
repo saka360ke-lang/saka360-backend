@@ -79,11 +79,6 @@ async function sendWhatsAppText(toNumberE164, body) {
   return msg;
 }
 
-// Example: database connection (uses env var)
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-});
-
 // Simple test route
 app.get('/api/health', async (req, res) => {
   try {
