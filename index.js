@@ -2,7 +2,6 @@
 require("dotenv").config();
 const express = require("express");
 const { Pool } = require("pg");
-const twilio = require("twilio");
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
 const cron = require("node-cron");
@@ -10,6 +9,7 @@ const PDFDocument = require("pdfkit");
 const fs = require("fs"); // optional, useful for local PDF saving
 
 // Twilio client (WhatsApp + SMS)
+const twilio = require("twilio");
 const twilioClient = twilio(
   process.env.TWILIO_ACCOUNT_SID,
   process.env.TWILIO_AUTH_TOKEN
