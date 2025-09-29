@@ -9,7 +9,6 @@ const PDFDocument = require("pdfkit");
 const fs = require("fs"); // optional, useful for local PDF saving
 
 // Twilio client (WhatsApp + SMS)
-const twilio = require("twilio");
 const twilioClient = twilio(
   process.env.TWILIO_ACCOUNT_SID,
   process.env.TWILIO_AUTH_TOKEN
@@ -47,15 +46,15 @@ app.get("/api/email-verify", async (req, res) => {
   }
 });
 
-// 2) Send a simple plain text test email
+// 2) Test plain email (no template)
 app.get("/api/test-email", async (req, res) => {
   try {
     const to = "huguadventures@gmail.com"; // test inbox
     await sendEmail(
       to,
       "Saka360 Plain Test Email",
-      null,
-      "Hello! 👋 This is a plain-text test from your Saka360 backend."
+      null, // null = no template, will use plain text body
+      "Hello! 👋 This is a public test email from Saka360 backend."
     );
     res.json({ message: "Plain test email sent ✅", to });
   } catch (err) {
@@ -63,6 +62,7 @@ app.get("/api/test-email", async (req, res) => {
     res.status(500).json({ error: "Failed to send test email", detail: err.message });
   }
 });
+
 
 // 3) Send a WhatsApp test message
 app.get("/api/test-whatsapp", async (req, res) => {

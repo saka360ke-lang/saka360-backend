@@ -54,4 +54,10 @@ async function sendEmail(to, subject, templateName = null, variablesOrText = {})
   return info;
 }
 
+if (template) {
+  // load and compile .hbs template
+} else {
+  htmlToSend = body; // if no template, just use body string
+}
+
 module.exports = { sendEmail, verifySmtp };
