@@ -2,26 +2,45 @@
 require('dotenv').config();
 const express = require('express');
 const app = express();
-app.use(express.json());
-
-// Mailer
 const { sendEmail } = require("./utils/mailer");
-
-// TestMail
+const twilio = require("twilio");
 const testEmailRoutes = require("./routes/testEmail");
-app.use("/api", testEmailRoutes);
-
-
-// Core
 const { Pool } = require('pg');
 const cron = require('node-cron');
-
-// Third-party
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const nodemailer = require('nodemailer');
 const PDFDocument = require('pdfkit');
 const twilio = require('twilio');
+app.use(express.json());
+app.use("/api", testEmailRoutes);
+
+// ----------------------
+// WhatsApp (Twilio)
+// ----------------------
+const twilio = require("twilio");
+
+const twilioClient = twilio(
+  process.env.TWILIO_ACCOUNT_SID,
+  process.env.TWILIO_AUTH_TOKEN
+);
+const TWILIO_WHATSAPP_FROM = process.env.TWILIO_WHATSAPP_FROM; // e.g. 'whatsapp:+14155238886'
+
+function toWhatsAppAddr(num) {
+  return num.startsWith("whatsapp:") ? num : `whatsapp:${num}`;
+}
+
+async function sendWhatsAppText(toNumberE164, body) {
+  if (!toNumberE164 || !body) throw new Error("to and body required");
+  const msg = await twilioClient.messages.create({
+    from: TWILIO_WHATSAPP_FROM,
+    to: toWhatsAppAddr(toNumberE164),
+    body,
+  });
+  console.log("📲 WhatsApp sent:", msg.sid, msg.status);
+  return msg;
+}
+
 
 // AWS S3
 const { S3Client, PutObjectCommand, GetObjectCommand } = require('@aws-sdk/client-s3');
