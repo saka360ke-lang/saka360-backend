@@ -1,18 +1,32 @@
-<h2 style="color:#ff6600;">Your Saka360 Subscription Invoice</h2>
-<p>Hi {{user_name}},</p>
-<p>Thank you for subscribing to <strong>{{plan_name}}</strong>.</p>
-
-<table style="width:100%;margin:20px 0;border-collapse:collapse;">
-  <tr style="background:#f2f2f2;">
-    <td style="padding:8px;">Plan</td>
-    <td style="padding:8px;">{{plan_name}}</td>
-  </tr>
-  <tr>
-    <td style="padding:8px;">Amount</td>
-    <td style="padding:8px;">KES {{amount}}</td>
-  </tr>
-  <tr>
-    <td style="padding:8px;">Date</td>
-    <td style="padding:8px;">{{date}}</td>
-  </tr>
-</table>
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>Your Saka360 Subscription Invoice</title>
+  </head>
+  <body style="font-family: Arial, sans-serif; background: #f9f9f9; padding: 20px;">
+    <div style="max-width: 600px; margin: auto; background: #ffffff; padding: 20px; border-radius: 8px;">
+      <h2 style="color: #FF6600;">Your Subscription Invoice</h2>
+      <p>Hi {{user_name}},</p>
+      <p>Here are the details of your subscription:</p>
+      <table style="width: 100%; border-collapse: collapse; margin: 20px 0;">
+        <tr>
+          <td style="padding: 8px; border: 1px solid #ddd;">Plan</td>
+          <td style="padding: 8px; border: 1px solid #ddd;">{{plan_name}}</td>
+        </tr>
+        <tr>
+          <td style="padding: 8px; border: 1px solid #ddd;">Amount</td>
+          <td style="padding: 8px; border: 1px solid #ddd;">KES {{amount}}</td>
+        </tr>
+        <tr>
+          <td style="padding: 8px; border: 1px solid #ddd;">Date</td>
+          <td style="padding: 8px; border: 1px solid #ddd;">{{date}}</td>
+        </tr>
+      </table>
+      <p style="text-align: center;">
+        <a href="https://saka360.com/dashboard" style="background: #FF6600; color: #fff; padding: 12px 24px; text-decoration: none; border-radius: 5px;">Go to Dashboard</a>
+      </p>
+      <p style="color: #888;">Thank you for choosing Saka360 🚀</p>
+    </div>
+  </body>
+</html>

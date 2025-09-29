@@ -1,10 +1,20 @@
-<table style="width:100%;max-width:600px;margin:auto;font-family:Arial,sans-serif;background:#f9f9f9;border-radius:8px;padding:20px;">
-  <tr>
-    <td style="text-align:center;">
-      <h2 style="color:#ff6600;">Welcome to Saka360 🚀</h2>
-      <p>Please confirm your email address to activate your account.</p>
-      <a href="{{verification_link}}" style="display:inline-block;margin:20px 0;padding:12px 24px;background:#ff6600;color:#fff;text-decoration:none;border-radius:6px;">Verify Email</a>
-      <p style="color:#555;">If you didn’t create this account, you can ignore this email.</p>
-    </td>
-  </tr>
-</table>
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>Verify your Saka360 account</title>
+  </head>
+  <body style="font-family: Arial, sans-serif; background: #f9f9f9; padding: 20px;">
+    <div style="max-width: 600px; margin: auto; background: #ffffff; padding: 20px; border-radius: 8px;">
+      <h2 style="color: #FF6600;">Welcome to Saka360 👋</h2>
+      <p>Hi {{user_name}},</p>
+      <p>Thank you for signing up. Please confirm your email address by clicking the button below:</p>
+      <p style="text-align: center;">
+        <a href="{{verification_link}}" style="background: #FF6600; color: #fff; padding: 12px 24px; text-decoration: none; border-radius: 5px;">Verify My Account</a>
+      </p>
+      <p>If the button above doesn’t work, copy and paste this link into your browser:</p>
+      <p>{{verification_link}}</p>
+      <p style="color: #888;">– The Saka360 Team</p>
+    </div>
+  </body>
+</html>

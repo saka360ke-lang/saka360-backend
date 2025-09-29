@@ -1,27 +1,32 @@
-<table style="width:100%;max-width:600px;margin:auto;font-family:Arial,sans-serif;background:#f9f9f9;border-radius:8px;padding:20px;">
-  <tr>
-    <td>
-      <h2 style="color:#ff6600;">Affiliate Payout Receipt</h2>
-      <p>Hi {{affiliate_name}},</p>
-      <p>Thank you for your partnership with Saka360! Here are your payout details for <strong>{{month_period}}</strong>:</p>
-      
-      <table style="width:100%;margin:20px 0;border-collapse:collapse;">
-        <tr style="background:#f2f2f2;">
-          <td style="padding:8px;">Total Bookings</td>
-          <td style="padding:8px;">{{bookings_count}}</td>
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>Your Saka360 Affiliate Payout</title>
+  </head>
+  <body style="font-family: Arial, sans-serif; background: #f9f9f9; padding: 20px;">
+    <div style="max-width: 600px; margin: auto; background: #ffffff; padding: 20px; border-radius: 8px;">
+      <h2 style="color: #28a745;">💰 Affiliate Payout Receipt</h2>
+      <p>Hi {{user_name}},</p>
+      <p>We’re excited to let you know that your affiliate payout has been processed!</p>
+      <table style="width: 100%; border-collapse: collapse; margin: 20px 0;">
+        <tr>
+          <td style="padding: 8px; border: 1px solid #ddd;">Amount Paid</td>
+          <td style="padding: 8px; border: 1px solid #ddd;">KES {{amount}}</td>
         </tr>
         <tr>
-          <td style="padding:8px;">Commission Earned</td>
-          <td style="padding:8px;">KES {{commission_amount}}</td>
+          <td style="padding: 8px; border: 1px solid #ddd;">Period</td>
+          <td style="padding: 8px; border: 1px solid #ddd;">{{period}}</td>
         </tr>
         <tr>
-          <td style="padding:8px;">Date Paid</td>
-          <td style="padding:8px;">{{payout_date}}</td>
+          <td style="padding: 8px; border: 1px solid #ddd;">Payment Method</td>
+          <td style="padding: 8px; border: 1px solid #ddd;">{{method}}</td>
         </tr>
       </table>
-
-      <p style="color:#555;">Funds have been deposited to your preferred payout method.</p>
-      <p>– The Saka360 Team</p>
-    </td>
-  </tr>
-</table>
+      <p style="text-align: center;">
+        <a href="https://saka360.com/dashboard" style="background: #28a745; color: #fff; padding: 12px 24px; text-decoration: none; border-radius: 5px;">View Dashboard</a>
+      </p>
+      <p style="color: #888;">Thank you for being part of the Saka360 Affiliate Program 🚀</p>
+    </div>
+  </body>
+</html>
