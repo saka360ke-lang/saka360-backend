@@ -61,32 +61,6 @@ function fmtDate(d) {
   return dt.toLocaleDateString('en-KE', { year:'numeric', month:'short', day:'numeric' });
 }
 
-// ----- Twilio (WhatsApp) -----
-const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
-const TWILIO_FROM = process.env.TWILIO_WHATSAPP_FROM; // plain number e.g. +14155238886
-
-function toWhatsAppAddr(numE164) {
-  // numE164 must be like +2547xxxxxxx
-  return numE164.startsWith('whatsapp:') ? numE164 : `whatsapp:${numE164}`;
-}
-
-async function sendWhatsAppText(toE164, body) {
-  if (!toE164) throw new Error('Missing recipient');
-  if (!TWILIO_FROM) throw new Error('Missing TWILIO_WHATSAPP_FROM');
-
-  const msg = await twilioClient.messages.create({
-    from: toWhatsAppAddr(TWILIO_FROM),
-    to: toWhatsAppAddr(toE164),
-    body
-  });
-  return msg;
-}
-
-function fmtDate(d) {
-  const dt = new Date(d);
-  return dt.toLocaleDateString('en-KE', { year:'numeric', month:'short', day:'numeric' });
-}
-
 
 
 
