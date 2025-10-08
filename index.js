@@ -62,7 +62,6 @@ function fmtDate(d) {
 }
 
 // ----- Twilio (WhatsApp) -----
-const twilio = require('twilio');
 const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 const TWILIO_FROM = process.env.TWILIO_WHATSAPP_FROM; // plain number e.g. +14155238886
 
