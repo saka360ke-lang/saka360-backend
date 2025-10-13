@@ -1,88 +1,87 @@
 // utils/mailer.js
 const nodemailer = require("nodemailer");
-const fs = require("fs");
-const path = require("path");
-const handlebars = require("handlebars");
 
-// =======================
-// 1. Setup transporter
-// =======================
-const transporter = nodemailer.createTransport({
-  host: process.env.SMTP_HOST || "smtp.hostinger.com",
-  port: process.env.SMTP_PORT || 465,
-  secure: true, // SSL
-  auth: {
+function buildTransporter({ host, port, secure, user, pass }) {
+  return nodemailer.createTransport({
+    host,
+    port: Number(port),
+    secure: secure === true || String(secure).toLowerCase() === "true", // true for 465
+    auth: { user, pass },
+    // helpful timeouts & logs
+    connectionTimeout: 15000, // 15s
+    greetingTimeout: 10000,
+    socketTimeout: 20000,
+    logger: true,
+    debug: true,
+  });
+}
+
+async function trySend({ to, subject, text, html }) {
+  const from = process.env.SMTP_FROM || `Saka360 <${process.env.SMTP_USER}>`;
+
+  // First attempt: .env settings (probably 465/SSL)
+  const t1 = buildTransporter({
+    host: process.env.SMTP_HOST,
+    port: process.env.SMTP_PORT || 465,
+    secure: process.env.SMTP_SECURE ?? true,
     user: process.env.SMTP_USER,
     pass: process.env.SMTP_PASS,
-  },
-});
+  });
 
-// =======================
-// 2. Verify SMTP connection
-// =======================
-async function verifySmtp() {
   try {
-    await transporter.verify();
-    console.log("✅ SMTP connection is ready");
-    return true;
-  } catch (err) {
-    console.error("❌ SMTP verify failed:", err);
-    throw err;
-  }
-}
+    return await t1.sendMail({ from, to, subject, text, html: html || text });
+  } catch (e1) {
+    console.error("❌ SMTP attempt #1 failed:", e1 && e1.message);
 
-// =======================
-// 3. Load and compile template
-// =======================
-function loadTemplate(templateName, variables) {
-  const templatePath = path.join(__dirname, "..", "templates", `${templateName}.hbs`);
-
-  if (!fs.existsSync(templatePath)) {
-    throw new Error(`Template file not found: ${templatePath}`);
-  }
-
-  const source = fs.readFileSync(templatePath, "utf8");
-  const compiled = handlebars.compile(source);
-  return compiled(variables);
-}
-
-// =======================
-// 4. Send Email
-// =======================
-// Usage examples:
-// - With template: sendEmail("user@mail.com", "Verify Account", "verification", { verification_link: "..." })
-// - Plain text: sendEmail("user@mail.com", "Hello", null, "Just testing")
-async function sendEmail(to, subject, templateName = null, variablesOrText = {}) {
-  try {
-    let htmlBody, textBody;
-
-    if (templateName) {
-      // Render from template
-      htmlBody = loadTemplate(templateName, variablesOrText);
-      textBody = subject; // fallback plain text
-    } else {
-      // Use plain text body directly
-      textBody = typeof variablesOrText === "string" ? variablesOrText : "";
-      htmlBody = `<p>${textBody}</p>`;
-    }
-
-    const info = await transporter.sendMail({
-      from: `"Saka360" <${process.env.SMTP_USER}>`,
-      to,
-      subject,
-      text: textBody,
-      html: htmlBody,
+    // Fallback attempt: 587 STARTTLS (common when 465 blocked)
+    const t2 = buildTransporter({
+      host: process.env.SMTP_HOST,
+      port: 587,
+      secure: false, // STARTTLS
+      user: process.env.SMTP_USER,
+      pass: process.env.SMTP_PASS,
     });
 
-    console.log("📧 Email sent:", info.messageId);
-    return info;
-  } catch (err) {
-    console.error("❌ Email error:", err);
-    throw err;
+    try {
+      return await t2.sendMail({ from, to, subject, text, html: html || text });
+    } catch (e2) {
+      console.error("❌ SMTP attempt #2 failed:", e2 && e2.message);
+      throw e2; // bubble up final error
+    }
   }
 }
 
-module.exports = {
-  sendEmail,
-  verifySmtp,
-};
+async function sendEmail(to, subject, templateNameOrNull, valuesOrText) {
+  // For now we’re sending plain text only in the test route
+  const text = typeof valuesOrText === "string" ? valuesOrText : "";
+  return trySend({ to, subject, text });
+}
+
+async function verifySmtp() {
+  const t = buildTransporter({
+    host: process.env.SMTP_HOST,
+    port: process.env.SMTP_PORT || 465,
+    secure: process.env.SMTP_SECURE ?? true,
+    user: process.env.SMTP_USER,
+    pass: process.env.SMTP_PASS,
+  });
+
+  try {
+    await t.verify();
+    return true;
+  } catch (e1) {
+    console.error("❌ verify() on primary failed:", e1 && e1.message);
+    // Retry on 587 STARTTLS
+    const t2 = buildTransporter({
+      host: process.env.SMTP_HOST,
+      port: 587,
+      secure: false,
+      user: process.env.SMTP_USER,
+      pass: process.env.SMTP_PASS,
+    });
+    await t2.verify(); // will throw if also fails
+    return true;
+  }
+}
+
+module.exports = { sendEmail, verifySmtp };
