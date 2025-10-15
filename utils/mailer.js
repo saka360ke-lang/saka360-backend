@@ -1,87 +1,89 @@
 // utils/mailer.js
-const nodemailer = require("nodemailer");
+const fs = require("fs");
+const path = require("path");
+const Handlebars = require("handlebars");
 
-function buildTransporter({ host, port, secure, user, pass }) {
-  return nodemailer.createTransport({
-    host,
-    port: Number(port),
-    secure: secure === true || String(secure).toLowerCase() === "true", // true for 465
-    auth: { user, pass },
-    // helpful timeouts & logs
-    connectionTimeout: 15000, // 15s
-    greetingTimeout: 10000,
-    socketTimeout: 20000,
-    logger: true,
-    debug: true,
-  });
+// Node 18+ has global fetch; if not, uncomment next line:
+// const fetch = (...args) => import('node-fetch').then(({default: f}) => f(...args));
+
+const MAILTRAP_API_TOKEN = process.env.MAILTRAP_API_TOKEN;
+const FROM_EMAIL = process.env.MAIL_FROM_EMAIL || "no-reply@saka360.com";
+const FROM_NAME  = process.env.MAIL_FROM_NAME  || "Saka360";
+
+function renderTemplateIfProvided(templateNameOrNull, variables) {
+  if (!templateNameOrNull) return { html: null }; // no template requested
+  const filePath = path.join(__dirname, "..", "templates", `${templateNameOrNull}.hbs`);
+  const raw = fs.readFileSync(filePath, "utf8");
+  const compiled = Handlebars.compile(raw);
+  const html = compiled(variables || {});
+  return { html };
 }
 
-async function trySend({ to, subject, text, html }) {
-  const from = process.env.SMTP_FROM || `Saka360 <${process.env.SMTP_USER}>`;
+/**
+ * Send email via Mailtrap Email Sending API
+ * @param {string} to - recipient email
+ * @param {string} subject - email subject
+ * @param {string|null} templateName - e.g. 'verification' to load templates/verification.hbs; null for plain text
+ * @param {object|string} payload - if templateName != null => variables; else => plain text string body
+ */
+async function sendEmail(to, subject, templateName = null, payload = "") {
+  if (!MAILTRAP_API_TOKEN) throw new Error("MAILTRAP_API_TOKEN not set");
 
-  // First attempt: .env settings (probably 465/SSL)
-  const t1 = buildTransporter({
-    host: process.env.SMTP_HOST,
-    port: process.env.SMTP_PORT || 465,
-    secure: process.env.SMTP_SECURE ?? true,
-    user: process.env.SMTP_USER,
-    pass: process.env.SMTP_PASS,
-  });
-
-  try {
-    return await t1.sendMail({ from, to, subject, text, html: html || text });
-  } catch (e1) {
-    console.error("❌ SMTP attempt #1 failed:", e1 && e1.message);
-
-    // Fallback attempt: 587 STARTTLS (common when 465 blocked)
-    const t2 = buildTransporter({
-      host: process.env.SMTP_HOST,
-      port: 587,
-      secure: false, // STARTTLS
-      user: process.env.SMTP_USER,
-      pass: process.env.SMTP_PASS,
-    });
-
-    try {
-      return await t2.sendMail({ from, to, subject, text, html: html || text });
-    } catch (e2) {
-      console.error("❌ SMTP attempt #2 failed:", e2 && e2.message);
-      throw e2; // bubble up final error
-    }
+  let text = "";
+  let html = null;
+  if (templateName) {
+    const rendered = renderTemplateIfProvided(templateName, payload || {});
+    html = rendered.html;
+    // provide a simple fallback text
+    text = subject;
+  } else {
+    text = typeof payload === "string" ? payload : JSON.stringify(payload);
   }
+
+  const body = {
+    from: { email: FROM_EMAIL, name: FROM_NAME },
+    to:   [{ email: to }],
+    subject,
+    text,
+    ...(html ? { html } : {}),
+  };
+
+  const res = await fetch("https://send.api.mailtrap.io/api/send", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${MAILTRAP_API_TOKEN}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(body)
+  });
+
+  if (!res.ok) {
+    const errTxt = await res.text().catch(() => "");
+    throw new Error(`Mailtrap API error ${res.status}: ${errTxt}`);
+  }
+
+  const data = await res.json().catch(() => ({}));
+  return data;
 }
 
-async function sendEmail(to, subject, templateNameOrNull, valuesOrText) {
-  // For now we’re sending plain text only in the test route
-  const text = typeof valuesOrText === "string" ? valuesOrText : "";
-  return trySend({ to, subject, text });
-}
-
+/**
+ * Lightweight verification:
+ * - confirms token exists
+ * - hits a tiny API endpoint to confirm networking & auth
+ */
 async function verifySmtp() {
-  const t = buildTransporter({
-    host: process.env.SMTP_HOST,
-    port: process.env.SMTP_PORT || 465,
-    secure: process.env.SMTP_SECURE ?? true,
-    user: process.env.SMTP_USER,
-    pass: process.env.SMTP_PASS,
-  });
+  if (!MAILTRAP_API_TOKEN) throw new Error("MAILTRAP_API_TOKEN not set");
+  // Mailtrap does not have a strict "verify" endpoint; we do a quick HEAD on /api/send
+  const res = await fetch("https://send.api.mailtrap.io/api/send", {
+    method: "OPTIONS",
+    headers: { "Authorization": `Bearer ${MAILTRAP_API_TOKEN}` }
+  }).catch((e) => { throw new Error(`Network check failed: ${e.message}`); });
 
-  try {
-    await t.verify();
-    return true;
-  } catch (e1) {
-    console.error("❌ verify() on primary failed:", e1 && e1.message);
-    // Retry on 587 STARTTLS
-    const t2 = buildTransporter({
-      host: process.env.SMTP_HOST,
-      port: 587,
-      secure: false,
-      user: process.env.SMTP_USER,
-      pass: process.env.SMTP_PASS,
-    });
-    await t2.verify(); // will throw if also fails
+  // Many APIs will return 204/200 for OPTIONS; any error indicates token/network issues.
+  if (res.status >= 200 && res.status < 500) {
     return true;
   }
+  throw new Error(`Verify failed with status ${res.status}`);
 }
 
 module.exports = { sendEmail, verifySmtp };
