@@ -8,9 +8,6 @@ app.use(express.json());
 app.use("/api/payments", paymentRoutes);
 app.use("/api/affiliates", affiliateRoutes);
 
-const paymentRoutes = require("./routes/payments");
-const affiliateRoutes = require("./routes/affiliates");
-
 
 /**
  * ----------------------------------------------------
@@ -144,6 +141,10 @@ app.post("/api/test-whatsapp", async (req, res) => {
     });
   }
 });
+
+const paymentRoutes = require("./routes/payments");
+const affiliateRoutes = require("./routes/affiliates");
+
 
 /**
  * ----------------------------------------------------
