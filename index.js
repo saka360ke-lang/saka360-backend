@@ -42,6 +42,8 @@ app.get("/api/health/db", async (_req, res) => {
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
 const cron = require("node-cron");
+const paymentRoutes = require("./routes/payments");
+const affiliateRoutes = require("./routes/affiliates");
 const PDFDocument = require("pdfkit");
 const fs = require("fs"); // useful for local PDF saving
 
@@ -141,10 +143,6 @@ app.post("/api/test-whatsapp", async (req, res) => {
     });
   }
 });
-
-const paymentRoutes = require("./routes/payments");
-const affiliateRoutes = require("./routes/affiliates");
-
 
 /**
  * ----------------------------------------------------
