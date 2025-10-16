@@ -5,6 +5,13 @@ const express = require("express");
 const app = express();
 app.use(express.json());
 
+app.use("/api/payments", paymentRoutes);
+app.use("/api/affiliates", affiliateRoutes);
+
+const paymentRoutes = require("./routes/payments");
+const affiliateRoutes = require("./routes/affiliates");
+
+
 /**
  * ----------------------------------------------------
  * 1) Minimal health routes (kept FIRST and super safe)
