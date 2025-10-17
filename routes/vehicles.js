@@ -1,3 +1,4 @@
+// routes/vehicles.js
 const express = require("express");
 const { pool, authenticateToken } = require("../shared");
 
@@ -6,7 +7,7 @@ const router = express.Router();
 // Add vehicle
 router.post("/add", authenticateToken, async (req, res) => {
   try {
-    const { name, plate_number, type } = req.body;
+    const { name, plate_number, type } = req.body || {};
     if (!name || !plate_number) return res.status(400).json({ error: "Name and plate number are required" });
 
     const result = await pool.query(
@@ -18,7 +19,7 @@ router.post("/add", authenticateToken, async (req, res) => {
 
     res.status(201).json({ vehicle: result.rows[0] });
   } catch (err) {
-    console.error(err);
+    console.error("Vehicles /add error:", err);
     res.status(500).json({ error: "Server error" });
   }
 });
