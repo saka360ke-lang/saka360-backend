@@ -19,6 +19,7 @@ require('./routes/fuel')(app);
 require('./routes/service')(app);
 require('./routes/documents')(app);
 require('./routes/reminders')(app);
+require('./routes/reports')(app);
 
 
 /**
