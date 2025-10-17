@@ -1,33 +1,39 @@
-const express = require("express");
+// routes/testemail.js
+const express = require('express');
 const router = express.Router();
-const { sendEmail } = require("../utils/mailer");
 
-router.post("/test-email", async (req, res) => {
+// use your existing mailer helpers
+const { sendEmail, verifySmtp } = require('../utils/mailer');
+
+// GET /api/email-verify  -> checks SMTP connection
+router.get('/email-verify', async (_req, res) => {
   try {
-    const { to, template } = req.body;
-
-    const sampleData = {
-      verification: { verification_link: "https://saka360.com/verify?token=TEST123" },
-      invoice: { user_name: "John Doe", plan_name: "Premium", amount: "2500", date: "01/10/2025" },
-      payout: { affiliate_name: "Jane Influencer", month_period: "September 2025", bookings_count: 18, commission_amount: "7200", payout_date: "Oct 5, 2025" },
-      "monthly-report": { user_name: "Fleet Owner", report_month: "September 2025", total_fuel: "52,000", total_service: "18,000", grand_total: "70,000", download_link: "https://saka360.com/download/report123" }
-    };
-
-    if (!sampleData[template]) {
-      return res.status(400).json({ error: "Invalid template name" });
-    }
-
-    await sendEmail(
-      to,
-      `Saka360 Test – ${template}`,
-      template,
-      sampleData[template]
-    );
-
-    res.json({ message: `Test ${template} email sent ✅` });
+    const ok = await verifySmtp();
+    res.json({ ok, message: 'SMTP connection OK ✅' });
   } catch (err) {
-    res.status(500).json({ error: "Failed to send test email", detail: err.message });
+    console.error('SMTP verify error:', err);
+    res.status(500).json({ ok: false, error: 'SMTP verification failed', detail: err.message });
   }
 });
 
-module.exports = router;
+// GET /api/test-email -> sends a simple text email
+router.get('/test-email', async (_req, res) => {
+  try {
+    const to = 'huguadventures@gmail.com'; // change if you want
+    await sendEmail(
+      to,
+      'Saka360 Plain Test Email',
+      null, // null template => plain text body
+      'Hello! 👋 This is a public test email from Saka360 backend.'
+    );
+    res.json({ message: 'Plain test email sent ✅', to });
+  } catch (err) {
+    console.error('Test email error:', err);
+    res.status(500).json({ error: 'Failed to send test email', detail: err.message });
+  }
+});
+
+module.exports = (app) => {
+  // mount under /api
+  app.use('/api', router);
+};
