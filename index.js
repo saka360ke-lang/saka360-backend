@@ -2,13 +2,13 @@
 require("dotenv").config();
 
 const express = require("express");
+const app = express();
+app.use(express.json());
 const { Pool } = require("pg");
-
 const cron = require("node-cron");
 
 // ---------- Create app FIRST ----------
-const app = express();
-app.use(express.json());
+
 
 // ---------- Database (shared pool) ----------
 const pool = new Pool({
