@@ -1,4 +1,4 @@
-// routes/testEmail.js  (or testemail.js - pick ONE name and keep it)
+// routes/testEmail.js
 const express = require("express");
 const router = express.Router();
 const { sendEmail } = require("../utils/mailer");
@@ -7,10 +7,13 @@ const { sendEmail } = require("../utils/mailer");
 router.post("/test-email", async (req, res) => {
   try {
     const { to, template, data } = req.body || {};
+
     if (!to) return res.status(400).json({ error: "Missing 'to' email" });
     if (!template) return res.status(400).json({ error: "Missing 'template' name" });
 
+    // sendEmail(to, subject, templateName (hbs), templateData)
     await sendEmail(to, `Saka360 Test – ${template}`, template, data || {});
+
     res.json({ message: `Test ${template} email sent ✅`, to, template });
   } catch (err) {
     console.error("Test email error:", err);
