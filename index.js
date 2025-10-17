@@ -112,7 +112,7 @@ let paymentsRoutes = null;
 let affiliatesRoutes = null;
 try { paymentsRoutes = require("./routes/payments"); } catch (_) {}
 try { affiliatesRoutes = require("./routes/affiliates"); } catch (_) {}
-const paymentsRoutes = require("./routes/payments");
+
 app.use("/api/payments", paymentsRoutes);
 
 
