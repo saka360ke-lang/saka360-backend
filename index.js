@@ -14,10 +14,9 @@ const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
 });
 app.set("pool", pool); // optional: lets routes read with req.app.get("pool")
-
 require('./routes/fuel')(app);
 require('./routes/service')(app);
-
+require('./routes/documents')(app);
 
 /**
  * ----------------------------------------------------
