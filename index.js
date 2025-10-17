@@ -15,6 +15,10 @@ const pool = new Pool({
 });
 app.set("pool", pool); // optional: lets routes read with req.app.get("pool")
 
+require('./routes/fuel')(app);
+require('./routes/service')(app);
+
+
 /**
  * ----------------------------------------------------
  * 1) Minimal health routes (kept FIRST and super safe)
