@@ -3,6 +3,7 @@ require("dotenv").config();
 
 const express = require("express");
 const { Pool } = require("pg");
+
 const cron = require("node-cron");
 
 // ---------- Create app FIRST ----------
@@ -17,6 +18,8 @@ app.set("pool", pool); // optional: lets routes read with req.app.get("pool")
 require('./routes/fuel')(app);
 require('./routes/service')(app);
 require('./routes/documents')(app);
+require('./routes/reminders')(app);
+
 
 /**
  * ----------------------------------------------------
