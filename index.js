@@ -20,7 +20,7 @@ require('./routes/service')(app);
 require('./routes/documents')(app);
 require('./routes/reminders')(app);
 require('./routes/reports')(app);
-
+require('./routes/testEmail')(app);
 
 /**
  * ----------------------------------------------------
@@ -148,7 +148,7 @@ const serviceRoutes   = require("./routes/service");
 const documentsRoutes = require("./routes/documents");
 const remindersRoutes = require("./routes/reminders");
 const reportsRoutes   = require("./routes/reports");
-const testEmailRoutes = require("./routes/testemail"); // if you keep extra test routes here
+const testEmailRoutes = require("./routes/testEmail"); // if you keep extra test routes here
 
 // Optional routes (only mount if files exist)
 let paymentsRoutes = null;
