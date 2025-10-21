@@ -98,7 +98,7 @@ app.post("/api/test-whatsapp", async (req, res) => {
 */
 
 // EXACT file names (case-sensitive!)
-const usersRoutes     = require("./routes/users");
+const usersRoutes     = require("./routes/users")(app);
 const vehiclesRoutes  = require("./routes/vehicles");
 const fuelRoutes      = require("./routes/fuel");
 const serviceRoutes   = require("./routes/service");
@@ -117,7 +117,6 @@ app.use("/api/payments", paymentsRoutes);
 
 
 // Mount with clear prefixes
-app.use("/api/users", usersRoutes);
 app.use("/api/vehicles", vehiclesRoutes);
 app.use("/api/fuel", fuelRoutes);
 app.use("/api/service", serviceRoutes);
