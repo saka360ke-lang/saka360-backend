@@ -18,6 +18,9 @@ app.get("/api/health", (_req, res) => {
 const { Pool } = require("pg");
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 
+// make pool available to route-modules that expect app.get("pool")
+app.set("pool", pool);
+
 // Optional DB health (does not affect /api/health)
 app.get("/api/health/db", async (_req, res) => {
   try {
@@ -79,64 +82,56 @@ app.post("/api/test-whatsapp", async (req, res) => {
   }
 });
 
-/* -------------------------------------------
- * 3) Mount your real app routes (AFTER above)
- * ------------------------------------------- */
-/*
-  IMPORTANT
-  - Your files exist as:
-    routes/users.js
-    routes/vehicles.js
-    routes/fuel.js
-    routes/service.js
-    routes/documents.js
-    routes/reminders.js
-    routes/reports.js
-    routes/testEmail.js  ← you said this file exists
-  - Each of those files must export an Express Router:  module.exports = router;
-  - Do NOT call them as functions here. Just require and app.use(...)
-*/
-
-// EXACT file names (case-sensitive!)
-require("./routes/users")(app);
-const vehiclesRoutes  = require("./routes/vehicles");
-const fuelRoutes      = require("./routes/fuel");
-const serviceRoutes   = require("./routes/service");
-const documentsRoutes = require("./routes/documents");
-const remindersRoutes = require("./routes/reminders");
-const reportsRoutes   = require("./routes/reports");
-const testEmailRoutes = require("./routes/testEmail"); // file name exactly "testEmail.js"
-
-// Optional routes: only mount if files actually exist in repo
-let paymentsRoutes = null;
-let affiliatesRoutes = null;
-try { paymentsRoutes = require("./routes/payments"); } catch (_) {}
-try { affiliatesRoutes = require("./routes/affiliates"); } catch (_) {}
-
-app.use("/api/payments", paymentsRoutes);
-
-
-// Mount with clear prefixes
-app.use("/api/vehicles", vehiclesRoutes);
-app.use("/api/fuel", fuelRoutes);
-app.use("/api/service", serviceRoutes);
-app.use("/api/docs", documentsRoutes);
-app.use("/api/reminders", remindersRoutes);
-app.use("/api/reports", reportsRoutes);
-app.use("/api", testEmailRoutes); // exposes /api/test-email (POST), /api/test-template (POST)
-
 /* -----------------------
- * 4) Cron (safe stub)
+ * 3) Cron (safe stub)
  * ----------------------- */
 const cron = require("node-cron");
 async function runExpiryCheck() {
   console.log("⏰ runExpiryCheck() stub called (plug in your real logic here).");
 }
+// make available to routes that call app.get("runExpiryCheck")
+app.set("runExpiryCheck", runExpiryCheck);
+
+// Run daily at 08:00 Africa/Nairobi
 cron.schedule(
   "0 8 * * *",
   () => runExpiryCheck().catch((e) => console.error("runExpiryCheck error:", e)),
   { timezone: "Africa/Nairobi" }
 );
+
+/* -------------------------------------------
+ * 4) Mount your real app routes (consistent)
+ * -------------------------------------------
+ * You have TWO kinds of route files:
+ *  A) Export a function(app) and self-mount inside → we CALL them.
+ *     (users, fuel, service, documents, reminders, reports)
+ *  B) Export an Express Router → we app.use(...) them.
+ *     (vehicles, testEmail, optional: payments, affiliates)
+ */
+
+// A) function-style routes (CALL them)
+require("./routes/users")(app);
+require("./routes/fuel")(app);
+require("./routes/service")(app);
+require("./routes/documents")(app);
+require("./routes/reminders")(app);
+require("./routes/reports")(app);
+
+// B) router-style routes (app.use...)
+const testEmailRoutes = require("./routes/testEmail"); // exports Router
+app.use("/api", testEmailRoutes); // exposes /api/test-email (POST) etc.
+
+let vehiclesRoutes = null;
+try { vehiclesRoutes = require("./routes/vehicles"); } catch (_) {}
+if (vehiclesRoutes) app.use("/api/vehicles", vehiclesRoutes);
+
+let paymentsRoutes = null;
+try { paymentsRoutes = require("./routes/payments"); } catch (_) {}
+if (paymentsRoutes) app.use("/api/payments", paymentsRoutes);
+
+let affiliatesRoutes = null;
+try { affiliatesRoutes = require("./routes/affiliates"); } catch (_) {}
+if (affiliatesRoutes) app.use("/api/affiliates", affiliatesRoutes);
 
 /* -----------------------
  * 5) 404 fallback
