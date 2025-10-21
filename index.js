@@ -98,7 +98,7 @@ app.post("/api/test-whatsapp", async (req, res) => {
 */
 
 // EXACT file names (case-sensitive!)
-const usersRoutes     = require("./routes/users")(app);
+require("./routes/users")(app);
 const vehiclesRoutes  = require("./routes/vehicles");
 const fuelRoutes      = require("./routes/fuel");
 const serviceRoutes   = require("./routes/service");
