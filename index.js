@@ -135,6 +135,9 @@ require("./routes/reports")(app);
 const testEmailRoutes = require("./routes/testEmail"); // exports Router
 app.use("/api", testEmailRoutes); // exposes /api/test-email (POST) etc.
 
+const uploadsRoutes = require("./routes/uploads");
+app.use("/api/uploads", uploadsRoutes);
+
 let vehiclesRoutes = null;
 try { vehiclesRoutes = require("./routes/vehicles"); } catch (_) {}
 if (vehiclesRoutes) app.use("/api/vehicles", vehiclesRoutes);
