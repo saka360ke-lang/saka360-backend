@@ -12,6 +12,20 @@ app.get("/api/health", (_req, res) => {
   res.status(200).json({ status: "OK" });
 });
 
+// Security & safety middleware
+const cors = require("cors");
+const helmet = require("helmet");
+const rateLimit = require("express-rate-limit");
+
+app.use(helmet());
+app.use(cors({ origin: "*"})); // tighten later to your frontend domain
+app.use(rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 300, // 300 requests per 15 min per IP
+  standardHeaders: true,
+  legacyHeaders: false
+}));
+
 /* -----------------------------
  * 1) Database (shared pool)
  * ----------------------------- */

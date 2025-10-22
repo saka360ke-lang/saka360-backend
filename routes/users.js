@@ -227,6 +227,33 @@ module.exports = (app) => {
     }
   });
 
+  // ---------- VERIFY EMAIL ----------
+router.get("/verify", async (req, res) => {
+  try {
+    const token = (req.query?.token || "").trim(); // format we used: `${user.id}-${Date.now()}`
+    if (!token || !token.includes("-")) {
+      return res.status(400).json({ error: "Invalid token" });
+    }
+    const userId = token.split("-")[0];
+
+    const q = await pool.query(
+      `UPDATE users SET is_verified = TRUE, updated_at = NOW()
+         WHERE id = $1
+         RETURNING id, email, is_verified`,
+      [userId]
+    );
+
+    if (q.rows.length === 0) {
+      return res.status(404).json({ error: "User not found" });
+    }
+    res.json({ message: "Email verified ✅", user: q.rows[0] });
+  } catch (err) {
+    console.error("users.verify error:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+
   // MOUNT under /api/users
   app.use("/api/users", router);
 };
