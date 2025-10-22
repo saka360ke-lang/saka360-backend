@@ -7,7 +7,7 @@ const { sendEmail } = require("../utils/mailer");
 
 module.exports = (app) => {
   const router = express.Router();
-  const pool = app.get("pool"); // <-- shared pool from index.js
+  const pool = app.get("pool"); // shared pool from index.js
 
   // ---------- REGISTER ----------
   router.post("/register", async (req, res) => {
@@ -37,7 +37,7 @@ module.exports = (app) => {
       try {
         await sendEmail(user.email, "Verify your Saka360 account", "verification", {
           user_name: user.name || "there",
-          verification_link: verificationLink
+          verification_link: verificationLink,
         });
       } catch (e) {
         console.error("sendEmail(verification) warning:", e.message);
@@ -45,7 +45,7 @@ module.exports = (app) => {
 
       return res.json({
         message: "Account created ✅. Verification email sent (if mailer is configured).",
-        user
+        user,
       });
     } catch (err) {
       console.error("users.register error:", err);
@@ -59,19 +59,22 @@ module.exports = (app) => {
   // ---------- LOGIN ----------
   router.post("/login", async (req, res) => {
     try {
-      const { email, whatsapp_number, password } = req.body || {};
+      // small hardening: trim inputs
+      const email = (req.body?.email ?? "").trim();
+      const whatsapp_number = (req.body?.whatsapp_number ?? "").trim();
+      const password = (req.body?.password ?? "");
+
       if ((!email && !whatsapp_number) || !password) {
         return res.status(400).json({ error: "Email or WhatsApp and password are required" });
       }
 
-      // safer predicate with clear parentheses
       const q = await pool.query(
         `SELECT id, name, email, whatsapp_number, password_hash, role, is_verified
            FROM users
-          WHERE ($1::text IS NOT NULL AND LOWER(email) = LOWER($1))
-             OR ($2::text IS NOT NULL AND whatsapp_number = $2)
+          WHERE ($1::text <> '' AND LOWER(email) = LOWER($1))
+             OR ($2::text <> '' AND whatsapp_number = $2)
           LIMIT 1`,
-        [email || null, whatsapp_number || null]
+        [email, whatsapp_number]
       );
 
       if (q.rows.length === 0) {
@@ -81,7 +84,6 @@ module.exports = (app) => {
       const user = q.rows[0];
 
       if (!user.password_hash) {
-        // helps catch bad seed data
         return res.status(500).json({ error: "Account has no password set. Contact support." });
       }
 
@@ -103,8 +105,8 @@ module.exports = (app) => {
           email: user.email,
           whatsapp_number: user.whatsapp_number,
           role: user.role,
-          is_verified: user.is_verified
-        }
+          is_verified: user.is_verified,
+        },
       });
     } catch (err) {
       console.error("users.login error:", err);
@@ -125,6 +127,44 @@ module.exports = (app) => {
       return res.json({ user: q.rows[0] });
     } catch (err) {
       console.error("users.me error:", err);
+      return res.status(500).json({ error: "Server error" });
+    }
+  });
+
+  // ---------- DEV-ONLY: RESET A USER'S PASSWORD (REMOVE AFTER YOU'RE IN) ----------
+  // Security: requires header X-Admin-Reset-Token to equal process.env.ADMIN_RESET_TOKEN
+  router.post("/admin/reset-password", async (req, res) => {
+    try {
+      const adminHeader = req.headers["x-admin-reset-token"];
+      if (!process.env.ADMIN_RESET_TOKEN || adminHeader !== process.env.ADMIN_RESET_TOKEN) {
+        return res.status(403).json({ error: "Forbidden" });
+      }
+
+      const { email, new_password } = req.body || {};
+      if (!email || !new_password) {
+        return res.status(400).json({ error: "email and new_password are required" });
+      }
+
+      const q = await pool.query(
+        `SELECT id FROM users WHERE LOWER(email) = LOWER($1) LIMIT 1`,
+        [email.trim()]
+      );
+      if (q.rows.length === 0) {
+        return res.status(404).json({ error: "User not found" });
+      }
+
+      const hash = await bcrypt.hash(new_password, 10);
+      await pool.query(
+        `UPDATE users
+            SET password_hash = $2,
+                updated_at = NOW()
+          WHERE id = $1`,
+        [q.rows[0].id, hash]
+      );
+
+      return res.json({ ok: true, message: "Password reset ✅" });
+    } catch (err) {
+      console.error("users.admin/reset-password error:", err);
       return res.status(500).json({ error: "Server error" });
     }
   });
