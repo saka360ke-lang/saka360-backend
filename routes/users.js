@@ -131,44 +131,6 @@ module.exports = (app) => {
     }
   });
 
-  // ---------- DEV-ONLY: RESET A USER'S PASSWORD (REMOVE AFTER YOU'RE IN) ----------
-  // Security: requires header X-Admin-Reset-Token to equal process.env.ADMIN_RESET_TOKEN
-  router.post("/admin/reset-password", async (req, res) => {
-    try {
-      const adminHeader = req.headers["x-admin-reset-token"];
-      if (!process.env.ADMIN_RESET_TOKEN || adminHeader !== process.env.ADMIN_RESET_TOKEN) {
-        return res.status(403).json({ error: "Forbidden" });
-      }
-
-      const { email, new_password } = req.body || {};
-      if (!email || !new_password) {
-        return res.status(400).json({ error: "email and new_password are required" });
-      }
-
-      const q = await pool.query(
-        `SELECT id FROM users WHERE LOWER(email) = LOWER($1) LIMIT 1`,
-        [email.trim()]
-      );
-      if (q.rows.length === 0) {
-        return res.status(404).json({ error: "User not found" });
-      }
-
-      const hash = await bcrypt.hash(new_password, 10);
-      await pool.query(
-        `UPDATE users
-            SET password_hash = $2,
-                updated_at = NOW()
-          WHERE id = $1`,
-        [q.rows[0].id, hash]
-      );
-
-      return res.json({ ok: true, message: "Password reset ✅" });
-    } catch (err) {
-      console.error("users.admin/reset-password error:", err);
-      return res.status(500).json({ error: "Server error" });
-    }
-  });
-
   // Mount under /api/users
   app.use("/api/users", router);
 };
