@@ -2,14 +2,16 @@
 const express = require("express");
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
+const crypto = require("crypto");
 const { authenticateToken } = require("../middleware/auth");
 const { sendEmail } = require("../utils/mailer");
 
 module.exports = (app) => {
   const router = express.Router();
-  const pool = app.get("pool"); // shared pool from index.js
+  const pool = app.get("pool"); // shared pg pool from index.js
 
-  // ---------- REGISTER ----------
+  // ============= REGISTER =============
+  // POST /api/users/register
   router.post("/register", async (req, res) => {
     try {
       const { name, email, whatsapp_number, password } = req.body || {};
@@ -34,14 +36,11 @@ module.exports = (app) => {
       const user = result.rows[0];
       const verificationLink = `https://saka360.com/verify?token=${user.id}-${Date.now()}`;
 
-      try {
-        await sendEmail(user.email, "Verify your Saka360 account", "verification", {
-          user_name: user.name || "there",
-          verification_link: verificationLink,
-        });
-      } catch (e) {
-        console.error("sendEmail(verification) warning:", e.message);
-      }
+      // Fire-and-forget (won’t block success if SMTP down)
+      sendEmail(user.email, "Verify your Saka360 account", "verification", {
+        user_name: user.name || "there",
+        verification_link: verificationLink,
+      }).catch((e) => console.error("sendEmail(verification) warning:", e.message));
 
       return res.json({
         message: "Account created ✅. Verification email sent (if mailer is configured).",
@@ -56,10 +55,10 @@ module.exports = (app) => {
     }
   });
 
-  // ---------- LOGIN ----------
+  // ================ LOGIN ================
+  // POST /api/users/login
   router.post("/login", async (req, res) => {
     try {
-      // small hardening: trim inputs
       const email = (req.body?.email ?? "").trim();
       const whatsapp_number = (req.body?.whatsapp_number ?? "").trim();
       const password = (req.body?.password ?? "");
@@ -114,7 +113,8 @@ module.exports = (app) => {
     }
   });
 
-  // ---------- ME ----------
+  // ================= ME =================
+  // GET /api/users/me  (JWT required)
   router.get("/me", authenticateToken, async (req, res) => {
     try {
       const q = await pool.query(
@@ -131,6 +131,102 @@ module.exports = (app) => {
     }
   });
 
-  // Mount under /api/users
+  // ======== FORGOT PASSWORD (send email) ========
+  // POST /api/users/forgot-password   { "email": "user@example.com" }
+  router.post("/forgot-password", async (req, res) => {
+    try {
+      const { email } = req.body || {};
+      if (!email) return res.status(400).json({ error: "Email is required" });
+
+      const uq = await pool.query(
+        `SELECT id, name, email FROM users WHERE LOWER(email) = LOWER($1) LIMIT 1`,
+        [email]
+      );
+
+      // Always return OK (avoid user enumeration)
+      if (uq.rows.length === 0) {
+        return res.json({ ok: true, message: "If that email exists, a reset link has been sent." });
+      }
+
+      const user = uq.rows[0];
+      const token = crypto.randomBytes(32).toString("hex");
+      const expiresMinutes = 60;
+      const expiresAt = new Date(Date.now() + expiresMinutes * 60 * 1000);
+
+      await pool.query(
+        `INSERT INTO password_reset_tokens (user_id, token, expires_at)
+         VALUES ($1, $2, $3)`,
+        [user.id, token, expiresAt]
+      );
+
+      const base = process.env.APP_BASE_URL || "https://saka360.com";
+      const resetLink = `${base}/reset-password?token=${encodeURIComponent(token)}`;
+
+      // Email the link (template: templates/reset-password.hbs)
+      sendEmail(user.email, "Reset your Saka360 password", "reset-password", {
+        user_name: user.name || "there",
+        reset_link: resetLink,
+        expires_minutes: String(expiresMinutes),
+      }).catch((e) => console.error("sendEmail(reset-password) warning:", e.message));
+
+      return res.json({ ok: true, message: "If that email exists, a reset link has been sent." });
+    } catch (err) {
+      console.error("users.forgot-password error:", err);
+      return res.status(500).json({ error: "Server error" });
+    }
+  });
+
+  // ======== RESET PASSWORD (submit token + new pass) ========
+  // POST /api/users/reset-password   { "token":"...", "new_password":"..." }
+  router.post("/reset-password", async (req, res) => {
+    try {
+      const { token, new_password } = req.body || {};
+      if (!token || !new_password) {
+        return res.status(400).json({ error: "token and new_password are required" });
+      }
+      if (new_password.length < 8) {
+        return res.status(400).json({ error: "Password must be at least 8 characters" });
+      }
+
+      const tq = await pool.query(
+        `SELECT prt.id, prt.user_id, prt.expires_at, prt.used_at
+           FROM password_reset_tokens prt
+          WHERE prt.token = $1
+          LIMIT 1`,
+        [token]
+      );
+
+      if (tq.rows.length === 0) {
+        return res.status(400).json({ error: "Invalid or expired token" });
+      }
+
+      const t = tq.rows[0];
+      if (t.used_at) {
+        return res.status(400).json({ error: "This token has already been used" });
+      }
+      if (new Date(t.expires_at).getTime() < Date.now()) {
+        return res.status(400).json({ error: "This token has expired" });
+      }
+
+      const hash = await bcrypt.hash(new_password, 10);
+
+      await pool.query(
+        `UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2`,
+        [hash, t.user_id]
+      );
+
+      await pool.query(
+        `UPDATE password_reset_tokens SET used_at = NOW() WHERE id = $1`,
+        [t.id]
+      );
+
+      return res.json({ ok: true, message: "Password has been reset successfully ✅" });
+    } catch (err) {
+      console.error("users.reset-password error:", err);
+      return res.status(500).json({ error: "Server error" });
+    }
+  });
+
+  // MOUNT under /api/users
   app.use("/api/users", router);
 };
