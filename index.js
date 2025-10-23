@@ -5,6 +5,12 @@ const express = require("express");
 const app = express();
 app.use(express.json());
 
+// ---------------------------
+// Add HTTP request logger
+// ---------------------------
+const morgan = require("morgan");
+app.use(morgan("tiny"));
+
 /* -----------------------------
  * 0) Minimal health first (safe)
  * ----------------------------- */
@@ -18,7 +24,7 @@ const helmet = require("helmet");
 const rateLimit = require("express-rate-limit");
 
 app.use(helmet());
-app.use(cors({ origin: "*"})); // tighten later to your frontend domain
+app.use(cors({ origin: "*" })); // tighten later to your frontend domain
 app.use(rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
   max: 300, // 300 requests per 15 min per IP
@@ -74,6 +80,16 @@ async function sendWhatsAppText(toE164, body) {
   });
 }
 
+// --------------------------------------------------------------------
+// Safe wrapper for WhatsApp sending (never throws inside scheduled jobs)
+// --------------------------------------------------------------------
+function sendWhatsAppTextSafe(to, body) {
+  // best-effort sender that never throws at call site
+  return sendWhatsAppText(to, body).catch(err => {
+    console.error("sendWhatsAppTextSafe error:", err.message);
+  });
+}
+
 // SMTP verify (quick infra check)
 app.get("/api/email-verify", async (_req, res) => {
   try {
@@ -97,19 +113,20 @@ app.post("/api/test-whatsapp", async (req, res) => {
 });
 
 /* -----------------------
- * 3) Cron (safe stub)
+ * 3) Cron (real implementation)
  * ----------------------- */
 const cron = require("node-cron");
-async function runExpiryCheck() {
-  console.log("⏰ runExpiryCheck() stub called (plug in your real logic here).");
-}
-// make available to routes that call app.get("runExpiryCheck")
-app.set("runExpiryCheck", runExpiryCheck);
+const { runExpiryCheckCore } = require("./utils/reminders");
+
+// Register the callable version (for routes to trigger manually)
+app.set("runExpiryCheck", () => runExpiryCheckCore(pool, sendWhatsAppTextSafe));
 
 // Run daily at 08:00 Africa/Nairobi
 cron.schedule(
   "0 8 * * *",
-  () => runExpiryCheck().catch((e) => console.error("runExpiryCheck error:", e)),
+  () => runExpiryCheckCore(pool, sendWhatsAppTextSafe).catch(e =>
+    console.error("runExpiryCheckCore error:", e)
+  ),
   { timezone: "Africa/Nairobi" }
 );
 
