@@ -1,88 +1,84 @@
-// utils/s3.js (AWS SDK v2)
+// utils/s3.js  (AWS SDK v2)
 const AWS = require("aws-sdk");
-const { v4: uuidv4 } = require("uuid");
 const path = require("path");
 
+// Read env
 const {
-  AWS_REGION,
   AWS_ACCESS_KEY_ID,
   AWS_SECRET_ACCESS_KEY,
-  S3_BUCKET,
+  AWS_SESSION_TOKEN, // optional
+  AWS_REGION,
+  S3_BUCKET
 } = process.env;
 
-if (!AWS_REGION) throw new Error("AWS_REGION is missing");
-if (!AWS_ACCESS_KEY_ID) throw new Error("AWS_ACCESS_KEY_ID is missing");
-if (!AWS_SECRET_ACCESS_KEY) throw new Error("AWS_SECRET_ACCESS_KEY is missing");
-if (!S3_BUCKET) throw new Error("S3_BUCKET is missing");
+// Minimal validation (no secrets logged)
+function assertEnv() {
+  const errs = [];
+  if (!AWS_ACCESS_KEY_ID) errs.push("AWS_ACCESS_KEY_ID missing");
+  if (!AWS_SECRET_ACCESS_KEY) errs.push("AWS_SECRET_ACCESS_KEY missing");
+  if (!AWS_REGION) errs.push("AWS_REGION missing");
+  if (!S3_BUCKET) errs.push("S3_BUCKET missing");
+  if (errs.length) {
+    throw new Error("[s3] Missing env: " + errs.join(", "));
+  }
+}
+assertEnv();
 
-// Configure SDK v2
-AWS.config.update({
+// Configure AWS SDK v2
+const base = {
   region: AWS_REGION,
-  credentials: new AWS.Credentials({
+  signatureVersion: "v4",
+};
+if (AWS_SESSION_TOKEN) {
+  AWS.config.update({
+    ...base,
+    credentials: new AWS.Credentials(
+      AWS_ACCESS_KEY_ID,
+      AWS_SECRET_ACCESS_KEY,
+      AWS_SESSION_TOKEN
+    ),
+  });
+} else {
+  AWS.config.update({
+    ...base,
     accessKeyId: AWS_ACCESS_KEY_ID,
     secretAccessKey: AWS_SECRET_ACCESS_KEY,
-  }),
-});
-
-const s3 = new AWS.S3({ signatureVersion: "v4" });
-
-// ---------- helpers ----------
-function sanitizeFilename(name = "file") {
-  const base = path.basename(name).replace(/[^\w.\-+]+/g, "_");
-  return base.length ? base : "file";
-}
-function two(n) {
-  return String(n).padStart(2, "0");
-}
-function makeObjectKey(userId, originalName) {
-  const now = new Date();
-  const yyyy = now.getFullYear();
-  const mm = two(now.getMonth() + 1);
-  const id = uuidv4();
-  const safe = sanitizeFilename(originalName);
-  return `uploads/${userId || "anon"}/${yyyy}/${mm}/${id}-${safe}`;
+  });
 }
 
-// ---------- API (same signatures you’re already using) ----------
-async function signPutUrl({ key, contentType = "application/octet-stream", expiresIn = 900 }) {
+const s3 = new AWS.S3({ apiVersion: "2006-03-01" });
+
+// Helper: clean key (optional)
+function safeKey(p) {
+  return p.replace(/^\//, "");
+}
+
+// Create a presigned PUT URL (upload)
+async function getPresignedPutUrl({ key, contentType = "application/octet-stream", expiresInSec = 300 }) {
+  if (!key) throw new Error("key is required");
   const params = {
     Bucket: S3_BUCKET,
-    Key: key,
-    Expires: expiresIn, // seconds
+    Key: safeKey(key),
+    Expires: expiresInSec,
     ContentType: contentType,
+    // optional: ACL: "private",
   };
-  const url = await s3.getSignedUrlPromise("putObject", params);
-  return { url, key, method: "PUT", contentType, expiresIn };
+  return s3.getSignedUrlPromise("putObject", params);
 }
 
-async function signGetUrl({ key, expiresIn = 900, responseContentDisposition }) {
+// Create a presigned GET URL (download)
+async function getPresignedGetUrl({ key, expiresInSec = 300 }) {
+  if (!key) throw new Error("key is required");
   const params = {
     Bucket: S3_BUCKET,
-    Key: key,
-    Expires: expiresIn,
-    ...(responseContentDisposition ? { ResponseContentDisposition: responseContentDisposition } : {}),
+    Key: safeKey(key),
+    Expires: expiresInSec,
   };
-  const url = await s3.getSignedUrlPromise("getObject", params);
-  return { url, key, method: "GET", expiresIn };
-}
-
-async function deleteObject(key) {
-  await s3.deleteObject({ Bucket: S3_BUCKET, Key: key }).promise();
-  return { ok: true, key };
-}
-
-async function isAlive() {
-  await s3
-    .headBucket({ Bucket: S3_BUCKET })
-    .promise();
-  return true;
+  return s3.getSignedUrlPromise("getObject", params);
 }
 
 module.exports = {
   s3,
-  makeObjectKey,
-  signPutUrl,
-  signGetUrl,
-  deleteObject,
-  isAlive,
+  getPresignedPutUrl,
+  getPresignedGetUrl,
 };

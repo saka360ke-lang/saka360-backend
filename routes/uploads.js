@@ -14,6 +14,22 @@ router.get("/health", authenticateToken, async (req, res) => {
   }
 });
 
+// TEMP
+// routes/uploads.js (add at top with other routes)
+router.get("/debug/aws", (req, res) => {
+  const hasAKID = !!process.env.AWS_ACCESS_KEY_ID;
+  const hasSK   = !!process.env.AWS_SECRET_ACCESS_KEY;
+  const hasTok  = !!process.env.AWS_SESSION_TOKEN;
+  res.json({
+    region: process.env.AWS_REGION || null,
+    bucket: process.env.S3_BUCKET || null,
+    accessKeyIdPresent: hasAKID,
+    secretPresent: hasSK,
+    sessionTokenPresent: hasTok
+  });
+});
+
+
 /**
  * POST /api/uploads/sign-put
  * Body: { filename: "report.pdf", contentType: "application/pdf" }
