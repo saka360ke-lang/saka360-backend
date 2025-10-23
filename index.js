@@ -23,11 +23,30 @@ const cors = require("cors");
 const helmet = require("helmet");
 const rateLimit = require("express-rate-limit");
 
+// Helmet (secure headers)
 app.use(helmet());
-app.use(cors({ origin: "*" })); // tighten later to your frontend domain
+
+// Lock CORS to specific origins via env ALLOWED_ORIGINS
+const ALLOWED = (process.env.ALLOWED_ORIGINS || "")
+  .split(",")
+  .map(s => s.trim())
+  .filter(Boolean);
+
+app.use(cors({
+  origin(origin, cb) {
+    // Allow no-origin requests (e.g., Postman, curl) OR explicit allowed origins
+    if (!origin || ALLOWED.includes(origin)) return cb(null, true);
+    return cb(new Error(`CORS blocked for origin: ${origin}`));
+  },
+  credentials: true,               // allow cookies if you ever need them
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"]
+}));
+
+// Rate limiting
 app.use(rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 300, // 300 requests per 15 min per IP
+  windowMs: 15 * 60 * 1000,
+  max: 300,
   standardHeaders: true,
   legacyHeaders: false
 }));
@@ -90,8 +109,10 @@ function sendWhatsAppTextSafe(to, body) {
   });
 }
 
-// SMTP verify (quick infra check)
-app.get("/api/email-verify", async (_req, res) => {
+const { authenticateToken, adminOnly } = require("./middleware/auth");
+
+// SMTP verify (admin-only)
+app.get("/api/email-verify", authenticateToken, adminOnly, async (_req, res) => {
   try {
     const ok = await verifySmtp();
     res.json({ ok, message: "SMTP connection OK ✅" });
@@ -100,8 +121,8 @@ app.get("/api/email-verify", async (_req, res) => {
   }
 });
 
-// WhatsApp test (POST { to: "+2547...", body?: "..." })
-app.post("/api/test-whatsapp", async (req, res) => {
+// WhatsApp test (admin-only)
+app.post("/api/test-whatsapp", authenticateToken, adminOnly, async (req, res) => {
   try {
     const { to, body } = req.body || {};
     if (!to) return res.status(400).json({ error: "Missing 'to' (E.164 like +2547XXXXXXXX)" });
@@ -111,6 +132,7 @@ app.post("/api/test-whatsapp", async (req, res) => {
     res.status(500).json({ error: "Failed to send WhatsApp", detail: err.message });
   }
 });
+
 
 /* -----------------------
  * 3) Cron (real implementation)
