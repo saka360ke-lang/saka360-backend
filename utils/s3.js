@@ -1,67 +1,84 @@
-// utils/s3.js
-const { S3Client, GetObjectCommand, PutObjectCommand } = require("@aws-sdk/client-s3");
-const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
+// utils/s3.js  (AWS SDK v2)
+const AWS = require("aws-sdk");
+const path = require("path");
 
+// Read env
 const {
-  AWS_REGION,
   AWS_ACCESS_KEY_ID,
   AWS_SECRET_ACCESS_KEY,
-  AWS_SESSION_TOKEN,
-  S3_BUCKET,
+  AWS_SESSION_TOKEN, // optional
+  AWS_REGION,
+  S3_BUCKET
 } = process.env;
 
-function getS3() {
-  if (!AWS_REGION) throw new Error("Missing AWS_REGION");
-  if (!S3_BUCKET) throw new Error("Missing S3_BUCKET");
+// Minimal validation (no secrets logged)
+function assertEnv() {
+  const errs = [];
+  if (!AWS_ACCESS_KEY_ID) errs.push("AWS_ACCESS_KEY_ID missing");
+  if (!AWS_SECRET_ACCESS_KEY) errs.push("AWS_SECRET_ACCESS_KEY missing");
+  if (!AWS_REGION) errs.push("AWS_REGION missing");
+  if (!S3_BUCKET) errs.push("S3_BUCKET missing");
+  if (errs.length) {
+    throw new Error("[s3] Missing env: " + errs.join(", "));
+  }
+}
+assertEnv();
 
-  // If you’re using long-lived keys, both must be present.
-  // If you’re using instance roles or Render’s IAM, the SDK will resolve creds automatically.
-  const credentials =
-    AWS_ACCESS_KEY_ID && AWS_SECRET_ACCESS_KEY
-      ? {
-          accessKeyId: AWS_ACCESS_KEY_ID,
-          secretAccessKey: AWS_SECRET_ACCESS_KEY,
-          sessionToken: AWS_SESSION_TOKEN || undefined,
-        }
-      : undefined;
-
-  return new S3Client({ region: AWS_REGION, credentials });
+// Configure AWS SDK v2
+const base = {
+  region: AWS_REGION,
+  signatureVersion: "v4",
+};
+if (AWS_SESSION_TOKEN) {
+  AWS.config.update({
+    ...base,
+    credentials: new AWS.Credentials(
+      AWS_ACCESS_KEY_ID,
+      AWS_SECRET_ACCESS_KEY,
+      AWS_SESSION_TOKEN
+    ),
+  });
+} else {
+  AWS.config.update({
+    ...base,
+    accessKeyId: AWS_ACCESS_KEY_ID,
+    secretAccessKey: AWS_SECRET_ACCESS_KEY,
+  });
 }
 
-/** Debug helper used by /api/uploads/debug/aws */
-function debugAws() {
-  return {
-    region: AWS_REGION || null,
-    bucket: S3_BUCKET || null,
-    accessKeyIdPresent: Boolean(AWS_ACCESS_KEY_ID),
-    secretPresent: Boolean(AWS_SECRET_ACCESS_KEY),
-    sessionTokenPresent: Boolean(AWS_SESSION_TOKEN),
-  };
+const s3 = new AWS.S3({ apiVersion: "2006-03-01" });
+
+// Helper: clean key (optional)
+function safeKey(p) {
+  return p.replace(/^\//, "");
 }
 
-/** Create a presigned GET URL to download an object */
-async function getPresignedGetUrl({ key, expiresInSec = 300 }) {
-  if (!key) throw new Error("key is required");
-  const s3 = getS3();
-  const cmd = new GetObjectCommand({ Bucket: S3_BUCKET, Key: key });
-  return getSignedUrl(s3, cmd, { expiresIn: expiresInSec });
-}
-
-/** Create a presigned PUT URL to upload an object */
+// Create a presigned PUT URL (upload)
 async function getPresignedPutUrl({ key, contentType = "application/octet-stream", expiresInSec = 300 }) {
   if (!key) throw new Error("key is required");
-  const s3 = getS3();
-  const cmd = new PutObjectCommand({
+  const params = {
     Bucket: S3_BUCKET,
-    Key: key,
+    Key: safeKey(key),
+    Expires: expiresInSec,
     ContentType: contentType,
-    // You can add ACL/metadata here if you need
-  });
-  return getSignedUrl(s3, cmd, { expiresIn: expiresInSec });
+    // optional: ACL: "private",
+  };
+  return s3.getSignedUrlPromise("putObject", params);
+}
+
+// Create a presigned GET URL (download)
+async function getPresignedGetUrl({ key, expiresInSec = 300 }) {
+  if (!key) throw new Error("key is required");
+  const params = {
+    Bucket: S3_BUCKET,
+    Key: safeKey(key),
+    Expires: expiresInSec,
+  };
+  return s3.getSignedUrlPromise("getObject", params);
 }
 
 module.exports = {
-  debugAws,
-  getPresignedGetUrl,
+  s3,
   getPresignedPutUrl,
+  getPresignedGetUrl,
 };
