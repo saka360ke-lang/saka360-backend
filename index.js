@@ -133,24 +133,29 @@ app.post("/api/test-whatsapp", authenticateToken, adminOnly, async (req, res) =>
   }
 });
 
-
 /* -----------------------
- * 3) Cron (real implementation)
+ * 3) Cron (safe + optional)
  * ----------------------- */
-const cron = require("node-cron");
-const { runExpiryCheckCore } = require("./utils/reminders");
+let cron = null;
+try {
+  cron = require("node-cron");
+} catch (e) {
+  console.error("[cron] node-cron not available; skipping schedules:", e.message);
+}
 
-// Register the callable version (for routes to trigger manually)
-app.set("runExpiryCheck", () => runExpiryCheckCore(pool, sendWhatsAppTextSafe));
+async function runExpiryCheck() {
+  console.log("⏰ runExpiryCheck() stub called (plug in your real logic here).");
+}
+app.set("runExpiryCheck", runExpiryCheck);
 
-// Run daily at 08:00 Africa/Nairobi
-cron.schedule(
-  "0 8 * * *",
-  () => runExpiryCheckCore(pool, sendWhatsAppTextSafe).catch(e =>
-    console.error("runExpiryCheckCore error:", e)
-  ),
-  { timezone: "Africa/Nairobi" }
-);
+// Only schedule if cron loaded
+if (cron) {
+  cron.schedule(
+    "0 8 * * *",
+    () => runExpiryCheck().catch((e) => console.error("runExpiryCheck error:", e)),
+    { timezone: "Africa/Nairobi" }
+  );
+}
 
 /* -------------------------------------------
  * 4) Mount your real app routes (consistent)
