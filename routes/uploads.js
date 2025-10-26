@@ -3,6 +3,24 @@ const express = require("express");
 const router = express.Router();
 const { signPutUrl, signGetUrl, publicUrl } = require("../utils/s3");
 
+// routes/uploads.js (add near the top, after the existing requires)
+router.get("/ping", (_req, res) => {
+  res.json({ ok: true, uploads_router: true });
+});
+
+router.get("/diag", (_req, res) => {
+  // Redact secrets; only show presence
+  const env = {
+    S3_REGION: !!process.env.S3_REGION,
+    S3_BUCKET: !!process.env.S3_BUCKET,
+    S3_ACCESS_KEY_ID_present: !!process.env.S3_ACCESS_KEY_ID,
+    S3_SECRET_ACCESS_KEY_present: !!process.env.S3_SECRET_ACCESS_KEY,
+    S3_SESSION_TOKEN_present: !!process.env.S3_SESSION_TOKEN
+  };
+  res.json({ ok: true, env });
+});
+
+
 /**
  * POST /api/uploads/sign-put
  * Body: { key, contentType?, expiresIn? }
