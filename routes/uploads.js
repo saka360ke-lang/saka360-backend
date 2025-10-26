@@ -1,162 +1,171 @@
 // routes/uploads.js
 const express = require("express");
 const router = express.Router();
-const { authenticateToken } = require("../middleware/auth");
-const { signPutUrl, signGetUrl, publicUrl, safeDeleteObject } = require("../utils/s3");
+const { signPutUrl, signGetUrl, publicUrl, deleteObjectSafe } = require("../utils/s3");
 
-/** Helpers */
-function userPrefix(userId) {
-  // all user uploads live under this prefix
-  return `users/${userId}/`;
-}
-function ensureUserKey(userId, key) {
-  const allowed = userPrefix(userId);
-  if (!key || typeof key !== "string") throw new Error("Missing or invalid key");
-  if (!key.startsWith(allowed)) {
-    throw new Error(`Key must start with "${allowed}"`);
-  }
+// --- helpers ---
+function cleanKey(raw) {
+  if (!raw) return null;
+  let k = String(raw).trim();
+
+  // If someone pasted a full URL, reject (we only want the key)
+  if (/^https?:\/\//i.test(k)) return null;
+
+  // Decode URL-encoded keys (docs%2Ffile.pdf -> docs/file.pdf)
+  try { k = decodeURIComponent(k); } catch (_) {}
+  // remove accidental leading slash
+  if (k.startsWith("/")) k = k.slice(1);
+
+  // very basic sanity: must contain at least one slash (folder/key)
+  if (!k.includes("/")) return null;
+
+  return k;
 }
 
-/**
- * POST /api/uploads/sign-put
- * Body: { key, contentType?, contentDisposition?, expiresIn? }
- */
-router.post("/sign-put", authenticateToken, async (req, res) => {
+function toIntOrNull(v) {
+  if (v === undefined || v === null || v === "") return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? Math.trunc(n) : null;
+}
+
+// -----------------------------
+// 1) Sign PUT
+// -----------------------------
+router.post("/sign-put", async (req, res) => {
   try {
-    const { key, contentType, contentDisposition, expiresIn } = req.body || {};
-    ensureUserKey(req.user.id, key);
+    const { key, contentType, expiresIn } = req.body || {};
+    const cleaned = cleanKey(key);
+    if (!cleaned) {
+      return res.status(400).json({
+        error: "Missing 'key' in body",
+        hint: "Send JSON like { \"key\":\"docs/my.pdf\", \"contentType\":\"application/pdf\" }"
+      });
+    }
 
-    const out = await signPutUrl({ key, contentType, contentDisposition, expiresIn });
+    const out = await signPutUrl({ key: cleaned, contentType, expiresIn });
     res.json({ method: "PUT", ...out });
   } catch (err) {
     console.error("sign-put error:", err);
-    res.status(400).json({ error: err.message || "Failed to create PUT URL" });
+    res.status(500).json({ error: "Failed to create PUT URL", detail: err.message });
   }
 });
 
-/**
- * POST /api/uploads/sign-get
- * Body: { key, expiresIn?, download?: boolean, filename?: string }
- */
-router.post("/sign-get", authenticateToken, async (req, res) => {
+// -----------------------------
+// 2) Sign GET
+// -----------------------------
+router.post("/sign-get", async (req, res) => {
   try {
-    const { key, expiresIn, download, filename } = req.body || {};
-    ensureUserKey(req.user.id, key);
-
-    let contentDisposition;
-    if (download) {
-      contentDisposition = filename ? `attachment; filename="${filename}"` : "attachment";
+    const { key, file_key, expiresIn } = req.body || {};
+    const cleaned = cleanKey(file_key || key);
+    if (!cleaned) {
+      return res.status(400).json({
+        error: "Missing 'key' in body",
+        hint: "Send JSON like { \"key\":\"docs/my.pdf\" }"
+      });
     }
 
-    const out = await signGetUrl({ key, expiresIn, contentDisposition });
-    res.json(out);
+    const out = await signGetUrl({ key: cleaned, expiresIn });
+    res.json(out); // { url, key, expiresInSec, method:"GET" }
   } catch (err) {
     console.error("sign-get error:", err);
-    res.status(400).json({ error: err.message || "Failed to create GET URL" });
+    res.status(500).json({ error: "Failed to create GET URL", detail: err.message });
   }
 });
 
-/**
- * POST /api/uploads/finalize
- * Body: { key, contentType?, sizeBytes?, label? }
- * Saves a DB record tied to the current user.
- */
-router.post("/finalize", authenticateToken, async (req, res) => {
+// -----------------------------
+// 3) Finalize (DB record)
+// -----------------------------
+router.post("/finalize", async (req, res) => {
   try {
     const pool = req.app.get("pool");
-    const { key, contentType, sizeBytes, label } = req.body || {};
-    ensureUserKey(req.user.id, key);
+    if (!pool) return res.status(500).json({ error: "DB pool not available" });
 
-    const q = await pool.query(
-      `INSERT INTO files (user_id, bucket, s3_key, content_type, size_bytes, label)
-       VALUES ($1,$2,$3,$4,$5,$6)
-       ON CONFLICT (s3_key) DO UPDATE
-         SET user_id=$1, content_type=$4, size_bytes=$5, label=$6
-       RETURNING *`,
-      [
-        req.user.id,
-        process.env.S3_BUCKET,
-        key,
-        contentType || null,
-        sizeBytes || null,
-        label || null
-      ]
-    );
+    const {
+      file_key,     // preferred
+      key,          // allowed fallback
+      content_type,
+      size_bytes,
+      label,
+      user_id
+    } = req.body || {};
 
-    res.json({ ok: true, file: q.rows[0], publicUrl: publicUrl(key) });
+    const cleaned = cleanKey(file_key || key);
+    if (!cleaned) {
+      return res.status(400).json({
+        error: "Missing or invalid key",
+        hint: "Provide { \"file_key\":\"docs/your-file.pdf\" } (not a full URL)"
+      });
+    }
+
+    const size = toIntOrNull(size_bytes);
+
+    const BUCKET = process.env.S3_BUCKET;
+    if (!BUCKET) return res.status(500).json({ error: "S3_BUCKET env not set" });
+
+    const sql = `
+      INSERT INTO files (user_id, bucket, s3_key, content_type, size_bytes, label)
+      VALUES ($1,$2,$3,$4,$5,$6)
+      ON CONFLICT (s3_key) DO UPDATE
+      SET content_type = COALESCE(EXCLUDED.content_type, files.content_type),
+          size_bytes   = COALESCE(EXCLUDED.size_bytes, files.size_bytes),
+          label        = COALESCE(EXCLUDED.label, files.label)
+      RETURNING id, user_id, bucket, s3_key, content_type, size_bytes, label, created_at
+    `;
+
+    const vals = [ user_id || null, BUCKET, cleaned, content_type || null, size, label || null ];
+    const r = await pool.query(sql, vals);
+    const file = r.rows[0];
+
+    return res.json({
+      ok: true,
+      file,
+      publicUrl: publicUrl(cleaned)
+    });
   } catch (err) {
-    console.error("finalize error:", err);
+    console.error("uploads.finalize error:", err);
     res.status(500).json({ error: "Failed to save file record", detail: err.message });
   }
 });
 
-/**
- * GET /api/uploads/my
- * Returns latest files for the current user.
- */
-router.get("/my", authenticateToken, async (req, res) => {
+// -----------------------------
+// 4) Optional: list recent files for quick checks
+// -----------------------------
+router.get("/files", async (req, res) => {
   try {
     const pool = req.app.get("pool");
-    const q = await pool.query(
-      `SELECT id, s3_key, bucket, content_type, size_bytes, label, created_at
+    const r = await pool.query(
+      `SELECT id, user_id, bucket, s3_key, content_type, size_bytes, label, created_at
        FROM files
-       WHERE user_id = $1
        ORDER BY created_at DESC
-       LIMIT 100`,
-      [req.user.id]
+       LIMIT 25`
     );
-    res.json({ files: q.rows });
+    res.json({ files: r.rows });
   } catch (err) {
-    console.error("my files error:", err);
+    console.error("uploads.files error:", err);
     res.status(500).json({ error: "Failed to list files" });
   }
 });
 
-/**
- * DELETE /api/uploads/by-key
- * Body: { key }
- * Deletes the S3 object and the DB record (only if it belongs to the user).
- */
-router.delete("/by-key", authenticateToken, async (req, res) => {
+// -----------------------------
+// 5) Optional: delete by key (S3 + DB)
+// -----------------------------
+router.delete("/", async (req, res) => {
   try {
-    const { key } = req.body || {};
-    ensureUserKey(req.user.id, key);
-
     const pool = req.app.get("pool");
+    const { key, file_key } = req.body || {};
+    const cleaned = cleanKey(file_key || key);
+    if (!cleaned) return res.status(400).json({ error: "Missing or invalid key" });
 
-    // Ensure the record belongs to this user
-    const check = await pool.query(
-      `SELECT id FROM files WHERE s3_key=$1 AND user_id=$2 LIMIT 1`,
-      [key, req.user.id]
-    );
-    if (check.rows.length === 0) {
-      return res.status(404).json({ error: "File not found" });
-    }
+    // Delete in S3 (best effort)
+    await deleteObjectSafe(cleaned);
 
-    // Best-effort delete in S3 (never throws at caller)
-    await safeDeleteObject(key);
+    // Delete in DB
+    await pool.query(`DELETE FROM files WHERE s3_key = $1`, [cleaned]);
 
-    // Delete DB record
-    await pool.query(`DELETE FROM files WHERE s3_key=$1 AND user_id=$2`, [key, req.user.id]);
-
-    res.json({ ok: true, deleted: key });
+    res.json({ ok: true, deleted_key: cleaned });
   } catch (err) {
-    console.error("delete by-key error:", err);
-    res.status(400).json({ error: err.message || "Failed to delete" });
-  }
-});
-
-/**
- * GET /api/uploads/public-url?key=...
- * (Kept for convenience—still requires auth and enforces prefix)
- */
-router.get("/public-url", authenticateToken, (req, res) => {
-  try {
-    const { key } = req.query || {};
-    ensureUserKey(req.user.id, key);
-    return res.json({ url: publicUrl(key) });
-  } catch (err) {
-    return res.status(400).json({ error: err.message || "Invalid key" });
+    console.error("uploads.delete error:", err);
+    res.status(500).json({ error: "Failed to delete", detail: err.message });
   }
 });
 
