@@ -1,82 +1,43 @@
 // routes/uploads.js
 const express = require("express");
 const router = express.Router();
+const { signPutUrl, signGetUrl, publicUrl } = require("../utils/s3");
 
-const {
-  debugAws,
-  getPresignedGetUrl,
-  getPresignedPutUrl,
-} = require("../utils/s3");
-
-// --- Debug your AWS env quickly ---
-router.get("/debug/aws", (_req, res) => {
-  try {
-    return res.json(debugAws());
-  } catch (err) {
-    return res.status(500).json({ error: "Debug failed", detail: err.message });
-  }
-});
-
-// --- POST: create presigned GET URL ---
-router.post("/sign-get", async (req, res) => {
-  try {
-    const { key, expiresInSec = 300 } = req.body || {};
-    if (!key) return res.status(400).json({ error: "Missing 'key' in body" });
-
-    const url = await getPresignedGetUrl({ key, expiresInSec: Number(expiresInSec) });
-    return res.json({ method: "GET", key, expiresInSec: Number(expiresInSec), url });
-  } catch (err) {
-    console.error("sign-get error:", err);
-    return res.status(500).json({ error: "Failed to create GET URL", detail: err.message });
-  }
-});
-
-// --- POST: create presigned PUT URL ---
+// POST /api/uploads/sign-put  { key, contentType?, expiresIn? }
 router.post("/sign-put", async (req, res) => {
   try {
-    const { key, contentType = "application/octet-stream", expiresInSec = 300 } = req.body || {};
+    const { key, contentType, expiresIn } = req.body || {};
     if (!key) return res.status(400).json({ error: "Missing 'key' in body" });
 
-    const url = await getPresignedPutUrl({
-      key,
-      contentType: String(contentType),
-      expiresInSec: Number(expiresInSec),
-    });
-    return res.json({ method: "PUT", key, contentType, expiresInSec: Number(expiresInSec), url });
+    const out = await signPutUrl({ key, contentType, expiresIn });
+    // out = { url, key, contentType, publicUrl }
+    res.json({ method: "PUT", ...out });
   } catch (err) {
     console.error("sign-put error:", err);
-    return res.status(500).json({ error: "Failed to create PUT URL", detail: err.message });
+    res.status(500).json({ error: "Failed to create PUT URL", detail: err.message });
   }
 });
 
-// --- (Optional) Convenience GET versions so you can test in a browser ---
-router.get("/sign-get", async (req, res) => {
+// POST /api/uploads/sign-get  { key, expiresIn? }
+router.post("/sign-get", async (req, res) => {
   try {
-    const key = (req.query.key || "").toString().trim();
-    const expiresInSec = parseInt(req.query.expiresInSec || "300", 10);
-    if (!key) return res.status(400).json({ error: "Missing ?key=..." });
+    const { key, expiresIn } = req.body || {};
+    if (!key) return res.status(400).json({ error: "Missing 'key' in body" });
 
-    const url = await getPresignedGetUrl({ key, expiresInSec });
-    return res.json({ method: "GET", key, expiresInSec, url });
+    const out = await signGetUrl({ key, expiresIn });
+    // out = { url, key, expiresInSec, method:"GET" }
+    res.json(out);
   } catch (err) {
-    console.error("sign-get (GET) error:", err);
-    return res.status(500).json({ error: "Failed to sign GET", detail: err.message });
+    console.error("sign-get error:", err);
+    res.status(500).json({ error: "Failed to create GET URL", detail: err.message });
   }
 });
 
-router.get("/sign-put", async (req, res) => {
-  try {
-    const key = (req.query.key || "").toString().trim();
-    const contentType = (req.query.contentType || "application/octet-stream").toString();
-    const expiresInSec = parseInt(req.query.expiresInSec || "300", 10);
-    if (!key) return res.status(400).json({ error: "Missing ?key=..." });
-
-    const url = await getPresignedPutUrl({ key, contentType, expiresInSec });
-    return res.json({ method: "PUT", key, contentType, expiresInSec, url });
-  } catch (err) {
-    console.error("sign-put (GET) error:", err);
-    return res.status(500).json({ error: "Failed to sign PUT", detail: err.message });
-  }
+// GET /api/uploads/public-url?key=docs/test.pdf
+router.get("/public-url", (req, res) => {
+  const { key } = req.query || {};
+  if (!key) return res.status(400).json({ error: "Missing 'key' query" });
+  return res.json({ url: publicUrl(key) });
 });
 
 module.exports = router;
