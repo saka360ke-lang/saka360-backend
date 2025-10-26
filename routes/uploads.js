@@ -3,35 +3,13 @@ const express = require("express");
 const router = express.Router();
 const { signPutUrl, signGetUrl, publicUrl } = require("../utils/s3");
 
-// routes/uploads.js (add near the top, after the existing requires)
-router.get("/ping", (_req, res) => {
-  res.json({ ok: true, uploads_router: true });
-});
-
-router.get("/diag", (_req, res) => {
-  // Redact secrets; only show presence
-  const env = {
-    S3_REGION: !!process.env.S3_REGION,
-    S3_BUCKET: !!process.env.S3_BUCKET,
-    S3_ACCESS_KEY_ID_present: !!process.env.S3_ACCESS_KEY_ID,
-    S3_SECRET_ACCESS_KEY_present: !!process.env.S3_SECRET_ACCESS_KEY,
-    S3_SESSION_TOKEN_present: !!process.env.S3_SESSION_TOKEN
-  };
-  res.json({ ok: true, env });
-});
-
-
-/**
- * POST /api/uploads/sign-put
- * Body: { key, contentType?, expiresIn? }
- */
+// POST /api/uploads/sign-put  { key, contentType?, contentDisposition?, expiresIn? }
 router.post("/sign-put", async (req, res) => {
   try {
-    const { key, contentType, expiresIn } = req.body || {};
+    const { key, contentType, contentDisposition, expiresIn } = req.body || {};
     if (!key) return res.status(400).json({ error: "Missing 'key' in body" });
 
-    const out = await signPutUrl({ key, contentType, expiresIn });
-    // out = { url, key, contentType, publicUrl }
+    const out = await signPutUrl({ key, contentType, contentDisposition, expiresIn });
     res.json({ method: "PUT", ...out });
   } catch (err) {
     console.error("sign-put error:", err);
@@ -39,17 +17,21 @@ router.post("/sign-put", async (req, res) => {
   }
 });
 
-/**
- * POST /api/uploads/sign-get
- * Body: { key, expiresIn? }
- */
+// POST /api/uploads/sign-get  { key, expiresIn?, download?:true, filename?: "report.pdf" }
 router.post("/sign-get", async (req, res) => {
   try {
-    const { key, expiresIn } = req.body || {};
+    const { key, expiresIn, download, filename } = req.body || {};
     if (!key) return res.status(400).json({ error: "Missing 'key' in body" });
 
-    const out = await signGetUrl({ key, expiresIn });
-    // out = { url, key, expiresInSec, method:"GET" }
+    let contentDisposition;
+    if (download) {
+      // If filename provided, hint it; else let S3/browser infer
+      contentDisposition = filename
+        ? `attachment; filename="${filename}"`
+        : "attachment";
+    }
+
+    const out = await signGetUrl({ key, expiresIn, contentDisposition });
     res.json(out);
   } catch (err) {
     console.error("sign-get error:", err);
@@ -57,52 +39,11 @@ router.post("/sign-get", async (req, res) => {
   }
 });
 
-/**
- * GET /api/uploads/public-url?key=docs/test.pdf
- */
+// GET /api/uploads/public-url?key=docs/test.pdf
 router.get("/public-url", (req, res) => {
   const { key } = req.query || {};
   if (!key) return res.status(400).json({ error: "Missing 'key' query" });
   return res.json({ url: publicUrl(key) });
-});
-
-/**
- * POST /api/uploads/finalize
- * Body: { key, contentType, sizeBytes, label?, user_id? }
- * Saves a DB record after a successful PUT to S3.
- */
-router.post("/finalize", async (req, res) => {
-  try {
-    const { key, contentType, sizeBytes, label, user_id } = req.body || {};
-    if (!key) return res.status(400).json({ error: "Missing 'key' in body" });
-
-    const pool = req.app.get("pool");
-    if (!pool) return res.status(500).json({ error: "DB pool not initialized" });
-
-    const bucket = process.env.S3_BUCKET;
-    if (!bucket) return res.status(500).json({ error: "S3_BUCKET env missing" });
-
-    // Insert into 'files' (no schema prefix to avoid schema mismatch)
-    const q = await pool.query(
-      `INSERT INTO files (user_id, bucket, s3_key, content_type, size_bytes, label)
-       VALUES ($1,$2,$3,$4,$5,$6)
-       ON CONFLICT (s3_key) DO UPDATE
-         SET content_type = EXCLUDED.content_type,
-             size_bytes   = EXCLUDED.size_bytes,
-             label        = COALESCE(EXCLUDED.label, files.label)
-       RETURNING id, user_id, bucket, s3_key, content_type, size_bytes, label, created_at`,
-      [user_id || null, bucket, key, contentType || null, sizeBytes || null, label || null]
-    );
-
-    return res.json({
-      ok: true,
-      file: q.rows[0],
-      publicUrl: publicUrl(key)
-    });
-  } catch (err) {
-    console.error("uploads.finalize error:", err);
-    return res.status(500).json({ error: "Failed to save file record", detail: err.message });
-  }
 });
 
 module.exports = router;
