@@ -1,277 +1,176 @@
 // routes/chat.js
-/**
- * Vehicle-aware chat endpoint with robust error handling.
- * - Resolves vehicle by plate (space-insensitive), make, or model.
- * - Pulls a few recent logs.
- * - Calls OpenAI if configured; otherwise returns a clear JSON error.
- * - Never returns HTML error pages; always JSON.
- */
 const express = require("express");
 const router = express.Router();
 
-const DEBUG_MODE = process.env.DEBUG_MODE === "1";
-
-// Lazy load OpenAI so missing module won't crash require()
-let OpenAILib = null;
-try {
-  OpenAILib = require("openai");
-} catch (e) {
-  console.error("[chat] openai module not found:", e.message);
+// Optional: only load OpenAI when we actually need it
+let OpenAI = null;
+function getOpenAI() {
+  if (!process.env.OPENAI_API_KEY && !process.env.LLM_API_KEY) {
+    const err = new Error("LLM not configured: set OPENAI_API_KEY (or LLM_API_KEY)");
+    err.status = 500;
+    throw err;
+  }
+  if (!OpenAI) {
+    // Lazy import so missing package errors are clearer here
+    OpenAI = require("openai");
+  }
+  const apiKey = process.env.OPENAI_API_KEY || process.env.LLM_API_KEY;
+  return new OpenAI({ apiKey });
 }
 
-const PROVIDER = process.env.LLM_PROVIDER || "openai";
-const OPENAI_MODEL = process.env.LLM_MODEL || "gpt-4o-mini";
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY || process.env.LLM_API_KEY;
+// --- helpers ---------------------------------------------------
+const MODEL = process.env.LLM_MODEL || "gpt-4o-mini";
 
-function normalizePlate(input = "") {
-  return String(input).toUpperCase().replace(/\s+/g, "");
+/** remove spaces/dashes & uppercase: "KDH 123A" -> "KDH123A" */
+function normalizePlate(p) {
+  return String(p || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
 }
 
-async function hasColumn(pool, table, column) {
-  const q = await pool.query(
-    `SELECT 1
-       FROM information_schema.columns
-      WHERE table_schema = 'public'
-        AND table_name = $1
-        AND column_name = $2
-      LIMIT 1`,
-    [table, column]
-  );
-  return q.rowCount > 0;
+/** quick heuristic to detect plate-like string */
+function looksLikePlate(s) {
+  return /[A-Z]/i.test(s) && /[0-9]/.test(s);
 }
 
-async function resolveVehicle(pool, searchText) {
-  let vehicle = null;
+/** try to find a vehicle from a free-form query */
+async function pickVehicleFromQuery(pool, userId, userText) {
+  const qText = (userText || "").trim();
 
-  const hasMake = await hasColumn(pool, "vehicles", "make");
-  const hasModel = await hasColumn(pool, "vehicles", "model");
-  const hasYom = await hasColumn(pool, "vehicles", "year_of_manufacture");
-
-  const cols = [
-    "id",
-    "name",
-    "plate_number",
-    "type",
-    hasMake ? "make" : "NULL AS make",
-    hasModel ? "model" : "NULL AS model",
-    hasYom ? "year_of_manufacture" : "NULL AS year_of_manufacture",
-    "created_at",
-  ].join(", ");
-
-  if (searchText && searchText.trim().length > 0) {
-    const raw = searchText.trim();
-    const norm = normalizePlate(raw);
-
-    // 1) Plate match (ignore spaces)
-    const q1 = await pool.query(
-      `SELECT ${cols}
+  // Try plate match first (normalize both sides)
+  if (looksLikePlate(qText)) {
+    const norm = normalizePlate(qText);
+    const byPlate = await pool.query(
+      `SELECT id, name, type, plate_number, make, model, year_of_manufacture
          FROM vehicles
-        WHERE REPLACE(UPPER(plate_number), ' ', '') = $1
+        WHERE user_id = $1
+          AND UPPER(REGEXP_REPLACE(plate_number, '[^A-Z0-9]', '', 'g')) = $2
         LIMIT 1`,
-      [norm]
+      [userId, norm]
     );
-    if (q1.rowCount > 0) return q1.rows[0];
-
-    // 2) Make/Model LIKE if present
-    if (hasMake || hasModel) {
-      const like = `%${raw.toLowerCase()}%`;
-      const q2 = await pool.query(
-        `SELECT ${cols}
-           FROM vehicles
-          WHERE ($1::text <> '' AND ${hasMake ? "LOWER(make) LIKE $2" : "false"})
-             OR ($1::text <> '' AND ${hasModel ? "LOWER(model) LIKE $2" : "false"})
-          ORDER BY created_at DESC
-          LIMIT 1`,
-        [raw, like]
-      );
-      if (q2.rowCount > 0) return q2.rows[0];
-    }
+    if (byPlate.rows.length) return byPlate.rows[0];
   }
 
-  // 3) Fallback to most-recent vehicle
-  const q3 = await pool.query(
-    `SELECT ${cols}
-       FROM vehicles
-      ORDER BY created_at DESC
-      LIMIT 1`
-  );
-  if (q3.rowCount > 0) vehicle = q3.rows[0];
-  return vehicle;
-}
-
-async function getRecentService(pool, vehicleId, limit = 3) {
-  try {
-    const q = await pool.query(
-      `SELECT id, description, cost, odometer, created_at
-         FROM service_logs
-        WHERE vehicle_id = $1
+  // Try make/model keywords (very simple fuzzy-ish search)
+  const words = qText.split(/\s+/).filter(Boolean);
+  if (words.length) {
+    const like = `%${words.join("%")}%`;
+    const byMakeModel = await pool.query(
+      `SELECT id, name, type, plate_number, make, model, year_of_manufacture
+         FROM vehicles
+        WHERE user_id = $1
+          AND (
+            (make  IS NOT NULL AND make  ILIKE $2) OR
+            (model IS NOT NULL AND model ILIKE $2) OR
+            (name  IS NOT NULL AND name  ILIKE $2)
+          )
         ORDER BY created_at DESC
-        LIMIT $2`,
-      [vehicleId, limit]
+        LIMIT 1`,
+      [userId, like]
     );
-    return q.rows;
-  } catch (e) {
-    console.error("[chat] getRecentService error:", e.message);
-    return [];
+    if (byMakeModel.rows.length) return byMakeModel.rows[0];
   }
+
+  return null;
 }
 
-async function getRecentFuel(pool, vehicleId, limit = 3) {
-  try {
-    const q = await pool.query(
-      `SELECT id, amount, liters, price_per_liter, odometer, created_at
-         FROM fuel_logs
-        WHERE vehicle_id = $1
-        ORDER BY created_at DESC
-        LIMIT $2`,
-      [vehicleId, limit]
-    );
-    return q.rows;
-  } catch (e) {
-    console.error("[chat] getRecentFuel error:", e.message);
-    return [];
-  }
+/** build the strict system prompt */
+function buildSystemPrompt(vehicle) {
+  const vtxt = vehicle
+    ? `Vehicle in focus:
+- Plate: ${vehicle.plate_number || "N/A"}
+- Name: ${vehicle.name || "N/A"}
+- Make/Model/Year: ${vehicle.make || "?"} / ${vehicle.model || "?"} / ${vehicle.year_of_manufacture || "?"}
+- Type: ${vehicle.type || "N/A"}`
+    : `No specific vehicle resolved yet. Ask a clarifying question about plate / make / model if needed.`;
+
+  return [
+    "You are Saka360’s maintenance assistant.",
+    "Only answer questions about the user’s vehicles and maintenance on this app.",
+    "Be brief, practical, and action-oriented. Use bullet points when helpful.",
+    "If the user asks about features/workflows, explain how to do it inside this app (not general web).",
+    "Never provide random web answers. If external facts are needed, keep it generic and short.",
+    vtxt,
+  ].join("\n\n");
 }
 
-function buildSystemPrompt() {
-  return `
-You are Saka360's vehicle assistant. Stay within vehicle maintenance and records for the user's vehicles.
-- If the user mentions only a plate, make, or model, infer details from provided context.
-- Be concise, practical, and specific.
-- When giving maintenance intervals, say they are general guidelines; advise checking the owner's manual.
-- If asked about using the app, give short, step-by-step instructions.
-- If user asks outside scope, politely redirect to maintenance/records.`;
+/** compose chat to OpenAI */
+async function llmRespond(openai, systemPrompt, userMessages) {
+  const { choices } = await openai.chat.completions.create({
+    model: MODEL,
+    messages: [
+      { role: "system", content: systemPrompt },
+      ...userMessages.map(m => ({ role: m.role, content: m.content }))
+    ],
+    temperature: 0.3,
+  });
+  return choices?.[0]?.message?.content?.trim() || "Sorry, I couldn’t draft a reply.";
 }
 
-function buildVehicleContext(vehicle, serviceLogs, fuelLogs) {
-  const v = vehicle
-    ? `Vehicle:
-- Name: ${vehicle.name || "-"}
-- Plate: ${vehicle.plate_number || "-"}
-- Type: ${vehicle.type || "-"}
-- Make/Model/YOM: ${vehicle.make || "-"} / ${vehicle.model || "-"} / ${vehicle.year_of_manufacture || "-"}`
-    : "No vehicle on file.";
-
-  const s = serviceLogs.length
-    ? `Recent service logs:
-${serviceLogs
-  .map(
-    (r) =>
-      `- ${new Date(r.created_at).toISOString().slice(0, 10)} | ${r.description || "Service"} | KES ${r.cost ?? "-"} | Odo ${r.odometer ?? "-"}`
-  )
-  .join("\n")}`
-    : "No recent service logs.";
-
-  const f = fuelLogs.length
-    ? `Recent fuel logs:
-${fuelLogs
-  .map(
-    (r) =>
-      `- ${new Date(r.created_at).toISOString().slice(0, 10)} | Amount KES ${r.amount ?? "-"} | Liters ${r.liters ?? "-"} | Price/L ${r.price_per_liter ?? "-"} | Odo ${r.odometer ?? "-"}`
-  )
-  .join("\n")}`
-    : "No recent fuel logs.";
-
-  return `${v}\n\n${s}\n\n${f}`;
-}
-
+// --- route -----------------------------------------------------
 module.exports = (app) => {
   const pool = app.get("pool");
+  if (!pool) throw new Error("Pool not found on app; set app.set('pool', pool) in index.js");
 
-  router.post("/chat", async (req, res) => {
-    const started = Date.now();
+  /**
+   * POST /api/chat
+   * Body: { messages: [{role, content}], vehicle_hint?: string, dry?: boolean }
+   * - Add `?dry=1` or body.dry=true to bypass LLM and just echo the resolved vehicle & parsed intent.
+   * - Set DEBUG_MODE=1 to include error details in JSON on failure.
+   */
+  router.post("/", async (req, res) => {
     try {
-      // Validate messages
-      const messages = Array.isArray(req.body?.messages) ? req.body.messages : null;
-      if (!messages || messages.length === 0) {
-        return res.status(400).json({ error: "Missing 'messages' array with at least one item." });
+      const { messages, vehicle_hint, dry } = req.body || {};
+      if (!Array.isArray(messages) || messages.length === 0) {
+        return res.status(400).json({ error: "Provide messages: [{role, content}, ...]" });
       }
-      const lastUserMsg =
-        [...messages].reverse().find((m) => m.role === "user")?.content || "";
 
-      // Resolve vehicle via heuristic token
-      const searchHint =
-        String(lastUserMsg)
-          .split(/[\s,.;:!?\n\r]+/)
-          .filter((t) => /[A-Za-z0-9]/.test(t))
-          .sort((a, b) => b.length - a.length)[0] || "";
+      // For now, use a fixed demo user (replace with authenticateToken and req.user.id in prod)
+      const userId = req.user?.id || 1;
 
-      const vehicle = await resolveVehicle(pool, searchHint);
-      const [serviceLogs, fuelLogs] = vehicle
-        ? await Promise.all([
-            getRecentService(pool, vehicle.id, 3),
-            getRecentFuel(pool, vehicle.id, 3),
-          ])
-        : [[], []];
+      // Try to lock onto a vehicle:
+      const lastUserMsg = [...messages].reverse().find(m => m.role === "user")?.content || "";
+      let vehicle = null;
 
-      const system = buildSystemPrompt();
-      const context = buildVehicleContext(vehicle, serviceLogs, fuelLogs);
-
-      // Provider / key checks
-      if (PROVIDER !== "openai") {
-        return res.status(500).json({
-          error: "LLM provider not supported",
-          detail: `PROVIDER=${PROVIDER}`,
-        });
+      // 1) Direct hint (plate/make/model)
+      if (vehicle_hint) {
+        vehicle =
+          (await pickVehicleFromQuery(pool, userId, vehicle_hint)) ||
+          (await pickVehicleFromQuery(pool, userId, lastUserMsg));
+      } else {
+        // 2) Infer from the last user message
+        vehicle = await pickVehicleFromQuery(pool, userId, lastUserMsg);
       }
-      if (!OpenAILib) {
-        return res.status(500).json({
-          error: "LLM module missing",
-          detail: "Install 'openai' in package.json",
-        });
-      }
-      if (!OPENAI_API_KEY) {
-        return res.status(500).json({
-          error: "LLM not configured",
-          detail: "Missing OPENAI_API_KEY (or LLM_API_KEY)",
+
+      // DRY RUN mode for diagnostics (no LLM call)
+      const isDry = Boolean(dry) || req.query.dry === "1";
+      if (isDry) {
+        return res.json({
+          dry: true,
+          resolved_vehicle: vehicle,
+          note: vehicle
+            ? "Vehicle resolved. Real mode would now ask the LLM with this context."
+            : "No vehicle resolved. In real mode the assistant would ask a clarifying question.",
         });
       }
 
-      const client = new OpenAILib({ apiKey: OPENAI_API_KEY });
+      // Real LLM call
+      const openai = getOpenAI();
+      const systemPrompt = buildSystemPrompt(vehicle);
+      const text = await llmRespond(openai, systemPrompt, messages);
 
-      const llmMessages = [
-        { role: "system", content: system },
-        {
-          role: "user",
-          content:
-            `User question:\n${lastUserMsg}\n\n` +
-            `Context (from DB):\n${context}\n\n` +
-            `Rules:\n- Keep answers short and to the point.\n- Give steps for using the app when asked.\n- If maintenance intervals are described, say they are general guidelines.\n- Stay within vehicle maintenance/records scope.`
-        }
-      ];
-
-      let answer = "";
-      try {
-        const completion = await client.chat.completions.create({
-          model: OPENAI_MODEL,
-          temperature: 0.2,
-          messages: llmMessages,
-        });
-        answer = completion.choices?.[0]?.message?.content?.trim() || "";
-      } catch (e) {
-        console.error("[chat] OpenAI error:", e.message);
-        return res.status(502).json({
-          error: "LLM call failed",
-          detail: DEBUG_MODE ? e.message : "provider_error",
-        });
-      }
-
-      const ms = Date.now() - started;
       return res.json({
         provider: "openai",
-        model: OPENAI_MODEL,
-        latency_ms: ms,
-        content: answer || "I couldn't generate a response.",
-        vehicle: vehicle || null,
+        model: MODEL,
+        content: text,
+        vehicle: vehicle || null
       });
     } catch (err) {
-      console.error("[chat] fatal error:", err);
+      console.error("chat error:", err);
       return res.status(500).json({
-        error: "Chat failed",
-        detail: DEBUG_MODE ? err.message : "internal_error",
+        error: "Server error",
+        detail: process.env.DEBUG_MODE === "1" ? (err?.message || String(err)) : undefined
       });
     }
   });
 
-  app.use("/api", router);
+  app.use("/api/chat", router);
 };
