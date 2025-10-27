@@ -3,6 +3,11 @@ require("dotenv").config();
 
 const express = require("express");
 const app = express();
+
+// Trust proxy (Render/Heroku) so rate-limit & IPs behave
+app.set("trust proxy", 1);
+
+// JSON body parser
 app.use(express.json());
 
 // Return JSON for malformed JSON bodies instead of HTML
@@ -12,7 +17,6 @@ app.use((err, req, res, next) => {
   }
   next(err);
 });
-
 
 // ---------------------------
 // HTTP request logger
@@ -38,27 +42,31 @@ app.use(helmet());
 // Lock CORS to specific origins via env ALLOWED_ORIGINS (comma-separated)
 const ALLOWED = (process.env.ALLOWED_ORIGINS || "")
   .split(",")
-  .map(s => s.trim())
+  .map((s) => s.trim())
   .filter(Boolean);
 
-app.use(cors({
-  origin(origin, cb) {
-    // Allow no-origin (Postman/curl) OR if explicitly allowed
-    if (!origin || ALLOWED.includes(origin)) return cb(null, true);
-    return cb(new Error(`CORS blocked for origin: ${origin}`));
-  },
-  credentials: true,
-  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization"]
-}));
+app.use(
+  cors({
+    origin(origin, cb) {
+      // Allow no-origin (Postman/curl) OR if explicitly allowed
+      if (!origin || ALLOWED.includes(origin)) return cb(null, true);
+      return cb(new Error(`CORS blocked for origin: ${origin}`));
+    },
+    credentials: true,
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+  })
+);
 
 // Rate limiting
-app.use(rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 300,
-  standardHeaders: true,
-  legacyHeaders: false
-}));
+app.use(
+  rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 300,
+    standardHeaders: true,
+    legacyHeaders: false,
+  })
+);
 
 /* -----------------------------
  * 1) Database (shared pool)
@@ -77,6 +85,11 @@ app.get("/api/health/db", async (_req, res) => {
   } catch (e) {
     res.status(500).json({ db: "error", error: e.message });
   }
+});
+
+// Quick diag: confirm pool attached
+app.get("/api/diag/pool", (req, res) => {
+  res.json({ pool_attached: !!app.get("pool") });
 });
 
 /* ------------------------------------------------
@@ -110,7 +123,7 @@ async function sendWhatsAppText(toE164, body) {
 }
 // Safe wrapper for cron usage (never throws out)
 function sendWhatsAppTextSafe(to, body) {
-  return sendWhatsAppText(to, body).catch(err => {
+  return sendWhatsAppText(to, body).catch((err) => {
     console.error("sendWhatsAppTextSafe error:", err.message);
   });
 }
@@ -158,8 +171,10 @@ app.set("runExpiryCheck", () =>
 if (cron) {
   cron.schedule(
     "0 8 * * *",
-    () => runExpiryCheckCore(pool, { sendEmail, sendWhatsAppTextSafe })
-            .catch(e => console.error("runExpiryCheckCore error:", e)),
+    () =>
+      runExpiryCheckCore(pool, { sendEmail, sendWhatsAppTextSafe }).catch((e) =>
+        console.error("runExpiryCheckCore error:", e)
+      ),
     { timezone: "Africa/Nairobi" }
   );
 }
@@ -179,7 +194,7 @@ require("./routes/documents")(app);
 require("./routes/reminders")(app);
 require("./routes/reports")(app);
 
-// B) router-style routes
+// B) router-style
 const chatRoutes = require("./routes/chat");     // exports Router
 app.use("/api", chatRoutes);                     // POST /api/chat
 
@@ -190,15 +205,21 @@ const uploadsRoutes = require("./routes/uploads");
 app.use("/api/uploads", uploadsRoutes);
 
 let vehiclesRoutes = null;
-try { vehiclesRoutes = require("./routes/vehicles"); } catch (_) {}
+try {
+  vehiclesRoutes = require("./routes/vehicles");
+} catch (_) {}
 if (vehiclesRoutes) app.use("/api/vehicles", vehiclesRoutes);
 
 let paymentsRoutes = null;
-try { paymentsRoutes = require("./routes/payments"); } catch (_) {}
+try {
+  paymentsRoutes = require("./routes/payments");
+} catch (_) {}
 if (paymentsRoutes) app.use("/api/payments", paymentsRoutes);
 
 let affiliatesRoutes = null;
-try { affiliatesRoutes = require("./routes/affiliates"); } catch (_) {}
+try {
+  affiliatesRoutes = require("./routes/affiliates");
+} catch (_) {}
 if (affiliatesRoutes) app.use("/api/affiliates", affiliatesRoutes);
 
 /* -----------------------
@@ -217,8 +238,8 @@ app.use((err, req, res, next) => {
     .type("application/json")
     .send({
       error: status === 404 ? "Not found" : "Server error",
-      detail: process.env.DEBUG_MODE === "1" ? (err?.message || String(err)) : undefined,
-      path: req.originalUrl
+      detail: process.env.DEBUG_MODE === "1" ? err?.message || String(err) : undefined,
+      path: req.originalUrl,
     });
 });
 
