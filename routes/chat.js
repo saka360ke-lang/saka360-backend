@@ -17,7 +17,9 @@ try {
 let VEH_COL_CHECKED = false;
 let HAS_MAKE = false;
 let HAS_MODEL = false;
-let HAS_YOM = false; // year_of_manufacture
+let HAS_YOM = false;         // year_of_manufacture
+let HAS_CREATED_AT = false;
+let HAS_UPDATED_AT = false;
 
 function normalizePlate(s = "") {
   return (s || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
@@ -25,20 +27,27 @@ function normalizePlate(s = "") {
 
 async function ensureVehicleColumns(pool) {
   if (VEH_COL_CHECKED) return;
+  const wanted = [
+    "make",
+    "model",
+    "year_of_manufacture",
+    "created_at",
+    "updated_at",
+  ];
   const sql = `
     SELECT column_name
     FROM information_schema.columns
     WHERE table_name='vehicles' AND column_name = ANY($1)
   `;
-  const wanted = ["make", "model", "year_of_manufacture"];
   try {
     const r = await pool.query(sql, [wanted]);
     const have = new Set(r.rows.map((x) => x.column_name));
-    HAS_MAKE  = have.has("make");
-    HAS_MODEL = have.has("model");
-    HAS_YOM   = have.has("year_of_manufacture");
+    HAS_MAKE       = have.has("make");
+    HAS_MODEL      = have.has("model");
+    HAS_YOM        = have.has("year_of_manufacture");
+    HAS_CREATED_AT = have.has("created_at");
+    HAS_UPDATED_AT = have.has("updated_at");
   } catch (e) {
-    // If this fails, just proceed with base columns
     console.error("[chat] column check failed:", e.message);
   } finally {
     VEH_COL_CHECKED = true;
@@ -46,33 +55,41 @@ async function ensureVehicleColumns(pool) {
 }
 
 function buildVehicleSelect() {
-  const cols = [
-    "id",
-    "name",
-    "plate_number",
-    "type",
-  ];
+  const cols = ["id", "name", "plate_number", "type"];
   if (HAS_MAKE) cols.push("make");
   if (HAS_MODEL) cols.push("model");
   if (HAS_YOM) cols.push("year_of_manufacture");
   return cols.join(", ");
 }
 
+function buildOrderBy() {
+  // Build a safe ORDER BY that only uses existing columns
+  const order = [];
+  if (HAS_UPDATED_AT) order.push("updated_at DESC NULLS LAST");
+  if (HAS_CREATED_AT) order.push("created_at DESC NULLS LAST");
+  // Fallback to id if neither timestamp exists
+  if (order.length === 0) order.push("id DESC");
+  return "ORDER BY " + order.join(", ");
+}
+
 function extractMakeModelGuess(text) {
-  // Extremely light heuristic: look for 1–2 capitalized tokens as model words.
-  // We still prioritize plate matching; this is just a fallback.
   const lower = (text || "").toLowerCase();
-  // A tiny OEM list for hinting (extend later as needed)
-  const makes = ["toyota","nissan","honda","mazda","subaru","ford","isuzu","mercedes","bmw","audi","vw","volkswagen","mitsubishi","suzuki","hyundai","kia"];
+  const makes = [
+    "toyota","nissan","honda","mazda","subaru","ford","isuzu",
+    "mercedes","bmw","audi","vw","volkswagen","mitsubishi",
+    "suzuki","hyundai","kia"
+  ];
   const foundMake = makes.find(m => lower.includes(m));
-  // crude model grab (next capitalized word after make)
   let model = null;
   if (foundMake) {
     const re = new RegExp(`${foundMake}\\s+([a-z0-9-]+)`, "i");
     const m = lower.match(re);
     if (m && m[1]) model = m[1];
   }
-  return { make: foundMake ? foundMake[0].toUpperCase() + foundMake.slice(1) : null, model: model ? model : null };
+  return {
+    make: foundMake ? foundMake[0].toUpperCase() + foundMake.slice(1) : null,
+    model: model || null
+  };
 }
 
 router.post("/chat", async (req, res) => {
@@ -94,23 +111,23 @@ router.post("/chat", async (req, res) => {
     const userMsg = messages[messages.length - 1]?.content || "";
     await ensureVehicleColumns(pool);
 
-    // 1) Try plate match first (normalize both sides)
-    const plateGuess = normalizePlate(userMsg);
     let vehicle = null;
 
+    // 1) Try plate match first (normalize both sides)
+    const plateGuess = normalizePlate(userMsg);
     if (plateGuess && plateGuess.length >= 5) {
       const sql = `
         SELECT ${buildVehicleSelect()}
         FROM vehicles
         WHERE regexp_replace(upper(plate_number),'[^A-Z0-9]','','g') = $1
-        ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST
+        ${buildOrderBy()}
         LIMIT 1
       `;
       const r = await pool.query(sql, [plateGuess]);
       if (r.rows.length) vehicle = r.rows[0];
     }
 
-    // 2) If no plate match, try make/model hint if those columns exist
+    // 2) If no plate match, try make/model (only if those cols exist)
     if (!vehicle) {
       const { make, model } = extractMakeModelGuess(userMsg);
       if ((HAS_MAKE || HAS_MODEL) && (make || model)) {
@@ -132,7 +149,7 @@ router.post("/chat", async (req, res) => {
             SELECT ${buildVehicleSelect()}
             FROM vehicles
             WHERE ${where.join(" AND ")}
-            ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST
+            ${buildOrderBy()}
             LIMIT 1
           `;
           const r = await pool.query(sql, params);
@@ -141,15 +158,14 @@ router.post("/chat", async (req, res) => {
       }
     }
 
-    // 3) Build system prompt—**strictly** limited to vehicle-records scope
+    // 3) System prompt: keep scope narrow to Saka360 records usage
     const systemPrompt = [
       "You are Saka360’s vehicle maintenance assistant.",
       "Only answer questions related to the user's registered vehicles and maintenance/usage.",
       "Pull details from the user's vehicle profile when available (plate/make/model/year).",
-      "Be brief and practical. Suggest next steps in the Saka360 app when relevant.",
+      "Be brief and practical. Suggest next steps in the Saka360 app when relevant."
     ].join(" ");
 
-    // 4) Create a short vehicle context, if any
     let vehicleContext = "No vehicle matched from the prompt.";
     if (vehicle) {
       vehicleContext =
@@ -157,12 +173,12 @@ router.post("/chat", async (req, res) => {
         `- Name: ${vehicle.name || "(n/a)"}\n` +
         `- Plate: ${vehicle.plate_number || "(n/a)"}\n` +
         `- Type: ${vehicle.type || "(n/a)"}\n` +
-        `${HAS_MAKE ? `- Make: ${vehicle.make || "(n/a)"}\n` : ""}` +
-        `${HAS_MODEL ? `- Model: ${vehicle.model || "(n/a)"}\n` : ""}` +
-        `${HAS_YOM ? `- Year: ${vehicle.year_of_manufacture ?? "(n/a)"}\n` : ""}`;
+        (HAS_MAKE  ? `- Make: ${vehicle.make || "(n/a)"}\n` : "") +
+        (HAS_MODEL ? `- Model: ${vehicle.model || "(n/a)"}\n` : "") +
+        (HAS_YOM   ? `- Year: ${vehicle.year_of_manufacture ?? "(n/a)"}\n` : "");
     }
 
-    // 5) Call OpenAI (if available); otherwise return a friendly stub
+    // 4) Call OpenAI (if configured), else return a stub
     let content = "(LLM is not configured)";
     let provider = "stub";
     let model = "none";
@@ -183,11 +199,9 @@ router.post("/chat", async (req, res) => {
 
       content = completion.choices?.[0]?.message?.content?.trim() || "(no response)";
     } else {
-      // simple fallback if key not set
-      content =
-        vehicle
-          ? `You asked: "${userMsg}".\nMatched your vehicle ${vehicle?.name || ""} (${vehicle?.plate_number || ""}). Keep queries related to maintenance records, fuel, service, and documents.`
-          : `You asked: "${userMsg}". I couldn't match a vehicle. Try including your plate (e.g., "KDH123A") or your make/model.`;
+      content = vehicle
+        ? `You asked: "${userMsg}". Matched your vehicle ${vehicle?.name || ""} (${vehicle?.plate_number || ""}). Keep queries related to maintenance records, fuel, service, and documents.`
+        : `You asked: "${userMsg}". I couldn't match a vehicle. Try including your plate (e.g., "KDH123A") or your make/model.`;
     }
 
     return res.json({
