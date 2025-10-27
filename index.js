@@ -176,8 +176,7 @@ require("./routes/reminders")(app);
 require("./routes/reports")(app);
 
 // B) router-style routes (app.use...)
-const chatRoutes = require("./routes/chat");
-app.use("/api/chat", chatRoutes);
+require("./routes/chat")(app); // chat route now needs app to access the DB pool
 
 const testEmailRoutes = require("./routes/testEmail"); // exports Router
 app.use("/api", testEmailRoutes); // exposes /api/test-email (POST) etc.
