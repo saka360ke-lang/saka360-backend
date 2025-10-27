@@ -25,6 +25,28 @@ function normalizePlate(s = "") {
   return (s || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
 }
 
+// Extract plate candidates from free text (Kenya-style plates like KAA 123A; also supports no-space/dash variants)
+function extractPlateCandidates(text = "") {
+  const t = String(text || "");
+  const out = new Set();
+
+  // 1) Canonical KE pattern: AAA 123 A (allow optional spaces/dashes)
+  const reKE = /\b([A-Za-z]{3})[\s-]*([0-9]{3})[\s-]*([A-Za-z])\b/g;
+  let m;
+  while ((m = reKE.exec(t)) !== null) {
+    out.add(normalizePlate(`${m[1]}${m[2]}${m[3]}`));
+  }
+
+  // 2) Fallback: any 6–8 char alphanumeric chunk that *looks* like a plate (starts with letters, ends with a letter)
+  const reLoose = /\b([A-Za-z]{2,4}[A-Za-z0-9]{2,5}[A-Za-z])\b/g;
+  while ((m = reLoose.exec(t)) !== null) {
+    const candidate = normalizePlate(m[1]);
+    if (candidate.length >= 5 && candidate.length <= 8) out.add(candidate);
+  }
+
+  return Array.from(out);
+}
+
 async function ensureVehicleColumns(pool) {
   if (VEH_COL_CHECKED) return;
   const wanted = [
@@ -63,11 +85,9 @@ function buildVehicleSelect() {
 }
 
 function buildOrderBy() {
-  // Build a safe ORDER BY that only uses existing columns
   const order = [];
   if (HAS_UPDATED_AT) order.push("updated_at DESC NULLS LAST");
   if (HAS_CREATED_AT) order.push("created_at DESC NULLS LAST");
-  // Fallback to id if neither timestamp exists
   if (order.length === 0) order.push("id DESC");
   return "ORDER BY " + order.join(", ");
 }
@@ -113,18 +133,24 @@ router.post("/chat", async (req, res) => {
 
     let vehicle = null;
 
-    // 1) Try plate match first (normalize both sides)
-    const plateGuess = normalizePlate(userMsg);
-    if (plateGuess && plateGuess.length >= 5) {
-      const sql = `
-        SELECT ${buildVehicleSelect()}
-        FROM vehicles
-        WHERE regexp_replace(upper(plate_number),'[^A-Z0-9]','','g') = $1
-        ${buildOrderBy()}
-        LIMIT 1
-      `;
-      const r = await pool.query(sql, [plateGuess]);
-      if (r.rows.length) vehicle = r.rows[0];
+    // 1) Try plate extraction first
+    const plateCandidates = extractPlateCandidates(userMsg);
+    if (plateCandidates.length) {
+      // Try each candidate until one matches
+      for (const plate of plateCandidates) {
+        const sql = `
+          SELECT ${buildVehicleSelect()}
+          FROM vehicles
+          WHERE regexp_replace(upper(plate_number),'[^A-Z0-9]', '', 'g') = $1
+          ${buildOrderBy()}
+          LIMIT 1
+        `;
+        const r = await pool.query(sql, [plate]);
+        if (r.rows.length) {
+          vehicle = r.rows[0];
+          break;
+        }
+      }
     }
 
     // 2) If no plate match, try make/model (only if those cols exist)
