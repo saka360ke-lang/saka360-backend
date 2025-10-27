@@ -5,6 +5,15 @@ const express = require("express");
 const app = express();
 app.use(express.json());
 
+// Return JSON for malformed JSON bodies instead of HTML
+app.use((err, req, res, next) => {
+  if (err instanceof SyntaxError && "body" in err) {
+    return res.status(400).json({ error: "Invalid JSON body" });
+  }
+  next(err);
+});
+
+
 // ---------------------------
 // HTTP request logger
 // ---------------------------
@@ -197,6 +206,20 @@ if (affiliatesRoutes) app.use("/api/affiliates", affiliatesRoutes);
  * ----------------------- */
 app.use((req, res) => {
   res.status(404).json({ error: "Not found", path: req.originalUrl });
+});
+
+// Global JSON error handler (last middleware)
+app.use((err, req, res, next) => {
+  console.error("[unhandled]", err);
+  const status = err.status || 500;
+  res
+    .status(status)
+    .type("application/json")
+    .send({
+      error: status === 404 ? "Not found" : "Server error",
+      detail: process.env.DEBUG_MODE === "1" ? (err?.message || String(err)) : undefined,
+      path: req.originalUrl
+    });
 });
 
 /* -----------------------
