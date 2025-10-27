@@ -2,175 +2,208 @@
 const express = require("express");
 const router = express.Router();
 
-// Optional: only load OpenAI when we actually need it
-let OpenAI = null;
-function getOpenAI() {
-  if (!process.env.OPENAI_API_KEY && !process.env.LLM_API_KEY) {
-    const err = new Error("LLM not configured: set OPENAI_API_KEY (or LLM_API_KEY)");
-    err.status = 500;
-    throw err;
-  }
-  if (!OpenAI) {
-    // Lazy import so missing package errors are clearer here
-    OpenAI = require("openai");
-  }
-  const apiKey = process.env.OPENAI_API_KEY || process.env.LLM_API_KEY;
-  return new OpenAI({ apiKey });
-}
-
-// --- helpers ---------------------------------------------------
-const MODEL = process.env.LLM_MODEL || "gpt-4o-mini";
-
-/** remove spaces/dashes & uppercase: "KDH 123A" -> "KDH123A" */
-function normalizePlate(p) {
-  return String(p || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
-}
-
-/** quick heuristic to detect plate-like string */
-function looksLikePlate(s) {
-  return /[A-Z]/i.test(s) && /[0-9]/.test(s);
-}
-
-/** try to find a vehicle from a free-form query */
-async function pickVehicleFromQuery(pool, userId, userText) {
-  const qText = (userText || "").trim();
-
-  // Try plate match first (normalize both sides)
-  if (looksLikePlate(qText)) {
-    const norm = normalizePlate(qText);
-    const byPlate = await pool.query(
-      `SELECT id, name, type, plate_number, make, model, year_of_manufacture
-         FROM vehicles
-        WHERE user_id = $1
-          AND UPPER(REGEXP_REPLACE(plate_number, '[^A-Z0-9]', '', 'g')) = $2
-        LIMIT 1`,
-      [userId, norm]
-    );
-    if (byPlate.rows.length) return byPlate.rows[0];
-  }
-
-  // Try make/model keywords (very simple fuzzy-ish search)
-  const words = qText.split(/\s+/).filter(Boolean);
-  if (words.length) {
-    const like = `%${words.join("%")}%`;
-    const byMakeModel = await pool.query(
-      `SELECT id, name, type, plate_number, make, model, year_of_manufacture
-         FROM vehicles
-        WHERE user_id = $1
-          AND (
-            (make  IS NOT NULL AND make  ILIKE $2) OR
-            (model IS NOT NULL AND model ILIKE $2) OR
-            (name  IS NOT NULL AND name  ILIKE $2)
-          )
-        ORDER BY created_at DESC
-        LIMIT 1`,
-      [userId, like]
-    );
-    if (byMakeModel.rows.length) return byMakeModel.rows[0];
-  }
-
-  return null;
-}
-
-/** build the strict system prompt */
-function buildSystemPrompt(vehicle) {
-  const vtxt = vehicle
-    ? `Vehicle in focus:
-- Plate: ${vehicle.plate_number || "N/A"}
-- Name: ${vehicle.name || "N/A"}
-- Make/Model/Year: ${vehicle.make || "?"} / ${vehicle.model || "?"} / ${vehicle.year_of_manufacture || "?"}
-- Type: ${vehicle.type || "N/A"}`
-    : `No specific vehicle resolved yet. Ask a clarifying question about plate / make / model if needed.`;
-
-  return [
-    "You are Saka360’s maintenance assistant.",
-    "Only answer questions about the user’s vehicles and maintenance on this app.",
-    "Be brief, practical, and action-oriented. Use bullet points when helpful.",
-    "If the user asks about features/workflows, explain how to do it inside this app (not general web).",
-    "Never provide random web answers. If external facts are needed, keep it generic and short.",
-    vtxt,
-  ].join("\n\n");
-}
-
-/** compose chat to OpenAI */
-async function llmRespond(openai, systemPrompt, userMessages) {
-  const { choices } = await openai.chat.completions.create({
-    model: MODEL,
-    messages: [
-      { role: "system", content: systemPrompt },
-      ...userMessages.map(m => ({ role: m.role, content: m.content }))
-    ],
-    temperature: 0.3,
+// OpenAI client (uses OPENAI_API_KEY or fallback LLM_API_KEY)
+let openai = null;
+try {
+  const { OpenAI } = require("openai");
+  openai = new OpenAI({
+    apiKey: process.env.OPENAI_API_KEY || process.env.LLM_API_KEY,
   });
-  return choices?.[0]?.message?.content?.trim() || "Sorry, I couldn’t draft a reply.";
+} catch (e) {
+  console.warn("[chat] openai SDK not installed or misconfigured:", e.message);
 }
 
-// --- route -----------------------------------------------------
-module.exports = (app) => {
-  const pool = app.get("pool");
-  if (!pool) throw new Error("Pool not found on app; set app.set('pool', pool) in index.js");
+// Cache whether optional columns exist (checked once, lazily)
+let VEH_COL_CHECKED = false;
+let HAS_MAKE = false;
+let HAS_MODEL = false;
+let HAS_YOM = false; // year_of_manufacture
 
-  /**
-   * POST /api/chat
-   * Body: { messages: [{role, content}], vehicle_hint?: string, dry?: boolean }
-   * - Add `?dry=1` or body.dry=true to bypass LLM and just echo the resolved vehicle & parsed intent.
-   * - Set DEBUG_MODE=1 to include error details in JSON on failure.
-   */
-  router.post("/", async (req, res) => {
-    try {
-      const { messages, vehicle_hint, dry } = req.body || {};
-      if (!Array.isArray(messages) || messages.length === 0) {
-        return res.status(400).json({ error: "Provide messages: [{role, content}, ...]" });
-      }
+function normalizePlate(s = "") {
+  return (s || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+}
 
-      // For now, use a fixed demo user (replace with authenticateToken and req.user.id in prod)
-      const userId = req.user?.id || 1;
+async function ensureVehicleColumns(pool) {
+  if (VEH_COL_CHECKED) return;
+  const sql = `
+    SELECT column_name
+    FROM information_schema.columns
+    WHERE table_name='vehicles' AND column_name = ANY($1)
+  `;
+  const wanted = ["make", "model", "year_of_manufacture"];
+  try {
+    const r = await pool.query(sql, [wanted]);
+    const have = new Set(r.rows.map((x) => x.column_name));
+    HAS_MAKE  = have.has("make");
+    HAS_MODEL = have.has("model");
+    HAS_YOM   = have.has("year_of_manufacture");
+  } catch (e) {
+    // If this fails, just proceed with base columns
+    console.error("[chat] column check failed:", e.message);
+  } finally {
+    VEH_COL_CHECKED = true;
+  }
+}
 
-      // Try to lock onto a vehicle:
-      const lastUserMsg = [...messages].reverse().find(m => m.role === "user")?.content || "";
-      let vehicle = null;
+function buildVehicleSelect() {
+  const cols = [
+    "id",
+    "name",
+    "plate_number",
+    "type",
+  ];
+  if (HAS_MAKE) cols.push("make");
+  if (HAS_MODEL) cols.push("model");
+  if (HAS_YOM) cols.push("year_of_manufacture");
+  return cols.join(", ");
+}
 
-      // 1) Direct hint (plate/make/model)
-      if (vehicle_hint) {
-        vehicle =
-          (await pickVehicleFromQuery(pool, userId, vehicle_hint)) ||
-          (await pickVehicleFromQuery(pool, userId, lastUserMsg));
-      } else {
-        // 2) Infer from the last user message
-        vehicle = await pickVehicleFromQuery(pool, userId, lastUserMsg);
-      }
+function extractMakeModelGuess(text) {
+  // Extremely light heuristic: look for 1–2 capitalized tokens as model words.
+  // We still prioritize plate matching; this is just a fallback.
+  const lower = (text || "").toLowerCase();
+  // A tiny OEM list for hinting (extend later as needed)
+  const makes = ["toyota","nissan","honda","mazda","subaru","ford","isuzu","mercedes","bmw","audi","vw","volkswagen","mitsubishi","suzuki","hyundai","kia"];
+  const foundMake = makes.find(m => lower.includes(m));
+  // crude model grab (next capitalized word after make)
+  let model = null;
+  if (foundMake) {
+    const re = new RegExp(`${foundMake}\\s+([a-z0-9-]+)`, "i");
+    const m = lower.match(re);
+    if (m && m[1]) model = m[1];
+  }
+  return { make: foundMake ? foundMake[0].toUpperCase() + foundMake.slice(1) : null, model: model ? model : null };
+}
 
-      // DRY RUN mode for diagnostics (no LLM call)
-      const isDry = Boolean(dry) || req.query.dry === "1";
-      if (isDry) {
-        return res.json({
-          dry: true,
-          resolved_vehicle: vehicle,
-          note: vehicle
-            ? "Vehicle resolved. Real mode would now ask the LLM with this context."
-            : "No vehicle resolved. In real mode the assistant would ask a clarifying question.",
-        });
-      }
-
-      // Real LLM call
-      const openai = getOpenAI();
-      const systemPrompt = buildSystemPrompt(vehicle);
-      const text = await llmRespond(openai, systemPrompt, messages);
-
-      return res.json({
-        provider: "openai",
-        model: MODEL,
-        content: text,
-        vehicle: vehicle || null
-      });
-    } catch (err) {
-      console.error("chat error:", err);
+router.post("/chat", async (req, res) => {
+  try {
+    const pool = req.app.get("pool");
+    if (!pool) {
       return res.status(500).json({
         error: "Server error",
-        detail: process.env.DEBUG_MODE === "1" ? (err?.message || String(err)) : undefined
+        detail: "Pool not found on app; set app.set('pool', pool) in index.js",
+        path: req.originalUrl,
       });
     }
-  });
 
-  app.use("/api/chat", router);
-};
+    const messages = req.body?.messages;
+    if (!Array.isArray(messages) || messages.length === 0) {
+      return res.status(400).json({ error: "Missing 'messages' array" });
+    }
+
+    const userMsg = messages[messages.length - 1]?.content || "";
+    await ensureVehicleColumns(pool);
+
+    // 1) Try plate match first (normalize both sides)
+    const plateGuess = normalizePlate(userMsg);
+    let vehicle = null;
+
+    if (plateGuess && plateGuess.length >= 5) {
+      const sql = `
+        SELECT ${buildVehicleSelect()}
+        FROM vehicles
+        WHERE regexp_replace(upper(plate_number),'[^A-Z0-9]','','g') = $1
+        ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST
+        LIMIT 1
+      `;
+      const r = await pool.query(sql, [plateGuess]);
+      if (r.rows.length) vehicle = r.rows[0];
+    }
+
+    // 2) If no plate match, try make/model hint if those columns exist
+    if (!vehicle) {
+      const { make, model } = extractMakeModelGuess(userMsg);
+      if ((HAS_MAKE || HAS_MODEL) && (make || model)) {
+        const where = [];
+        const params = [];
+        let p = 1;
+
+        if (HAS_MAKE && make) {
+          where.push(`LOWER(make) = LOWER($${p++})`);
+          params.push(make);
+        }
+        if (HAS_MODEL && model) {
+          where.push(`LOWER(model) = LOWER($${p++})`);
+          params.push(model);
+        }
+
+        if (where.length) {
+          const sql = `
+            SELECT ${buildVehicleSelect()}
+            FROM vehicles
+            WHERE ${where.join(" AND ")}
+            ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST
+            LIMIT 1
+          `;
+          const r = await pool.query(sql, params);
+          if (r.rows.length) vehicle = r.rows[0];
+        }
+      }
+    }
+
+    // 3) Build system prompt—**strictly** limited to vehicle-records scope
+    const systemPrompt = [
+      "You are Saka360’s vehicle maintenance assistant.",
+      "Only answer questions related to the user's registered vehicles and maintenance/usage.",
+      "Pull details from the user's vehicle profile when available (plate/make/model/year).",
+      "Be brief and practical. Suggest next steps in the Saka360 app when relevant.",
+    ].join(" ");
+
+    // 4) Create a short vehicle context, if any
+    let vehicleContext = "No vehicle matched from the prompt.";
+    if (vehicle) {
+      vehicleContext =
+        `Matched vehicle:\n` +
+        `- Name: ${vehicle.name || "(n/a)"}\n` +
+        `- Plate: ${vehicle.plate_number || "(n/a)"}\n` +
+        `- Type: ${vehicle.type || "(n/a)"}\n` +
+        `${HAS_MAKE ? `- Make: ${vehicle.make || "(n/a)"}\n` : ""}` +
+        `${HAS_MODEL ? `- Model: ${vehicle.model || "(n/a)"}\n` : ""}` +
+        `${HAS_YOM ? `- Year: ${vehicle.year_of_manufacture ?? "(n/a)"}\n` : ""}`;
+    }
+
+    // 5) Call OpenAI (if available); otherwise return a friendly stub
+    let content = "(LLM is not configured)";
+    let provider = "stub";
+    let model = "none";
+
+    if (openai && (process.env.OPENAI_API_KEY || process.env.LLM_API_KEY)) {
+      provider = "openai";
+      model = process.env.LLM_MODEL || "gpt-4o-mini";
+
+      const completion = await openai.chat.completions.create({
+        model,
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "system", content: `Vehicle context:\n${vehicleContext}` },
+          { role: "user", content: userMsg },
+        ],
+        temperature: 0.3,
+      });
+
+      content = completion.choices?.[0]?.message?.content?.trim() || "(no response)";
+    } else {
+      // simple fallback if key not set
+      content =
+        vehicle
+          ? `You asked: "${userMsg}".\nMatched your vehicle ${vehicle?.name || ""} (${vehicle?.plate_number || ""}). Keep queries related to maintenance records, fuel, service, and documents.`
+          : `You asked: "${userMsg}". I couldn't match a vehicle. Try including your plate (e.g., "KDH123A") or your make/model.`;
+    }
+
+    return res.json({
+      provider,
+      model,
+      content,
+      vehicle: vehicle || null,
+    });
+  } catch (err) {
+    console.error("chat error:", err);
+    return res.status(500).json({
+      error: "Server error",
+      detail: process.env.DEBUG_MODE === "1" ? err?.message : undefined,
+      path: req.originalUrl,
+    });
+  }
+});
+
+module.exports = router;
