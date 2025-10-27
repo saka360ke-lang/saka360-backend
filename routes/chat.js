@@ -3,17 +3,23 @@ const express = require("express");
 const { authenticateToken } = require("../middleware/auth");
 const { chatComplete } = require("../utils/ai");
 
-/**
- * Helpers
- */
+/** ---------- Helpers ---------- **/
+
+// lowercase & trim
 const norm = (s) => String(s || "").toLowerCase().trim();
 
+// remove all non-alphanumerics (so "KDH 123A", "KDH-123A" => "kdh123a")
+const normPlate = (s) => norm(s).replace(/[^a-z0-9]/g, "");
+
+// quick tokenization to catch plates/words/years in user text
 function tokensFromText(text) {
-  // extract crude tokens for plate-like (letters+digits), words, and years
   const t = norm(text);
-  const plateish = Array.from(t.matchAll(/[a-z]{2,}\d{2,}[a-z]*|\d{2,}[a-z]+/g)).map(m => m[0]); // e.g., KDA123A, ABC123K
-  const words = Array.from(t.matchAll(/[a-z]+/g)).map(m => m[0]); // toyota, probox
-  const years = Array.from(t.matchAll(/\b(19[6-9]\d|20[0-4]\d)\b/g)).map(m => m[0]); // 1960-2049 safety
+  const plateish = Array.from(t.matchAll(/[a-z0-9-]+/g))
+    .map(m => normPlate(m[0]))
+    .filter(Boolean)
+    .filter(x => /[a-z]/.test(x) && /\d/.test(x)); // must have letters+digits
+  const words = Array.from(t.matchAll(/[a-z]+/g)).map(m => m[0]);
+  const years = Array.from(t.matchAll(/\b(19[6-9]\d|20[0-4]\d)\b/g)).map(m => m[0]);
   return { plateish, words, years };
 }
 
@@ -45,6 +51,16 @@ function shortVehicleLabel(v, have) {
   return bits.join(" ").replace(/\s+/g, " ").trim();
 }
 
+// basic “help intent” detector
+function looksLikeHelp(text) {
+  const t = norm(text);
+  return [
+    "how do i", "how to ", "where do i", "guide me", "show me", "steps", "record service",
+    "add service", "add fuel", "log fuel", "upload", "document", "logbook",
+    "insurance", "inspection", "reminder", "set reminder", "report", "download report"
+  ].some(kw => t.includes(kw));
+}
+
 module.exports = (app) => {
   const router = express.Router();
   const pool = app.get("pool");
@@ -56,11 +72,11 @@ module.exports = (app) => {
         return res.status(400).json({ error: "Missing 'messages' (array of {role, content})" });
       }
 
-      // Combine all user messages (we only inspect user's text for matching)
+      // Combine user text
       const userText = messages.filter(m => m.role === "user").map(m => m.content || "").join(" ").trim();
       const { plateish, words, years } = tokensFromText(userText);
 
-      // 1) Detect optional columns
+      // Detect optional columns
       const colQ = await pool.query(
         `SELECT column_name
            FROM information_schema.columns
@@ -74,11 +90,12 @@ module.exports = (app) => {
         year:  colQ.rows.some(r => r.column_name === "year_of_manufacture"),
       };
 
-      // 2) Build select & fetch user vehicles
+      // Build select & fetch user's vehicles
       const baseFields = ["id", "name", "plate_number", "type"];
       if (have.make)  baseFields.push("make");
       if (have.model) baseFields.push("model");
       if (have.year)  baseFields.push("year_of_manufacture");
+
       const vq = await pool.query(
         `SELECT ${buildSelectList(baseFields)}
            FROM public.vehicles
@@ -94,62 +111,87 @@ module.exports = (app) => {
         });
       }
 
-      // 3) Try to match by (priority) plate → make/model → year narrowing
+      // Precompute normalized plates
+      const vehiclesWithNorm = vehicles.map(v => ({
+        ...v,
+        _plate_norm: v.plate_number ? normPlate(v.plate_number) : ""
+      }));
+
       const textL = norm(userText);
+      const textPlateNorms = [
+        ...new Set([
+          ...plateish,
+          // also derive from raw text words by stripping non-alnum
+          ...words.map(normPlate).filter(Boolean)
+        ])
+      ];
 
-      const byPlate = vehicles.filter(v => v.plate_number && textL.includes(norm(v.plate_number)));
-      // If the user typed something that looks like a plate but not exact match, try fuzzy contains
-      const fuzzyPlate = vehicles.filter(v => v.plate_number && plateish.some(p => norm(v.plate_number).includes(p)));
+      // Match priority: exact plate (normalized) → fuzzy contains of plate norm → make/model narrowing → year
+      let candidates = vehiclesWithNorm;
 
-      let candidates = byPlate.length ? byPlate : (fuzzyPlate.length ? fuzzyPlate : vehicles);
+      // exact plate norm match first
+      const exactByPlate = candidates.filter(v =>
+        v._plate_norm && textPlateNorms.includes(v._plate_norm)
+      );
 
-      // Narrow by make/model when present in text
+      if (exactByPlate.length > 0) {
+        candidates = exactByPlate;
+      } else {
+        // fuzzy: any user plate-ish token contained within vehicle plate norm or vice-versa
+        const fuzzyPlate = candidates.filter(v =>
+          v._plate_norm &&
+          textPlateNorms.some(tp => v._plate_norm.includes(tp) || tp.includes(v._plate_norm))
+        );
+        if (fuzzyPlate.length > 0) candidates = fuzzyPlate;
+      }
+
+      // Narrow by make
       if (have.make) {
-        const mks = new Set(
-          vehicles
+        const makesInText = new Set(
+          vehiclesWithNorm
             .map(v => v.make)
             .filter(Boolean)
-            .map(x => norm(x))
-            .filter(x => textL.includes(x))
+            .map(norm)
+            .filter(mk => textL.includes(mk))
         );
-        if (mks.size > 0) {
-          candidates = candidates.filter(v => v.make && mks.has(norm(v.make)));
+        if (makesInText.size > 0) {
+          candidates = candidates.filter(v => v.make && makesInText.has(norm(v.make)));
         }
       }
 
+      // Narrow by model
       if (have.model) {
-        const mdls = new Set(
-          vehicles
+        const modelsInText = new Set(
+          vehiclesWithNorm
             .map(v => v.model)
             .filter(Boolean)
-            .map(x => norm(x))
-            .filter(x => textL.includes(x))
+            .map(norm)
+            .filter(md => textL.includes(md))
         );
-        if (mdls.size > 0) {
-          candidates = candidates.filter(v => v.model && mdls.has(norm(v.model)));
+        if (modelsInText.size > 0) {
+          candidates = candidates.filter(v => v.model && modelsInText.has(norm(v.model)));
         }
       }
 
-      // Narrow by year if present in query (rare but useful)
+      // Narrow by year
       if (have.year && years.length > 0) {
         const yset = new Set(years.map(y => parseInt(y, 10)));
         const narrowed = candidates.filter(v => v.year_of_manufacture && yset.has(Number(v.year_of_manufacture)));
         if (narrowed.length > 0) candidates = narrowed;
       }
 
-      // If the query mentions plate/make/model/year tokens but we still match NOTHING → tell the user what to use
+      // Handle no match
       if (candidates.length === 0) {
-        // examples of valid handles
-        const examples = vehicles.slice(0, 5).map(v => shortVehicleLabel(v, have));
+        const examples = vehiclesWithNorm.slice(0, 5).map(v => shortVehicleLabel(v, have));
         return res.status(400).json({
           error: "No matching vehicle",
           detail:
-            "I couldn’t find a vehicle matching what you typed. Mention the vehicle by plate, name, make, model, or year exactly as saved.",
+            "I couldn’t find a vehicle matching what you typed. Mention the vehicle by plate (spaces/dashes OK), name, make, model, or year exactly as saved.",
           examples
         });
       }
 
-      // If multiple matches remain → ask user to pick one (short disambiguation)
+      // Disambiguate multiples
       if (candidates.length > 1) {
         const options = candidates.slice(0, 6).map(v => ({
           id: v.id,
@@ -158,44 +200,42 @@ module.exports = (app) => {
         return res.status(409).json({
           error: "Multiple vehicles match",
           options,
-          tip: "Reply with one of the plate numbers, or make+model+year to narrow it down."
+          tip: "Reply with one of the plate numbers (spaces/dashes OK), or make+model+year."
         });
       }
 
-      // Exactly one vehicle found → build tight context
+      // Exactly one
       const v = candidates[0];
 
-      // Optional: load last few maintenance rows (fuel/service/docs) for richer context
-      // Keeping it light/optional; comment these in if useful.
-      // const [fuel, service, docs] = await Promise.all([
-      //   pool.query(`SELECT amount, liters, odometer, created_at FROM fuel_logs WHERE user_id=$1 AND vehicle_id=$2 ORDER BY created_at DESC LIMIT 5`, [req.user.id, v.id]),
-      //   pool.query(`SELECT description, cost, odometer, created_at FROM service_logs WHERE user_id=$1 AND vehicle_id=$2 ORDER BY created_at DESC LIMIT 5`, [req.user.id, v.id]),
-      //   pool.query(`SELECT doc_type, number, expiry_date FROM documents WHERE user_id=$1 AND vehicle_id=$2 ORDER BY expiry_date ASC LIMIT 5`, [req.user.id, v.id]),
-      // ]);
+      // --- HELP MODE: If user is asking “how to use Saka360”, give concise steps + API ---
+      const helpMode = looksLikeHelp(userText);
+      const helpBlock = helpMode ? [
+        "Saka360 quick help (keep answers short, step-by-step):",
+        "- To record a service: App → Vehicles → Select vehicle → Service → Add new → Fill description, cost, odometer → Save.",
+        "- API (developer): POST /api/service/add { vehicle_id, description, cost, odometer } (Auth: Bearer).",
+        "- To log fuel: App → Vehicles → Select vehicle → Fuel → Add new → Amount, price/liter, odometer → Save.",
+        "- API: POST /api/fuel/add { vehicle_id, amount, price_per_liter, odometer }.",
+        "- To upload a document (insurance, inspection, etc.): App → Documents → Upload → pick file → save.",
+        "- API: Direct S3 upload via /api/uploads/sign-put then /api/uploads/finalize.",
+        "- To set reminders: App → Documents → Set reminder ahead of expiry.",
+        "- Reports: App → Reports → Fleet or Vehicle; API: GET /api/reports/vehicles/report/:vehicle_id."
+      ].join("\n") : "";
 
-      // (Future) Web enrichment hook:
-      // If you truly want “search the internet”, call your own small service here,
-      // then add a compact summary string into the system prompt. Keep it short.
-      // const externalSummary = await fetchBriefExternalSummary(v.make, v.model, v.year_of_manufacture);
-      const externalSummary = ""; // keep empty for now (no external calls)
+      // External (kept empty now)
+      const externalSummary = "";
 
       const systemPrompt = [
         "You are Saka360’s vehicle records assistant.",
-        "Answer briefly and practically (3–7 bullet points when listing).",
-        "Use the exact vehicle details below. If a maintenance interval is general knowledge, state it clearly.",
-        "If uncertain, say so and suggest checking the owner’s manual.",
-        "",
-        "Vehicle in scope:",
-        `- ${vehicleLine(v, have)}`,
-        externalSummary && "",
-        externalSummary && "External maintenance summary:",
-        externalSummary && externalSummary,
+        "Scope: only answer about the user’s own vehicles and maintenance. Keep answers short and practical.",
+        "When listing items, use 3–7 bullet points. If uncertain, advise checking the owner’s manual.",
+        `Vehicle in scope: ${vehicleLine(v, have)}`,
+        helpBlock,
+        externalSummary && "External maintenance notes:",
+        externalSummary
       ].filter(Boolean).join("\n");
 
       const finalMessages = [
         { role: "system", content: systemPrompt },
-        // Optional: You can add a tool-style context message with last logs if you enabled the queries above.
-        // { role: "system", content: `Recent logs: fuel=${fuel.rows.length}, service=${service.rows.length}, docs=${docs.rows.length}` },
         ...messages
       ];
 
@@ -216,11 +256,10 @@ module.exports = (app) => {
         }
       });
     } catch (err) {
-      console.error("chat (plate/make/model flow) error:", err);
+      console.error("chat route error:", err);
       return res.status(500).json({ error: "Chat failed", detail: err.message });
     }
   });
 
-  // mount
   app.use("/api/chat", router);
 };
