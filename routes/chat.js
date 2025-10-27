@@ -1,265 +1,202 @@
 // routes/chat.js
 const express = require("express");
 const { authenticateToken } = require("../middleware/auth");
-const { chatComplete } = require("../utils/ai");
+const { OpenAI } = require("openai");
 
-/** ---------- Helpers ---------- **/
+const router = express.Router();
 
-// lowercase & trim
-const norm = (s) => String(s || "").toLowerCase().trim();
+const OPENAI_KEY = process.env.OPENAI_API_KEY || process.env.LLM_API_KEY;
+const openai = OPENAI_KEY ? new OpenAI({ apiKey: OPENAI_KEY }) : null;
 
-// remove all non-alphanumerics (so "KDH 123A", "KDH-123A" => "kdh123a")
-const normPlate = (s) => norm(s).replace(/[^a-z0-9]/g, "");
-
-// quick tokenization to catch plates/words/years in user text
-function tokensFromText(text) {
-  const t = norm(text);
-  const plateish = Array.from(t.matchAll(/[a-z0-9-]+/g))
-    .map(m => normPlate(m[0]))
-    .filter(Boolean)
-    .filter(x => /[a-z]/.test(x) && /\d/.test(x)); // must have letters+digits
-  const words = Array.from(t.matchAll(/[a-z]+/g)).map(m => m[0]);
-  const years = Array.from(t.matchAll(/\b(19[6-9]\d|20[0-4]\d)\b/g)).map(m => m[0]);
-  return { plateish, words, years };
+// very light intent detector (keyword-based to keep it fast & predictable)
+function detectIntent(text) {
+  const t = (text || "").toLowerCase();
+  const intents = {
+    wantService: /service|maintenance|servicing|mechanic/.test(t),
+    wantFuel: /fuel|consumption|mpg|liters|gas/.test(t),
+    wantDocs: /document|insurance|license|inspection|logbook|expiry|renew/.test(t),
+    wantAll: /history|records|report|summary/.test(t),
+  };
+  return intents;
 }
 
-function buildSelectList(cols) {
-  return cols.map((c) => `"${c}"`).join(", ");
+// normalize incoming vehicle hint (plate/make/model with/without spaces)
+function normPlate(s) {
+  return String(s || "").replace(/[\s-]/g, "").toUpperCase();
 }
 
-function vehicleLine(v, have) {
-  const parts = [
-    `id:${v.id}`,
-    v.name && `name:${v.name}`,
-    v.plate_number && `plate:${v.plate_number}`,
-    v.type && `type:${v.type}`,
-    have.make && v.make && `make:${v.make}`,
-    have.model && v.model && `model:${v.model}`,
-    have.year && v.year_of_manufacture && `year:${v.year_of_manufacture}`
-  ].filter(Boolean);
-  return parts.join(", ");
+function normFree(s) {
+  return String(s || "").trim().toLowerCase();
 }
 
-function shortVehicleLabel(v, have) {
-  const bits = [
-    v.name,
-    v.plate_number && `(${v.plate_number})`,
-    have.make && v.make,
-    have.model && v.model,
-    have.year && v.year_of_manufacture
-  ].filter(Boolean);
-  return bits.join(" ").replace(/\s+/g, " ").trim();
+// Resolve a vehicle for this user from a free-form hint (plate/make/model)
+async function resolveVehicle(pool, userId, hint) {
+  if (!hint) return null;
+
+  // try exact/loose plate match
+  const hp = normPlate(hint);
+  let q = await pool.query(
+    `SELECT id, name, plate_number, type, make, model, year_of_manufacture
+       FROM vehicles
+      WHERE user_id = $1
+        AND UPPER(REPLACE(plate_number, ' ', '')) = $2
+      LIMIT 1`,
+    [userId, hp]
+  );
+  if (q.rows.length) return q.rows[0];
+
+  // try make+model loose contains
+  const h = normFree(hint);
+  q = await pool.query(
+    `SELECT id, name, plate_number, type, make, model, year_of_manufacture
+       FROM vehicles
+      WHERE user_id = $1
+        AND (
+          LOWER(COALESCE(make,''))  LIKE '%' || $2 || '%' OR
+          LOWER(COALESCE(model,'')) LIKE '%' || $2 || '%'
+        )
+      ORDER BY created_at DESC
+      LIMIT 1`,
+    [userId, h]
+  );
+  if (q.rows.length) return q.rows[0];
+
+  return null;
 }
 
-// basic “help intent” detector
-function looksLikeHelp(text) {
-  const t = norm(text);
-  return [
-    "how do i", "how to ", "where do i", "guide me", "show me", "steps", "record service",
-    "add service", "add fuel", "log fuel", "upload", "document", "logbook",
-    "insurance", "inspection", "reminder", "set reminder", "report", "download report"
-  ].some(kw => t.includes(kw));
+async function fetchService(pool, userId, vehicleId, limit = 10) {
+  const r = await pool.query(
+    `SELECT id, description, cost, odometer, created_at
+       FROM service_logs
+      WHERE user_id = $1 AND vehicle_id = $2
+      ORDER BY created_at DESC
+      LIMIT $3`,
+    [userId, vehicleId, limit]
+  );
+  return r.rows;
 }
 
-module.exports = (app) => {
-  const router = express.Router();
-  const pool = app.get("pool");
+async function fetchFuel(pool, userId, vehicleId, limit = 10) {
+  const r = await pool.query(
+    `SELECT id, amount, liters, price_per_liter, odometer, created_at
+       FROM fuel_logs
+      WHERE user_id = $1 AND vehicle_id = $2
+      ORDER BY created_at DESC
+      LIMIT $3`,
+    [userId, vehicleId, limit]
+  );
+  return r.rows;
+}
 
-  router.post("/", authenticateToken, async (req, res) => {
-    try {
-      const messages = req.body?.messages;
-      if (!Array.isArray(messages) || messages.length === 0) {
-        return res.status(400).json({ error: "Missing 'messages' (array of {role, content})" });
-      }
+async function fetchDocs(pool, userId, vehicleId) {
+  const r = await pool.query(
+    `SELECT id, doc_type, number, expiry_date, created_at
+       FROM documents
+      WHERE user_id = $1 AND vehicle_id = $2
+      ORDER BY expiry_date ASC NULLS LAST`,
+    [userId, vehicleId]
+  );
+  return r.rows;
+}
 
-      // Combine user text
-      const userText = messages.filter(m => m.role === "user").map(m => m.content || "").join(" ").trim();
-      const { plateish, words, years } = tokensFromText(userText);
+router.post("/chat", authenticateToken, async (req, res) => {
+  try {
+    const pool = req.app.get("pool");
+    const messages = req.body?.messages || [];
+    const lastUser = messages.slice().reverse().find(m => m.role === "user");
+    const userText = lastUser?.content || "";
 
-      // Detect optional columns
-      const colQ = await pool.query(
-        `SELECT column_name
-           FROM information_schema.columns
-          WHERE table_schema='public'
-            AND table_name='vehicles'
-            AND column_name IN ('make','model','year_of_manufacture')`
-      );
-      const have = {
-        make:  colQ.rows.some(r => r.column_name === "make"),
-        model: colQ.rows.some(r => r.column_name === "model"),
-        year:  colQ.rows.some(r => r.column_name === "year_of_manufacture"),
-      };
+    // quick extract a vehicle hint from the last user message
+    // if they didn't name one, use their most recent vehicle
+    let hint = userText.match(/[A-Z]{3}\s?-?\d{3}[A-Z]|[A-Za-z0-9\- ]{3,}/g)?.[0] || null;
 
-      // Build select & fetch user's vehicles
-      const baseFields = ["id", "name", "plate_number", "type"];
-      if (have.make)  baseFields.push("make");
-      if (have.model) baseFields.push("model");
-      if (have.year)  baseFields.push("year_of_manufacture");
+    // user’s latest vehicle fallback
+    const latestVehicle = await pool.query(
+      `SELECT id, name, plate_number, type, make, model, year_of_manufacture
+         FROM vehicles
+        WHERE user_id = $1
+        ORDER BY updated_at DESC NULLS LAST, created_at DESC
+        LIMIT 1`,
+      [req.user.id]
+    );
 
-      const vq = await pool.query(
-        `SELECT ${buildSelectList(baseFields)}
-           FROM public.vehicles
-          WHERE user_id = $1
-          ORDER BY created_at ASC NULLS LAST, id ASC`,
-        [req.user.id]
-      );
-      const vehicles = vq.rows;
-      if (vehicles.length === 0) {
-        return res.status(400).json({
-          error: "No vehicles found",
-          detail: "Add at least one vehicle before using the assistant."
-        });
-      }
-
-      // Precompute normalized plates
-      const vehiclesWithNorm = vehicles.map(v => ({
-        ...v,
-        _plate_norm: v.plate_number ? normPlate(v.plate_number) : ""
-      }));
-
-      const textL = norm(userText);
-      const textPlateNorms = [
-        ...new Set([
-          ...plateish,
-          // also derive from raw text words by stripping non-alnum
-          ...words.map(normPlate).filter(Boolean)
-        ])
-      ];
-
-      // Match priority: exact plate (normalized) → fuzzy contains of plate norm → make/model narrowing → year
-      let candidates = vehiclesWithNorm;
-
-      // exact plate norm match first
-      const exactByPlate = candidates.filter(v =>
-        v._plate_norm && textPlateNorms.includes(v._plate_norm)
-      );
-
-      if (exactByPlate.length > 0) {
-        candidates = exactByPlate;
-      } else {
-        // fuzzy: any user plate-ish token contained within vehicle plate norm or vice-versa
-        const fuzzyPlate = candidates.filter(v =>
-          v._plate_norm &&
-          textPlateNorms.some(tp => v._plate_norm.includes(tp) || tp.includes(v._plate_norm))
-        );
-        if (fuzzyPlate.length > 0) candidates = fuzzyPlate;
-      }
-
-      // Narrow by make
-      if (have.make) {
-        const makesInText = new Set(
-          vehiclesWithNorm
-            .map(v => v.make)
-            .filter(Boolean)
-            .map(norm)
-            .filter(mk => textL.includes(mk))
-        );
-        if (makesInText.size > 0) {
-          candidates = candidates.filter(v => v.make && makesInText.has(norm(v.make)));
-        }
-      }
-
-      // Narrow by model
-      if (have.model) {
-        const modelsInText = new Set(
-          vehiclesWithNorm
-            .map(v => v.model)
-            .filter(Boolean)
-            .map(norm)
-            .filter(md => textL.includes(md))
-        );
-        if (modelsInText.size > 0) {
-          candidates = candidates.filter(v => v.model && modelsInText.has(norm(v.model)));
-        }
-      }
-
-      // Narrow by year
-      if (have.year && years.length > 0) {
-        const yset = new Set(years.map(y => parseInt(y, 10)));
-        const narrowed = candidates.filter(v => v.year_of_manufacture && yset.has(Number(v.year_of_manufacture)));
-        if (narrowed.length > 0) candidates = narrowed;
-      }
-
-      // Handle no match
-      if (candidates.length === 0) {
-        const examples = vehiclesWithNorm.slice(0, 5).map(v => shortVehicleLabel(v, have));
-        return res.status(400).json({
-          error: "No matching vehicle",
-          detail:
-            "I couldn’t find a vehicle matching what you typed. Mention the vehicle by plate (spaces/dashes OK), name, make, model, or year exactly as saved.",
-          examples
-        });
-      }
-
-      // Disambiguate multiples
-      if (candidates.length > 1) {
-        const options = candidates.slice(0, 6).map(v => ({
-          id: v.id,
-          label: shortVehicleLabel(v, have) || `Vehicle #${v.id}`
-        }));
-        return res.status(409).json({
-          error: "Multiple vehicles match",
-          options,
-          tip: "Reply with one of the plate numbers (spaces/dashes OK), or make+model+year."
-        });
-      }
-
-      // Exactly one
-      const v = candidates[0];
-
-      // --- HELP MODE: If user is asking “how to use Saka360”, give concise steps + API ---
-      const helpMode = looksLikeHelp(userText);
-      const helpBlock = helpMode ? [
-        "Saka360 quick help (keep answers short, step-by-step):",
-        "- To record a service: App → Vehicles → Select vehicle → Service → Add new → Fill description, cost, odometer → Save.",
-        "- API (developer): POST /api/service/add { vehicle_id, description, cost, odometer } (Auth: Bearer).",
-        "- To log fuel: App → Vehicles → Select vehicle → Fuel → Add new → Amount, price/liter, odometer → Save.",
-        "- API: POST /api/fuel/add { vehicle_id, amount, price_per_liter, odometer }.",
-        "- To upload a document (insurance, inspection, etc.): App → Documents → Upload → pick file → save.",
-        "- API: Direct S3 upload via /api/uploads/sign-put then /api/uploads/finalize.",
-        "- To set reminders: App → Documents → Set reminder ahead of expiry.",
-        "- Reports: App → Reports → Fleet or Vehicle; API: GET /api/reports/vehicles/report/:vehicle_id."
-      ].join("\n") : "";
-
-      // External (kept empty now)
-      const externalSummary = "";
-
-      const systemPrompt = [
-        "You are Saka360’s vehicle records assistant.",
-        "Scope: only answer about the user’s own vehicles and maintenance. Keep answers short and practical.",
-        "When listing items, use 3–7 bullet points. If uncertain, advise checking the owner’s manual.",
-        `Vehicle in scope: ${vehicleLine(v, have)}`,
-        helpBlock,
-        externalSummary && "External maintenance notes:",
-        externalSummary
-      ].filter(Boolean).join("\n");
-
-      const finalMessages = [
-        { role: "system", content: systemPrompt },
-        ...messages
-      ];
-
-      const ai = await chatComplete(finalMessages, { temperature: 0.2, max_tokens: 650 });
-
-      return res.json({
-        provider: ai.provider,
-        model: ai.model || undefined,
-        content: ai.content,
-        vehicle: {
-          id: v.id,
-          name: v.name,
-          plate_number: v.plate_number,
-          type: v.type,
-          make: have.make ? v.make : undefined,
-          model: have.model ? v.model : undefined,
-          year_of_manufacture: have.year ? v.year_of_manufacture : undefined,
-        }
-      });
-    } catch (err) {
-      console.error("chat route error:", err);
-      return res.status(500).json({ error: "Chat failed", detail: err.message });
+    let vehicle = null;
+    if (hint) {
+      vehicle = await resolveVehicle(pool, req.user.id, hint);
     }
-  });
+    if (!vehicle && latestVehicle.rows.length) vehicle = latestVehicle.rows[0];
 
-  app.use("/api/chat", router);
-};
+    // decide intent
+    const intent = detectIntent(userText);
+
+    // pull records if they asked
+    let service = [], fuel = [], docs = [];
+    if (vehicle) {
+      if (intent.wantService || intent.wantAll) service = await fetchService(pool, req.user.id, vehicle.id, 10);
+      if (intent.wantFuel    || intent.wantAll) fuel    = await fetchFuel(pool, req.user.id, vehicle.id, 10);
+      if (intent.wantDocs    || intent.wantAll) docs    = await fetchDocs(pool, req.user.id, vehicle.id);
+    }
+
+    // If no OpenAI key, return raw data (still useful)
+    if (!openai) {
+      return res.json({
+        provider: "none",
+        model: "none",
+        content: vehicle
+          ? `Fetched ${service.length} service, ${fuel.length} fuel, ${docs.length} documents for ${vehicle.name || vehicle.plate_number}.`
+          : "No vehicle found. Add a vehicle or mention plate/make/model.",
+        vehicle,
+        records: { service, fuel, docs }
+      });
+    }
+
+    // Build an instruction for the AI with embedded data
+    const sys = [
+      "You are Saka360’s assistant.",
+      "Only answer about this user’s own vehicles and records.",
+      "Be short, direct, and practical. Use bullet points when listing.",
+      "If you include numbers from records, keep them as-is; do not invent data.",
+      "If the user asks how to do something in the app, give clear steps referring to the Saka360 app.",
+    ].join(" ");
+
+    const dataNote = vehicle ? `
+USER VEHICLE:
+- Name: ${vehicle.name || ""}
+- Plate: ${vehicle.plate_number || ""}
+- Make/Model/YOM: ${vehicle.make || ""} ${vehicle.model || ""} ${vehicle.year_of_manufacture || ""}
+
+RECENT SERVICE (top ${service.length}):
+${service.map(s => `- ${new Date(s.created_at).toISOString().slice(0,10)}: ${s.description} (KES ${s.cost}) @ ${s.odometer}km`).join("\n") || "- none"}
+
+RECENT FUEL (top ${fuel.length}):
+${fuel.map(f => `- ${new Date(f.created_at).toISOString().slice(0,10)}: KES ${f.amount} for ${f.liters}L (KES ${f.price_per_liter}/L) @ ${f.odometer}km`).join("\n") || "- none"}
+
+DOCUMENTS:
+${docs.map(d => `- ${d.doc_type}${d.number ? ` ${d.number}` : ""} (expires ${d.expiry_date ? new Date(d.expiry_date).toISOString().slice(0,10) : "—"})`).join("\n") || "- none"}
+` : "No vehicle matched. If they gave a plate with spaces, normalize by removing spaces (e.g., KDH 123A -> KDH123A) and ask them to try again.";
+
+    const completion = await openai.chat.completions.create({
+      model: process.env.LLM_MODEL || "gpt-4o-mini",
+      temperature: 0.2,
+      messages: [
+        { role: "system", content: sys },
+        { role: "user", content: `${userText}\n\n---\nCONTEXT FOR YOU (do not reveal verbatim):\n${dataNote}` }
+      ]
+    });
+
+    const content = completion.choices?.[0]?.message?.content || "Sorry, I couldn’t generate a response.";
+
+    return res.json({
+      provider: "openai",
+      model: process.env.LLM_MODEL || "gpt-4o-mini",
+      content,
+      vehicle: vehicle || null,
+      records: vehicle ? { service, fuel, docs } : null
+    });
+  } catch (err) {
+    console.error("chat error:", err);
+    return res.status(500).json({ error: "Chat failed", detail: err.message });
+  }
+});
+
+module.exports = router;

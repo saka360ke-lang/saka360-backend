@@ -6,7 +6,7 @@ const app = express();
 app.use(express.json());
 
 // ---------------------------
-// Add HTTP request logger
+// HTTP request logger
 // ---------------------------
 const morgan = require("morgan");
 app.use(morgan("tiny"));
@@ -26,7 +26,7 @@ const rateLimit = require("express-rate-limit");
 // Helmet (secure headers)
 app.use(helmet());
 
-// Lock CORS to specific origins via env ALLOWED_ORIGINS
+// Lock CORS to specific origins via env ALLOWED_ORIGINS (comma-separated)
 const ALLOWED = (process.env.ALLOWED_ORIGINS || "")
   .split(",")
   .map(s => s.trim())
@@ -34,11 +34,11 @@ const ALLOWED = (process.env.ALLOWED_ORIGINS || "")
 
 app.use(cors({
   origin(origin, cb) {
-    // Allow no-origin requests (e.g., Postman, curl) OR explicit allowed origins
+    // Allow no-origin (Postman/curl) OR if explicitly allowed
     if (!origin || ALLOWED.includes(origin)) return cb(null, true);
     return cb(new Error(`CORS blocked for origin: ${origin}`));
   },
-  credentials: true,               // allow cookies if you ever need them
+  credentials: true,
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"]
 }));
@@ -57,10 +57,10 @@ app.use(rateLimit({
 const { Pool } = require("pg");
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 
-// make pool available to route-modules that expect app.get("pool")
+// expose pool to function-style route modules via app.get("pool")
 app.set("pool", pool);
 
-// Optional DB health (does not affect /api/health)
+// Optional DB health
 app.get("/api/health/db", async (_req, res) => {
   try {
     const r = await pool.query("SELECT NOW()");
@@ -73,11 +73,12 @@ app.get("/api/health/db", async (_req, res) => {
 /* ------------------------------------------------
  * 2) Infra helpers (Mailer + Twilio test endpoints)
  * ------------------------------------------------ */
-const { verifySmtp } = require("./utils/mailer");
+const { verifySmtp, sendEmail } = require("./utils/mailer");
+const { runExpiryCheckCore } = require("./utils/reminders");
 
 // Twilio (for test WhatsApp)
 const twilio = require("twilio");
-const TWILIO_FROM = process.env.TWILIO_WHATSAPP_FROM; // e.g. +14155238886 (NO "whatsapp:" here)
+const TWILIO_FROM = process.env.TWILIO_WHATSAPP_FROM; // e.g. +14155238886
 function getTwilioClient() {
   const { TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN } = process.env;
   if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) {
@@ -98,12 +99,8 @@ async function sendWhatsAppText(toE164, body) {
     body,
   });
 }
-
-// --------------------------------------------------------------------
-// Safe wrapper for WhatsApp sending (never throws inside scheduled jobs)
-// --------------------------------------------------------------------
+// Safe wrapper for cron usage (never throws out)
 function sendWhatsAppTextSafe(to, body) {
-  // best-effort sender that never throws at call site
   return sendWhatsAppText(to, body).catch(err => {
     console.error("sendWhatsAppTextSafe error:", err.message);
   });
@@ -134,7 +131,7 @@ app.post("/api/test-whatsapp", authenticateToken, adminOnly, async (req, res) =>
 });
 
 /* -----------------------
- * 3) Cron (safe + optional)
+ * 3) Cron (reminders)
  * ----------------------- */
 let cron = null;
 try {
@@ -143,16 +140,17 @@ try {
   console.error("[cron] node-cron not available; skipping schedules:", e.message);
 }
 
-async function runExpiryCheck() {
-  console.log("⏰ runExpiryCheck() stub called (plug in your real logic here).");
-}
-app.set("runExpiryCheck", runExpiryCheck);
+// Expose the real reminder runner to routes (e.g., /api/reminders/run-check)
+app.set("runExpiryCheck", () =>
+  runExpiryCheckCore(pool, { sendEmail, sendWhatsAppTextSafe })
+);
 
 // Only schedule if cron loaded
 if (cron) {
   cron.schedule(
     "0 8 * * *",
-    () => runExpiryCheck().catch((e) => console.error("runExpiryCheck error:", e)),
+    () => runExpiryCheckCore(pool, { sendEmail, sendWhatsAppTextSafe })
+            .catch(e => console.error("runExpiryCheckCore error:", e)),
     { timezone: "Africa/Nairobi" }
   );
 }
@@ -160,11 +158,8 @@ if (cron) {
 /* -------------------------------------------
  * 4) Mount your real app routes (consistent)
  * -------------------------------------------
- * You have TWO kinds of route files:
- *  A) Export a function(app) and self-mount inside → we CALL them.
- *     (users, fuel, service, documents, reminders, reports)
- *  B) Export an Express Router → we app.use(...) them.
- *     (vehicles, testEmail, optional: payments, affiliates)
+ * Function-style routes (export a function(app)) → CALL them.
+ * Router-style routes (export Router) → app.use(...)
  */
 
 // A) function-style routes (CALL them)
@@ -175,11 +170,12 @@ require("./routes/documents")(app);
 require("./routes/reminders")(app);
 require("./routes/reports")(app);
 
-// B) router-style routes (app.use...)
-require("./routes/chat")(app); // chat route now needs app to access the DB pool
+// B) router-style routes
+const chatRoutes = require("./routes/chat");     // exports Router
+app.use("/api", chatRoutes);                     // POST /api/chat
 
-const testEmailRoutes = require("./routes/testEmail"); // exports Router
-app.use("/api", testEmailRoutes); // exposes /api/test-email (POST) etc.
+const testEmailRoutes = require("./routes/testEmail");
+app.use("/api", testEmailRoutes);                // /api/test-email
 
 const uploadsRoutes = require("./routes/uploads");
 app.use("/api/uploads", uploadsRoutes);
