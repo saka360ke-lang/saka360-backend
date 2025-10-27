@@ -2,7 +2,7 @@
 const express = require("express");
 const router = express.Router();
 
-// OpenAI client (uses OPENAI_API_KEY or fallback LLM_API_KEY)
+// OpenAI client setup
 let openai = null;
 try {
   const { OpenAI } = require("openai");
@@ -10,94 +10,60 @@ try {
     apiKey: process.env.OPENAI_API_KEY || process.env.LLM_API_KEY,
   });
 } catch (e) {
-  console.warn("[chat] openai SDK not installed or misconfigured:", e.message);
+    console.warn("[chat] openai SDK not installed or misconfigured:", e.message);
 }
 
-// Cache whether optional columns exist (checked once, lazily)
-let VEH_COL_CHECKED = false;
-let HAS_MAKE = false;
-let HAS_MODEL = false;
-let HAS_YOM = false;         // year_of_manufacture
-let HAS_CREATED_AT = false;
-let HAS_UPDATED_AT = false;
-
+/* ---------------------------------------------
+   1️⃣ Helpers — plate extraction & normalization
+---------------------------------------------- */
 function normalizePlate(s = "") {
   return (s || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
 }
 
-// Extract plate candidates from free text (Kenya-style plates like KAA 123A; also supports no-space/dash variants)
-function extractPlateCandidates(text = "") {
+// International-friendly plate extractor
+function extractPlateCandidatesInternational(text = "") {
   const t = String(text || "");
-  const out = new Set();
+  const found = new Set();
 
-  // 1) Canonical KE pattern: AAA 123 A (allow optional spaces/dashes)
-  const reKE = /\b([A-Za-z]{3})[\s-]*([0-9]{3})[\s-]*([A-Za-z])\b/g;
+  // Common segmented pattern: e.g. KDH 123A, AB-123-CD, KA 01 AB 1234
+  const reSegmented = /\b([A-Za-z]{1,4})[\s.-]*([0-9]{1,4})[\s.-]*([A-Za-z]{1,4})\b/g;
   let m;
-  while ((m = reKE.exec(t)) !== null) {
-    out.add(normalizePlate(`${m[1]}${m[2]}${m[3]}`));
+  while ((m = reSegmented.exec(t)) !== null) {
+    const candidate = `${m[1]}${m[2]}${m[3]}`;
+    const norm = normalizePlate(candidate);
+    if (norm.length >= 4 && norm.length <= 10) found.add(norm);
   }
 
-  // 2) Fallback: any 6–8 char alphanumeric chunk that *looks* like a plate (starts with letters, ends with a letter)
-  const reLoose = /\b([A-Za-z]{2,4}[A-Za-z0-9]{2,5}[A-Za-z])\b/g;
+  // Two-part patterns like ABC 12345 or 123 ABC
+  const reTwoPart = /\b([A-Za-z]{1,4})[\s.-]*([0-9]{2,5})\b|\b([0-9]{2,5})[\s.-]*([A-Za-z]{1,4})\b/g;
+  while ((m = reTwoPart.exec(t)) !== null) {
+    const part1 = (m[1] && m[2]) ? `${m[1]}${m[2]}` : `${m[3]}${m[4]}`;
+    const norm = normalizePlate(part1);
+    if (norm.length >= 4 && norm.length <= 10) found.add(norm);
+  }
+
+  // Loose alphanumeric (e.g. 7ABC123, ABC1234)
+  const reLoose = /\b([A-Za-z0-9][A-Za-z0-9\s.-]{2,12}[A-Za-z0-9])\b/g;
   while ((m = reLoose.exec(t)) !== null) {
-    const candidate = normalizePlate(m[1]);
-    if (candidate.length >= 5 && candidate.length <= 8) out.add(candidate);
+    const norm = normalizePlate(m[1]);
+    if (norm.length >= 4 && norm.length <= 10 && /[A-Z]/.test(norm) && /\d/.test(norm)) {
+      found.add(norm);
+    }
   }
 
-  return Array.from(out);
+  return Array.from(found);
 }
 
-async function ensureVehicleColumns(pool) {
-  if (VEH_COL_CHECKED) return;
-  const wanted = [
-    "make",
-    "model",
-    "year_of_manufacture",
-    "created_at",
-    "updated_at",
-  ];
-  const sql = `
-    SELECT column_name
-    FROM information_schema.columns
-    WHERE table_name='vehicles' AND column_name = ANY($1)
-  `;
-  try {
-    const r = await pool.query(sql, [wanted]);
-    const have = new Set(r.rows.map((x) => x.column_name));
-    HAS_MAKE       = have.has("make");
-    HAS_MODEL      = have.has("model");
-    HAS_YOM        = have.has("year_of_manufacture");
-    HAS_CREATED_AT = have.has("created_at");
-    HAS_UPDATED_AT = have.has("updated_at");
-  } catch (e) {
-    console.error("[chat] column check failed:", e.message);
-  } finally {
-    VEH_COL_CHECKED = true;
-  }
-}
-
-function buildVehicleSelect() {
-  const cols = ["id", "name", "plate_number", "type"];
-  if (HAS_MAKE) cols.push("make");
-  if (HAS_MODEL) cols.push("model");
-  if (HAS_YOM) cols.push("year_of_manufacture");
-  return cols.join(", ");
-}
-
-function buildOrderBy() {
-  const order = [];
-  if (HAS_UPDATED_AT) order.push("updated_at DESC NULLS LAST");
-  if (HAS_CREATED_AT) order.push("created_at DESC NULLS LAST");
-  if (order.length === 0) order.push("id DESC");
-  return "ORDER BY " + order.join(", ");
-}
-
+/* ---------------------------------------------
+   2️⃣ Helpers — make/model extraction
+---------------------------------------------- */
 function extractMakeModelGuess(text) {
   const lower = (text || "").toLowerCase();
   const makes = [
     "toyota","nissan","honda","mazda","subaru","ford","isuzu",
-    "mercedes","bmw","audi","vw","volkswagen","mitsubishi",
-    "suzuki","hyundai","kia"
+    "mercedes","benz","bmw","audi","vw","volkswagen","mitsubishi",
+    "suzuki","hyundai","kia","chevrolet","peugeot","renault",
+    "volvo","tata","jeep","range rover","land rover"
   ];
   const foundMake = makes.find(m => lower.includes(m));
   let model = null;
@@ -107,11 +73,14 @@ function extractMakeModelGuess(text) {
     if (m && m[1]) model = m[1];
   }
   return {
-    make: foundMake ? foundMake[0].toUpperCase() + foundMake.slice(1) : null,
+    make: foundMake ? foundMake.replace(/\b\w/g, c => c.toUpperCase()) : null,
     model: model || null
   };
 }
 
+/* ---------------------------------------------
+   3️⃣ Main route
+---------------------------------------------- */
 router.post("/chat", async (req, res) => {
   try {
     const pool = req.app.get("pool");
@@ -129,20 +98,17 @@ router.post("/chat", async (req, res) => {
     }
 
     const userMsg = messages[messages.length - 1]?.content || "";
-    await ensureVehicleColumns(pool);
-
     let vehicle = null;
 
-    // 1) Try plate extraction first
-    const plateCandidates = extractPlateCandidates(userMsg);
-    if (plateCandidates.length) {
-      // Try each candidate until one matches
-      for (const plate of plateCandidates) {
+    // 🔍 1. Try normalized plate search first
+    const plates = extractPlateCandidatesInternational(userMsg);
+    if (plates.length) {
+      for (const plate of plates) {
         const sql = `
-          SELECT ${buildVehicleSelect()}
+          SELECT id, name, plate_number, type, make, model, year_of_manufacture
           FROM vehicles
-          WHERE regexp_replace(upper(plate_number),'[^A-Z0-9]', '', 'g') = $1
-          ${buildOrderBy()}
+          WHERE plate_normalized = upper(regexp_replace($1, '[^A-Za-z0-9]', '', 'g'))
+          ORDER BY id DESC
           LIMIT 1
         `;
         const r = await pool.query(sql, [plate]);
@@ -153,29 +119,23 @@ router.post("/chat", async (req, res) => {
       }
     }
 
-    // 2) If no plate match, try make/model (only if those cols exist)
+    // 🔍 2. Try make/model fallback
     if (!vehicle) {
       const { make, model } = extractMakeModelGuess(userMsg);
-      if ((HAS_MAKE || HAS_MODEL) && (make || model)) {
+      if (make || model) {
         const where = [];
         const params = [];
         let p = 1;
 
-        if (HAS_MAKE && make) {
-          where.push(`LOWER(make) = LOWER($${p++})`);
-          params.push(make);
-        }
-        if (HAS_MODEL && model) {
-          where.push(`LOWER(model) = LOWER($${p++})`);
-          params.push(model);
-        }
+        if (make) { where.push(`LOWER(make)=LOWER($${p++})`); params.push(make); }
+        if (model) { where.push(`LOWER(model)=LOWER($${p++})`); params.push(model); }
 
         if (where.length) {
           const sql = `
-            SELECT ${buildVehicleSelect()}
+            SELECT id, name, plate_number, type, make, model, year_of_manufacture
             FROM vehicles
             WHERE ${where.join(" AND ")}
-            ${buildOrderBy()}
+            ORDER BY id DESC
             LIMIT 1
           `;
           const r = await pool.query(sql, params);
@@ -184,28 +144,29 @@ router.post("/chat", async (req, res) => {
       }
     }
 
-    // 3) System prompt: keep scope narrow to Saka360 records usage
+    // 🧠 3. Saka360 “domain brain” prompt
     const systemPrompt = [
-      "You are Saka360’s vehicle maintenance assistant.",
-      "Only answer questions related to the user's registered vehicles and maintenance/usage.",
-      "Pull details from the user's vehicle profile when available (plate/make/model/year).",
-      "Be brief and practical. Suggest next steps in the Saka360 app when relevant."
+      "You are Saka360's virtual assistant.",
+      "You help users manage everything within the Saka360 ecosystem:",
+      "- registering or logging into their account",
+      "- adding, editing or deleting vehicles",
+      "- recording fuel, service, and maintenance logs",
+      "- viewing and downloading vehicle documents",
+      "- understanding their subscription packages (Free, Basic, Premium, FleetPro)",
+      "- handling payments and renewals",
+      "- setting reminders for insurance, inspections, services, etc.",
+      "- onboarding to the affiliate program (earning from referrals)",
+      "- and any other in-app or account-related questions.",
+      "Never answer questions outside this scope (no general web searches).",
+      "Always keep answers concise, friendly, and helpful, guiding the user toward actions inside the Saka360 app."
     ].join(" ");
 
-    let vehicleContext = "No vehicle matched from the prompt.";
-    if (vehicle) {
-      vehicleContext =
-        `Matched vehicle:\n` +
-        `- Name: ${vehicle.name || "(n/a)"}\n` +
-        `- Plate: ${vehicle.plate_number || "(n/a)"}\n` +
-        `- Type: ${vehicle.type || "(n/a)"}\n` +
-        (HAS_MAKE  ? `- Make: ${vehicle.make || "(n/a)"}\n` : "") +
-        (HAS_MODEL ? `- Model: ${vehicle.model || "(n/a)"}\n` : "") +
-        (HAS_YOM   ? `- Year: ${vehicle.year_of_manufacture ?? "(n/a)"}\n` : "");
-    }
+    const vehicleContext = vehicle
+      ? `Matched vehicle:\n- ${vehicle.make || ""} ${vehicle.model || ""} (${vehicle.plate_number || ""})`
+      : "No specific vehicle matched.";
 
-    // 4) Call OpenAI (if configured), else return a stub
-    let content = "(LLM is not configured)";
+    // 🧩 4. Call LLM
+    let content = "(LLM not configured)";
     let provider = "stub";
     let model = "none";
 
@@ -215,27 +176,22 @@ router.post("/chat", async (req, res) => {
 
       const completion = await openai.chat.completions.create({
         model,
+        temperature: 0.3,
         messages: [
           { role: "system", content: systemPrompt },
           { role: "system", content: `Vehicle context:\n${vehicleContext}` },
-          { role: "user", content: userMsg },
+          ...messages
         ],
-        temperature: 0.3,
       });
 
       content = completion.choices?.[0]?.message?.content?.trim() || "(no response)";
     } else {
       content = vehicle
-        ? `You asked: "${userMsg}". Matched your vehicle ${vehicle?.name || ""} (${vehicle?.plate_number || ""}). Keep queries related to maintenance records, fuel, service, and documents.`
-        : `You asked: "${userMsg}". I couldn't match a vehicle. Try including your plate (e.g., "KDH123A") or your make/model.`;
+        ? `Matched your vehicle ${vehicle.make || ""} ${vehicle.model || ""} (${vehicle.plate_number || ""}). Ask anything related to maintenance, payments, packages or records.`
+        : `You asked: "${userMsg}". I can help you with vehicle records, reminders, payments, or Saka360 features — try mentioning your plate or make.`;
     }
 
-    return res.json({
-      provider,
-      model,
-      content,
-      vehicle: vehicle || null,
-    });
+    return res.json({ provider, model, content, vehicle: vehicle || null });
   } catch (err) {
     console.error("chat error:", err);
     return res.status(500).json({
