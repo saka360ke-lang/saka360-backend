@@ -178,54 +178,42 @@ module.exports = (app) => {
 
   // ======== RESET PASSWORD (submit token + new pass) ========
   // POST /api/users/reset-password   { "token":"...", "new_password":"..." }
-  router.post("/reset-password", async (req, res) => {
-    try {
-      const { token, new_password } = req.body || {};
-      if (!token || !new_password) {
-        return res.status(400).json({ error: "token and new_password are required" });
-      }
-      if (new_password.length < 8) {
-        return res.status(400).json({ error: "Password must be at least 8 characters" });
-      }
+// --- Admin password reset (no auth; guarded by ADMIN_RESET_TOKEN) ---
+router.post("/admin/reset-password", async (req, res) => {
+  try {
+    const provided =
+      (req.query["x-admin-reset-token"] || req.get("x-admin-reset-token") || "").toString().trim();
+    const expected = (process.env.ADMIN_RESET_TOKEN || "").toString().trim();
 
-      const tq = await pool.query(
-        `SELECT prt.id, prt.user_id, prt.expires_at, prt.used_at
-           FROM password_reset_tokens prt
-          WHERE prt.token = $1
-          LIMIT 1`,
-        [token]
-      );
-
-      if (tq.rows.length === 0) {
-        return res.status(400).json({ error: "Invalid or expired token" });
-      }
-
-      const t = tq.rows[0];
-      if (t.used_at) {
-        return res.status(400).json({ error: "This token has already been used" });
-      }
-      if (new Date(t.expires_at).getTime() < Date.now()) {
-        return res.status(400).json({ error: "This token has expired" });
-      }
-
-      const hash = await bcrypt.hash(new_password, 10);
-
-      await pool.query(
-        `UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2`,
-        [hash, t.user_id]
-      );
-
-      await pool.query(
-        `UPDATE password_reset_tokens SET used_at = NOW() WHERE id = $1`,
-        [t.id]
-      );
-
-      return res.json({ ok: true, message: "Password has been reset successfully ✅" });
-    } catch (err) {
-      console.error("users.reset-password error:", err);
-      return res.status(500).json({ error: "Server error" });
+    if (!expected || provided !== expected) {
+      return res.status(401).json({ error: "Missing or invalid token" });
     }
-  });
+
+    const { email, new_password } = req.body || {};
+    if (!email || !new_password) {
+      return res.status(400).json({ error: "email and new_password are required" });
+    }
+
+    const q = await pool.query(
+      `SELECT id FROM users WHERE LOWER(email) = LOWER($1) LIMIT 1`,
+      [email]
+    );
+    if (q.rows.length === 0) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    const password_hash = await bcrypt.hash(new_password, 10);
+    await pool.query(
+      `UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2`,
+      [password_hash, q.rows[0].id]
+    );
+
+    return res.json({ message: "Password reset ✅" });
+  } catch (err) {
+    console.error("admin.reset-password error:", err);
+    return res.status(500).json({ error: "Server error" });
+  }
+});
 
   // ---------- VERIFY EMAIL ----------
 router.get("/verify", async (req, res) => {
