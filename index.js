@@ -10,6 +10,15 @@ app.set("trust proxy", 1);
 // JSON body parser
 app.use(express.json());
 
+// TEMP: env presence check (does not reveal the value)
+app.get("/api/diag/admin-reset", (_req, res) => {
+  const v = process.env.ADMIN_RESET_TOKEN || "";
+  res.json({
+    admin_reset_token_present: Boolean(v),
+    admin_reset_token_length: v.length
+  });
+});
+
 // Return JSON for malformed JSON bodies instead of HTML
 app.use((err, req, res, next) => {
   if (err instanceof SyntaxError && "body" in err) {
