@@ -197,38 +197,32 @@ require("./routes/documents")(app);
 require("./routes/reminders")(app);
 require("./routes/reports")(app);
 require("./routes/whatsapp")(app); // POST /api/webhooks/whatsapp
-require("./routes/subscriptions")(app); // <-- ensure subscriptions gets the pool via app
 
-// B) router-style
-const chatRoutes = require("./routes/chat");     // exports Router
-app.use("/api", chatRoutes);                     // POST /api/chat
+// Helper to safely mount router-style modules
+function safeUse(path, modulePath) {
+  try {
+    const mod = require(modulePath);
+    if (mod && typeof mod === "function") {
+      app.use(path, mod);
+      console.log(`[mount] ${modulePath} -> ${path}`);
+    } else {
+      console.error(`[mount] ${modulePath} not a router (exported: ${typeof mod})`);
+    }
+  } catch (e) {
+    console.error(`[mount] ${modulePath} require error:`, e.message);
+  }
+}
 
-const subscriptionsRoutes = require("./routes/subscriptions");
-app.use("/api/subscriptions", subscriptionsRoutes);
+// B) router-style (SAFE mounts)
+safeUse("/api", "./routes/chat");                  // POST /api/chat
+safeUse("/api/subscriptions", "./routes/subscriptions");
+safeUse("/api", "./routes/testEmail");             // /api/test-email
+safeUse("/api/uploads", "./routes/uploads");
 
-const testEmailRoutes = require("./routes/testEmail");
-app.use("/api", testEmailRoutes);                // /api/test-email
-
-const uploadsRoutes = require("./routes/uploads");
-app.use("/api/uploads", uploadsRoutes);
-
-let vehiclesRoutes = null;
-try {
-  vehiclesRoutes = require("./routes/vehicles");
-} catch (_) {}
-if (vehiclesRoutes) app.use("/api/vehicles", vehiclesRoutes);
-
-let paymentsRoutes = null;
-try {
-  paymentsRoutes = require("./routes/payments");
-} catch (_) {}
-if (paymentsRoutes) app.use("/api/payments", paymentsRoutes);
-
-let affiliatesRoutes = null;
-try {
-  affiliatesRoutes = require("./routes/affiliates");
-} catch (_) {}
-if (affiliatesRoutes) app.use("/api/affiliates", affiliatesRoutes);
+// Optional routers
+safeUse("/api/vehicles", "./routes/vehicles");
+safeUse("/api/payments", "./routes/payments");
+safeUse("/api/affiliates", "./routes/affiliates");
 
 /* -----------------------
  * 5) 404 fallback
