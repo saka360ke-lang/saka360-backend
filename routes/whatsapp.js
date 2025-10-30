@@ -2,38 +2,64 @@
 const express = require("express");
 const router = express.Router();
 
-/** Build a TwiML reply (so we don't need to send via API) */
+// Build TwiML reply
 function twimlMessage(text) {
   const safe = (text || "").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
   return `<?xml version="1.0" encoding="UTF-8"?><Response><Message>${safe}</Message></Response>`;
 }
 
 function normalizeWhats(from) {
-  // Twilio sends like: "whatsapp:+2547XXXXXXX"
-  if (!from) return null;
-  return from.replace(/^whatsapp:/, "");
+  return from ? from.replace(/^whatsapp:/, "") : null;
 }
 
 function normalizePlate(raw) {
-  if (!raw) return null;
-  return raw.replace(/[^A-Za-z0-9]/g, "").toUpperCase(); // remove spaces/dashes, keep letters+digits
+  return raw ? raw.replace(/[^A-Za-z0-9]/g, "").toUpperCase() : null;
 }
 
-/** Parse:  add vehicle <plate> <make> <model> <year> */
-function parseAddVehicle(body) {
-  // example: "add vehicle KDH123A Toyota Probox 2015"
-  const m = body.match(/^add\s+vehicle\s+(\S+)\s+([A-Za-z0-9\-]+)\s+([A-Za-z0-9\-]+)\s+(\d{4})$/i);
+const HELP = [
+  "Saka360 WhatsApp Help:",
+  "• add vehicle <plate> <make> <model> <year>",
+  "• delete vehicle <plate>",
+  "• my vehicles",
+  "• set reminders email on|off whatsapp on|off days <N>",
+  "• service <km> for <plate|make|model>",
+  "",
+  "Examples:",
+  "- add vehicle KDH123A Toyota Probox 2015",
+  "- delete vehicle KDH123A",
+  "- set reminders email on whatsapp on days 14",
+].join("\n");
+
+// Loose parser for `add vehicle`
+function parseAddVehicleLoose(body) {
+  const m = body.match(/^add\s+vehicle\s+(.+)$/i);
   if (!m) return null;
-  return { plate: m[1], make: m[2], model: m[3], year: Number(m[4]) };
+  const rest = m[1].trim();
+
+  // split by spaces; expect: plate make model [year?]
+  const parts = rest.split(/\s+/);
+
+  if (parts.length < 3) {
+    // Not enough info; caller will show usage
+    return { partial: true };
+  }
+
+  const plate = parts[0];
+  let year = null;
+
+  // If last token looks like year (4 digits), pop it
+  if (/^\d{4}$/.test(parts[parts.length - 1])) {
+    year = Number(parts.pop());
+  }
+
+  const make = parts[1];
+  const model = parts.slice(2).join(" "); // allow multi-word models (e.g., Land Cruiser)
+
+  return { plate, make, model, year };
 }
 
-/** Parse: set reminders email on|off whatsapp on|off days N */
+// Exact “set reminders …” options (any subset allowed)
 function parseSetReminders(body) {
-  // flexible: allow missing pieces
-  // examples:
-  //   set reminders email on whatsapp on days 14
-  //   set reminders email off days 7
-  //   set reminders whatsapp on
   const r = { email_enabled: null, whatsapp_enabled: null, days_before: null };
   const lc = body.toLowerCase();
 
@@ -50,29 +76,19 @@ function parseSetReminders(body) {
   return r;
 }
 
-/** Parse: service <km> for <query>  OR  service <km>  */
+// “service 10000 for …” or “service 10000”
 function parseService(body) {
-  // examples:
-  //   service 10000 for KDH123A
-  //   service 15000 for Toyota
-  //   service 10000
   const m = body.match(/^service\s+(\d{3,6})(?:\s+for\s+(.+))?$/i);
   if (!m) return null;
   return { km: Number(m[1]), query: m[2]?.trim() || null };
 }
 
-/** Help text */
-const HELP = [
-  "Saka360 WhatsApp Help:",
-  "• add vehicle <plate> <make> <model> <year>",
-  "• my vehicles",
-  "• set reminders email on|off whatsapp on|off days <N>",
-  "• service <km> for <plate|make|model>",
-  "",
-  "Examples:",
-  "- add vehicle KDH123A Toyota Probox 2015",
-  "- set reminders email on whatsapp on days 14",
-].join("\n");
+// NEW: delete vehicle
+function parseDeleteVehicle(body) {
+  const m = body.match(/^delete\s+vehicle\s+(.+)$/i);
+  if (!m) return null;
+  return { plate: m[1].trim() };
+}
 
 module.exports = (app) => {
   const pool = app.get("pool");
@@ -84,20 +100,18 @@ module.exports = (app) => {
       const body = (req.body.Body || "").trim();
 
       if (!from || !body) {
-        return res.type("text/xml").send(twimlMessage("Sorry, I couldn't read your message. Type 'help' to see commands."));
+        return res.type("text/xml").send(twimlMessage("Sorry, I couldn't read that. Type 'help' to see commands."));
       }
 
-      // Find (or create minimal) user by whatsapp_number
-      let user = null;
+      // Find or create user by WhatsApp
+      let user;
       {
         const q = await pool.query(
           `SELECT id, name, email, whatsapp_number FROM users WHERE whatsapp_number = $1 LIMIT 1`,
           [from]
         );
-        if (q.rows.length) {
-          user = q.rows[0];
-        } else {
-          // Soft-onboard: create a minimal user so they can add vehicles
+        if (q.rows.length) user = q.rows[0];
+        else {
           const ins = await pool.query(
             `INSERT INTO users (name, email, whatsapp_number, role, is_verified, created_at, updated_at)
              VALUES ($1,$2,$3,$4,$5,NOW(),NOW())
@@ -108,58 +122,92 @@ module.exports = (app) => {
         }
       }
 
-      // Commands
       const lc = body.toLowerCase();
 
-      // 1) HELP
-      if (lc === "help") {
+      // HELP
+      if (lc === "help" || lc === "menu") {
         return res.type("text/xml").send(twimlMessage(HELP));
       }
 
-      // 2) MY VEHICLES
-      if (lc === "my vehicles") {
+      // MY VEHICLES
+      if (lc === "my vehicles" || lc === "vehicles") {
         const v = await pool.query(
           `SELECT name, plate_number, make, model, year_of_manufacture
-             FROM vehicles WHERE user_id = $1 ORDER BY created_at ASC`,
+             FROM vehicles WHERE user_id = $1
+             ORDER BY created_at ASC`,
           [user.id]
         );
         if (!v.rows.length) {
-          return res.type("text/xml").send(twimlMessage("You have no vehicles yet.\nAdd one:\nadd vehicle <plate> <make> <model> <year>"));
+          return res.type("text/xml").send(twimlMessage(
+            "You have no vehicles yet.\nAdd one:\nadd vehicle <plate> <make> <model> <year>"
+          ));
         }
         const lines = v.rows.map(r => {
+          const title = r.name || `${r.make||""} ${r.model||""}`.trim();
           const y = r.year_of_manufacture ? ` ${r.year_of_manufacture}` : "";
-          return `• ${r.name || `${r.make||""} ${r.model||""}`.trim()} (${r.plate_number})${y}`;
+          return `• ${title} (${r.plate_number})${y}`;
         });
         return res.type("text/xml").send(twimlMessage(["Your vehicles:", ...lines].join("\n")));
       }
 
-      // 3) ADD VEHICLE
-      const addParsed = parseAddVehicle(body);
-      if (addParsed) {
-        const plateNorm = normalizePlate(addParsed.plate);
-        // prevent dupes on same user
+      // ADD VEHICLE (loose)
+      if (lc.startsWith("add vehicle") || lc === "add") {
+        const parsed = parseAddVehicleLoose(body);
+        if (!parsed || parsed.partial) {
+          return res.type("text/xml").send(twimlMessage(
+            "Format:\nadd vehicle <plate> <make> <model> <year>\nExample:\nadd vehicle KDH123A Toyota Probox 2015"
+          ));
+        }
+
+        const plateNorm = normalizePlate(parsed.plate);
+        // dupe check for this user
         const exists = await pool.query(
-          `SELECT id FROM vehicles WHERE user_id=$1 AND UPPER(REGEXP_REPLACE(plate_number,'[^A-Za-z0-9]','','g')) = $2 LIMIT 1`,
+          `SELECT id FROM vehicles
+            WHERE user_id=$1
+              AND UPPER(REGEXP_REPLACE(plate_number,'[^A-Za-z0-9]','','g')) = $2
+            LIMIT 1`,
           [user.id, plateNorm]
         );
         if (exists.rows.length) {
-          return res.type("text/xml").send(twimlMessage(`That vehicle is already in your list (${addParsed.plate}).`));
+          return res.type("text/xml").send(twimlMessage(`That vehicle is already in your list (${parsed.plate}).`));
         }
 
-        const name = `${addParsed.make} ${addParsed.model}`.trim();
+        const name = `${parsed.make} ${parsed.model}`.trim();
         await pool.query(
           `INSERT INTO vehicles (user_id, name, plate_number, type, make, model, year_of_manufacture, created_at)
            VALUES ($1,$2,$3,$4,$5,$6,$7,NOW())`,
-          [user.id, name, addParsed.plate.toUpperCase(), "car", addParsed.make, addParsed.model, addParsed.year]
+          [user.id, name, parsed.plate.toUpperCase(), "car", parsed.make, parsed.model, parsed.year]
         );
-        return res.type("text/xml").send(twimlMessage(`Added ✅ ${name} (${addParsed.plate.toUpperCase()}) ${addParsed.year}`));
+        return res.type("text/xml").send(twimlMessage(
+          `Added ✅ ${name} (${parsed.plate.toUpperCase()})${parsed.year ? " " + parsed.year : ""}`
+        ));
       }
 
-      // 4) SET REMINDERS
-      if (lc.startsWith("set reminders")) {
+      // DELETE VEHICLE
+      if (lc.startsWith("delete vehicle")) {
+        const p = parseDeleteVehicle(body);
+        if (!p?.plate) {
+          return res.type("text/xml").send(twimlMessage("Format:\ndelete vehicle <plate>\nExample:\ndelete vehicle KDH123A"));
+        }
+        const plateNorm = normalizePlate(p.plate);
+        const del = await pool.query(
+          `DELETE FROM vehicles
+            WHERE user_id=$1
+              AND UPPER(REGEXP_REPLACE(plate_number,'[^A-Za-z0-9]','','g')) = $2
+            RETURNING id, plate_number`,
+          [user.id, plateNorm]
+        );
+        if (!del.rows.length) {
+          return res.type("text/xml").send(twimlMessage(`No vehicle found with plate ${p.plate}.`));
+        }
+        return res.type("text/xml").send(twimlMessage(`Deleted ✅ ${del.rows[0].plate_number}.`));
+      }
+
+      // SET REMINDERS (+ singular “set reminder” show current)
+      if (lc.startsWith("set reminders") || lc === "set reminder" || lc === "reminder settings") {
         const pr = parseSetReminders(body);
         if (!pr) {
-          // Show current settings if present
+          // Show current settings if any
           const rs = await pool.query(
             `SELECT email_enabled, whatsapp_enabled, days_before
                FROM reminder_settings WHERE user_id=$1 LIMIT 1`,
@@ -167,7 +215,7 @@ module.exports = (app) => {
           );
           if (!rs.rows.length) {
             return res.type("text/xml").send(twimlMessage(
-              "No settings found. Example:\nset reminders email on whatsapp on days 14"
+              "No settings saved.\nExample:\nset reminders email on whatsapp on days 14"
             ));
           }
           const s = rs.rows[0];
@@ -176,7 +224,6 @@ module.exports = (app) => {
           ));
         }
 
-        // upsert
         await pool.query(
           `INSERT INTO reminder_settings(user_id, email_enabled, whatsapp_enabled, days_before, updated_at)
            VALUES($1,$2,$3,$4,NOW())
@@ -185,20 +232,14 @@ module.exports = (app) => {
                  whatsapp_enabled = COALESCE(EXCLUDED.whatsapp_enabled, reminder_settings.whatsapp_enabled),
                  days_before = COALESCE(EXCLUDED.days_before, reminder_settings.days_before),
                  updated_at = NOW()`,
-          [
-            user.id,
-            pr.email_enabled,
-            pr.whatsapp_enabled,
-            pr.days_before
-          ]
+          [user.id, pr.email_enabled, pr.whatsapp_enabled, pr.days_before]
         );
         return res.type("text/xml").send(twimlMessage("Saved ✅ reminder preferences."));
       }
 
-      // 5) SERVICE <km> [for …]
+      // SERVICE (as before)
       const svc = parseService(body);
       if (svc) {
-        // Try resolve a vehicle when query given; else use the first
         let vehicle = null;
         if (svc.query) {
           const plateNorm = normalizePlate(svc.query);
@@ -235,17 +276,15 @@ module.exports = (app) => {
         const suffix = vehicle
           ? `\nVehicle: ${vehicle.make || ""} ${vehicle.model || ""} (${vehicle.plate_number})`
           : "\nTip: add a vehicle so I can personalize intervals.";
-
         return res.type("text/xml").send(twimlMessage(base.join("\n") + suffix));
       }
 
-      // Default
-      return res.type("text/xml").send(twimlMessage("I didn’t catch that. Type \"help\" to see commands."));
+      return res.type("text/xml").send(twimlMessage('I didn’t catch that. Type "help" to see commands.'));
     } catch (err) {
       console.error("whatsapp webhook error:", err);
       return res.type("text/xml").send(twimlMessage("Sorry, something went wrong"));
     }
   });
 
-  app.use("/api/whatsapp", router); // webhook at /api/whatsapp/webhook
+  app.use("/api/whatsapp", router);
 };
