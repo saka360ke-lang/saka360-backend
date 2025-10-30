@@ -10,6 +10,9 @@ app.set("trust proxy", 1);
 // JSON body parser
 app.use(express.json());
 
+// urlencoded middleware (needed for Twilio form POST)
+app.use(express.urlencoded({ extended: false })); // <-- for Twilio webhook form posts
+
 // Return JSON for malformed JSON bodies instead of HTML
 app.use((err, req, res, next) => {
   if (err instanceof SyntaxError && "body" in err) {
@@ -194,6 +197,7 @@ require("./routes/documents")(app);
 require("./routes/reminders")(app);
 require("./routes/reports")(app);
 require("./routes/whatsapp")(app); // POST /api/webhooks/whatsapp (TwiML)
+require("./routes/whatsapp")(app);
 
 
 // B) router-style
