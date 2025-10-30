@@ -1,4 +1,3 @@
-// utils/s3.js
 const { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand } = require("@aws-sdk/client-s3");
 const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
 
@@ -17,35 +16,26 @@ function publicUrl(key) {
   return `https://${BUCKET}.s3.${REGION}.amazonaws.com/${encodeURIComponent(key)}`;
 }
 
-async function signPutUrl({ key, contentType, contentDisposition, expiresIn = 900 }) {
-  const cmd = new PutObjectCommand({
-    Bucket: BUCKET,
-    Key: key,
-    ContentType: contentType || "application/octet-stream",
-    ...(contentDisposition ? { ContentDisposition: contentDisposition } : {})
-  });
+async function signPutUrl({ key, contentType, expiresIn = 900 }) {
+  const cmd = new PutObjectCommand({ Bucket: BUCKET, Key: key, ContentType: contentType || "application/octet-stream" });
   const url = await getSignedUrl(s3, cmd, { expiresIn });
   return { url, key, contentType: contentType || "application/octet-stream", publicUrl: publicUrl(key) };
 }
 
-async function signGetUrl({ key, expiresIn = 300, contentDisposition }) {
-  const cmd = new GetObjectCommand({
-    Bucket: BUCKET,
-    Key: key,
-    ...(contentDisposition ? { ResponseContentDisposition: contentDisposition } : {})
-  });
+async function signGetUrl({ key, expiresIn = 300 }) {
+  const cmd = new GetObjectCommand({ Bucket: BUCKET, Key: key });
   const url = await getSignedUrl(s3, cmd, { expiresIn });
   return { url, key, expiresInSec: expiresIn, method: "GET" };
 }
 
-async function safeDeleteObject(key) {
+async function deleteKeySafe(key) {
   try {
     await s3.send(new DeleteObjectCommand({ Bucket: BUCKET, Key: key }));
-    return true;
-  } catch (e) {
-    console.error("safeDeleteObject error:", e.message);
-    return false; // never throw
+    return { ok: true };
+  } catch (err) {
+    console.error("S3 delete error:", err.message);
+    return { ok: false, error: err.message };
   }
 }
 
-module.exports = { signPutUrl, signGetUrl, publicUrl, safeDeleteObject };
+module.exports = { signPutUrl, signGetUrl, publicUrl, deleteKeySafe };

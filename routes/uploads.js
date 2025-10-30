@@ -169,4 +169,25 @@ router.delete("/", async (req, res) => {
   }
 });
 
+// DELETE /api/uploads?key=docs/test.pdf
+router.delete("/", async (req, res) => {
+  try {
+    const pool = req.app.get("pool");
+    const { key } = req.query || {};
+    if (!key) return res.status(400).json({ error: "Missing 'key' query" });
+
+    // delete from S3 first (safe)
+    const { deleteKeySafe } = require("../utils/s3");
+    const del = await deleteKeySafe(key);
+
+    // delete DB record (non-fatal if not found)
+    await pool.query(`DELETE FROM files WHERE s3_key=$1`, [key]);
+
+    res.json({ ok: true, s3: del });
+  } catch (err) {
+    console.error("uploads.delete error:", err);
+    res.status(500).json({ error: "Failed to delete file" });
+  }
+});
+
 module.exports = router;
