@@ -11,7 +11,7 @@ app.set("trust proxy", 1);
 app.use(express.json());
 
 // urlencoded middleware (needed for Twilio form POST)
-app.use(express.urlencoded({ extended: false })); // <-- for Twilio webhook form posts
+app.use(express.urlencoded({ extended: false })); // for Twilio webhook form posts
 
 // Return JSON for malformed JSON bodies instead of HTML
 app.use((err, req, res, next) => {
@@ -196,9 +196,8 @@ require("./routes/service")(app);
 require("./routes/documents")(app);
 require("./routes/reminders")(app);
 require("./routes/reports")(app);
-require("./routes/whatsapp")(app); // POST /api/webhooks/whatsapp (TwiML)
-require("./routes/whatsapp")(app);
-
+require("./routes/whatsapp")(app); // POST /api/webhooks/whatsapp
+require("./routes/subscriptions")(app); // <-- ensure subscriptions gets the pool via app
 
 // B) router-style
 const chatRoutes = require("./routes/chat");     // exports Router
