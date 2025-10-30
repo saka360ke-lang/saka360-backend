@@ -203,6 +203,9 @@ require("./routes/subscriptions")(app); // <-- ensure subscriptions gets the poo
 const chatRoutes = require("./routes/chat");     // exports Router
 app.use("/api", chatRoutes);                     // POST /api/chat
 
+const subscriptionsRoutes = require("./routes/subscriptions");
+app.use("/api/subscriptions", subscriptionsRoutes);
+
 const testEmailRoutes = require("./routes/testEmail");
 app.use("/api", testEmailRoutes);                // /api/test-email
 
