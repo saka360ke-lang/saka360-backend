@@ -193,6 +193,8 @@ require("./routes/service")(app);
 require("./routes/documents")(app);
 require("./routes/reminders")(app);
 require("./routes/reports")(app);
+require("./routes/whatsapp")(app); // POST /api/webhooks/whatsapp (TwiML)
+
 
 // B) router-style
 const chatRoutes = require("./routes/chat");     // exports Router
