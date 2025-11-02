@@ -215,7 +215,6 @@ function safeUse(path, modulePath) {
 
 // B) router-style (SAFE mounts)
 safeUse("/api", "./routes/chat");                  // POST /api/chat
-safeUse("/api/subscriptions", "./routes/subscriptions");
 safeUse("/api", "./routes/testEmail");             // /api/test-email
 safeUse("/api/uploads", "./routes/uploads");
 
