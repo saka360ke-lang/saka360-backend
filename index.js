@@ -7,11 +7,9 @@ const app = express();
 // Trust proxy (Render/Heroku) so rate-limit & IPs behave
 app.set("trust proxy", 1);
 
-// JSON body parser
+// Body parsers
 app.use(express.json());
-
-// urlencoded middleware (needed for Twilio form POST)
-app.use(express.urlencoded({ extended: false })); // for Twilio webhook form posts
+app.use(express.urlencoded({ extended: false })); // for Twilio form posts
 
 // Return JSON for malformed JSON bodies instead of HTML
 app.use((err, req, res, next) => {
@@ -28,7 +26,7 @@ const morgan = require("morgan");
 app.use(morgan("tiny"));
 
 /* -----------------------------
- * 0) Minimal health first (safe)
+ * 0) Minimal health first
  * ----------------------------- */
 app.get("/api/health", (_req, res) => {
   res.status(200).json({ status: "OK" });
@@ -196,32 +194,31 @@ require("./routes/service")(app);
 require("./routes/documents")(app);
 require("./routes/reminders")(app);
 require("./routes/reports")(app);
-require("./routes/whatsapp")(app); // POST /api/webhooks/whatsapp
+require("./routes/whatsapp")(app);      // POST /api/webhooks/whatsapp
+require("./routes/subscriptions")(app); // ✅ subscriptions mounted function-style here
 
-// Helper to safely mount router-style modules
-function safeUse(path, modulePath) {
-  try {
-    const mod = require(modulePath);
-    if (mod && typeof mod === "function") {
-      app.use(path, mod);
-      console.log(`[mount] ${modulePath} -> ${path}`);
-    } else {
-      console.error(`[mount] ${modulePath} not a router (exported: ${typeof mod})`);
-    }
-  } catch (e) {
-    console.error(`[mount] ${modulePath} require error:`, e.message);
-  }
-}
+// B) router-style routes
+const chatRoutes = require("./routes/chat");     // exports Router
+app.use("/api", chatRoutes);                     // POST /api/chat
 
-// B) router-style (SAFE mounts)
-safeUse("/api", "./routes/chat");                  // POST /api/chat
-safeUse("/api", "./routes/testEmail");             // /api/test-email
-safeUse("/api/uploads", "./routes/uploads");
+const testEmailRoutes = require("./routes/testEmail");
+app.use("/api", testEmailRoutes);                // /api/test-email
 
-// Optional routers
-safeUse("/api/vehicles", "./routes/vehicles");
-safeUse("/api/payments", "./routes/payments");
-safeUse("/api/affiliates", "./routes/affiliates");
+const uploadsRoutes = require("./routes/uploads");
+app.use("/api/uploads", uploadsRoutes);
+
+// Optional/defensive dynamic mounts
+let vehiclesRoutes = null;
+try { vehiclesRoutes = require("./routes/vehicles"); } catch (_) {}
+if (vehiclesRoutes) app.use("/api/vehicles", vehiclesRoutes);
+
+let paymentsRoutes = null;
+try { paymentsRoutes = require("./routes/payments"); } catch (_) {}
+if (paymentsRoutes) app.use("/api/payments", paymentsRoutes);
+
+let affiliatesRoutes = null;
+try { affiliatesRoutes = require("./routes/affiliates"); } catch (_) {}
+if (affiliatesRoutes) app.use("/api/affiliates", affiliatesRoutes);
 
 /* -----------------------
  * 5) 404 fallback
