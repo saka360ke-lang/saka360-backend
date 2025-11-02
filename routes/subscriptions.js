@@ -1,103 +1,141 @@
 // routes/subscriptions.js
 const express = require("express");
-const router = express.Router();
 
-// GET /api/subscriptions/_diag
-router.get("/_diag", async (req, res) => {
-  const pool = req.app.get("pool");
-  if (!pool) return res.status(500).json({ error: "Server error", detail: "Pool not found on app" });
-  try {
-    const q = await pool.query(`SELECT COUNT(*)::int AS count FROM public.subscription_plans`);
-    res.json({ ok: true, plans_count: q.rows[0]?.count ?? 0 });
-  } catch (e) {
-    console.error("subscriptions._diag error:", e);
-    res.status(500).json({ ok: false, error: "Server error" });
+/**
+ * This file is FUNCTION-STYLE: export a function(app) and mount inside index.js with:
+ *   require("./routes/subscriptions")(app);
+ *
+ * DO NOT also mount it as a router-style app.use("/api/subscriptions", ...) or you'll double-mount.
+ */
+module.exports = (app) => {
+  const router = express.Router();
+  const pool = app.get("pool");
+  if (!pool) throw new Error("Pool not found on app; set app.set('pool', pool) in index.js");
+
+  // Small helper: check if a column exists on a table
+  async function columnsFor(table) {
+    const sql = `
+      SELECT column_name
+      FROM information_schema.columns
+      WHERE table_schema='public' AND table_name=$1
+    `;
+    const r = await pool.query(sql, [table]);
+    const s = new Set(r.rows.map((x) => x.column_name));
+    return s;
   }
-});
 
-// GET /api/subscriptions/plans
-router.get("/plans", async (req, res) => {
-  const pool = req.app.get("pool");
-  if (!pool) return res.status(500).json({ error: "Server error", detail: "Pool not found on app" });
-  try {
-    const q = await pool.query(`
-      SELECT code, name, price_cents, currency, features, is_active
-        FROM public.subscription_plans
-       WHERE is_active = TRUE
-       ORDER BY price_cents ASC
-    `);
-    res.json({ plans: q.rows });
-  } catch (e) {
-    console.error("subscriptions.plans error:", e);
-    res.status(500).json({ error: "Server error" });
-  }
-});
+  // GET /api/subscriptions/plans
+  router.get("/subscriptions/plans", async (_req, res) => {
+    try {
+      const cols = await columnsFor("subscription_plans");
 
-// GET /api/subscriptions/me  (temporary: ?user_id=)
-router.get("/me", async (req, res) => {
-  const pool = req.app.get("pool");
-  if (!pool) return res.status(500).json({ error: "Server error", detail: "Pool not found on app" });
-  try {
-    const userId = Number(req.user?.id || req.query.user_id);
-    if (!userId) return res.status(400).json({ error: "Missing user_id (or login token)" });
+      const has = (c) => cols.has(c);
 
-    const q = await pool.query(
-      `SELECT us.id, us.user_id, us.plan_code, us.status, us.started_at, us.renewed_at, us.meta,
-              sp.name, sp.price_cents, sp.currency, sp.features
-         FROM public.user_subscriptions us
-         JOIN public.subscription_plans sp ON sp.code = us.plan_code
-        WHERE us.user_id = $1
-        ORDER BY us.started_at DESC
-        LIMIT 1`,
-      [userId]
-    );
-    res.json({ subscription: q.rows[0] || null });
-  } catch (e) {
-    console.error("subscriptions.me error:", e);
-    res.status(500).json({ error: "Server error" });
-  }
-});
+      // ---- Build safe expressions that do NOT reference missing columns ----
+      // code
+      const codeExpr = has("code")
+        ? "code"
+        : "regexp_replace(upper(name), '[^A-Z0-9]+', '_', 'g')";
 
-// POST /api/subscriptions/subscribe  { user_id, plan_code }
-router.post("/subscribe", async (req, res) => {
-  const pool = req.app.get("pool");
-  if (!pool) return res.status(500).json({ error: "Server error", detail: "Pool not found on app" });
+      // name (should exist, but guard anyway)
+      const nameExpr = has("name") ? "name" : "NULL::text AS name";
 
-  try {
-    const { user_id, plan_code } = req.body || {};
-    if (!user_id || !plan_code) return res.status(400).json({ error: "user_id and plan_code are required" });
+      // price_cents
+      let priceCentsExpr = "0";
+      if (has("price_cents") && has("price_amount")) {
+        priceCentsExpr = "COALESCE(price_cents, (price_amount*100)::int, 0)";
+      } else if (has("price_cents")) {
+        priceCentsExpr = "COALESCE(price_cents, 0)";
+      } else if (has("price_amount")) {
+        priceCentsExpr = "(price_amount*100)::int";
+      }
 
-    const plan = await pool.query(
-      `SELECT code FROM public.subscription_plans WHERE code=$1 AND is_active=TRUE`,
-      [plan_code]
-    );
-    if (plan.rows.length === 0) return res.status(400).json({ error: "Invalid plan_code" });
+      // currency
+      let currencyExpr = "'USD'";
+      if (has("currency") && has("price_currency")) {
+        currencyExpr = "COALESCE(currency, price_currency, 'USD')";
+      } else if (has("currency")) {
+        currencyExpr = "COALESCE(currency, 'USD')";
+      } else if (has("price_currency")) {
+        currencyExpr = "COALESCE(price_currency, 'USD')";
+      }
 
-    const up = await pool.query(
-      `INSERT INTO public.user_subscriptions (user_id, plan_code, status, started_at, meta)
-       VALUES ($1, $2, 'active', NOW(), '{}'::jsonb)
-       ON CONFLICT DO NOTHING
-       RETURNING *`,
-      [user_id, plan_code]
-    );
+      // is_active
+      const isActiveExpr = has("is_active")
+        ? "COALESCE(is_active, TRUE)"
+        : "TRUE";
 
-    let sub = up.rows[0];
-    if (!sub) {
-      const q = await pool.query(
-        `SELECT * FROM public.user_subscriptions
-          WHERE user_id=$1
-          ORDER BY started_at DESC
-          LIMIT 1`,
-        [user_id]
-      );
-      sub = q.rows[0] || null;
+      // features JSON (prefer features_json if present, else derive from features text, else [])
+      let featuresExpr = "'[]'::jsonb";
+      if (has("features_json") && has("features")) {
+        featuresExpr = `
+          COALESCE(
+            features_json,
+            CASE
+              WHEN features IS NULL THEN '[]'::jsonb
+              WHEN features ~ '^\\s*\\[' THEN features::jsonb
+              ELSE to_jsonb(string_to_array(features, ','))
+            END
+          )
+        `;
+      } else if (has("features_json")) {
+        featuresExpr = "COALESCE(features_json, '[]'::jsonb)";
+      } else if (has("features")) {
+        featuresExpr = `
+          CASE
+            WHEN features IS NULL THEN '[]'::jsonb
+            WHEN features ~ '^\\s*\\[' THEN features::jsonb
+            ELSE to_jsonb(string_to_array(features, ','))
+          END
+        `;
+      }
+
+      // Build the SELECT using only safe expressions
+      const sql = `
+        SELECT
+          ${codeExpr}            AS code,
+          ${nameExpr}            AS name,
+          ${priceCentsExpr}      AS price_cents,
+          ${currencyExpr}        AS currency,
+          ${featuresExpr}        AS features,
+          ${isActiveExpr}        AS is_active
+        FROM subscription_plans
+        ORDER BY price_cents NULLS LAST, name
+      `;
+
+      const q = await pool.query(sql);
+      // normalize features to array<string>
+      const plans = q.rows.map((r) => ({
+        code: r.code,
+        name: r.name,
+        price_cents: typeof r.price_cents === "number" ? r.price_cents : 0,
+        currency: r.currency || "USD",
+        features: Array.isArray(r.features) ? r.features : [],
+        is_active: !!r.is_active,
+      }));
+
+      return res.json({ plans });
+    } catch (err) {
+      console.error("subscriptions.plans error:", err);
+      return res.status(500).json({ error: "Server error" });
     }
+  });
 
-    res.json({ ok: true, subscription: sub });
-  } catch (e) {
-    console.error("subscriptions.subscribe error:", e);
-    res.status(500).json({ error: "Server error" });
-  }
-});
+  // Optionally expose a tiny diag endpoint to see which columns exist
+  router.get("/subscriptions/diag/columns", async (_req, res) => {
+    try {
+      const r = await pool.query(
+        `SELECT column_name
+           FROM information_schema.columns
+          WHERE table_schema='public' AND table_name='subscription_plans'
+          ORDER BY column_name`
+      );
+      res.json({ table: "subscription_plans", columns: r.rows.map((x) => x.column_name) });
+    } catch (e) {
+      res.status(500).json({ error: "diag failed", detail: e.message });
+    }
+  });
 
-module.exports = router;
+  // Mount under /api
+  app.use("/api", router);
+};
