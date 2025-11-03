@@ -153,6 +153,92 @@ app.post("/api/test-whatsapp", authenticateToken, adminOnly, async (req, res) =>
   }
 });
 
+/* ------------------------------------------------
+ * 2b) ADMIN EMAIL TEST ENDPOINTS (how to call templates)
+ * ------------------------------------------------
+ * These let you exercise the templates from Postman safely.
+ * All are admin-only and accept JSON bodies.
+ */
+
+app.post("/api/admin/email/verification", authenticateToken, adminOnly, async (req, res) => {
+  try {
+    const { to, user_name = "there", verification_link } = req.body || {};
+    if (!to || !verification_link) {
+      return res.status(400).json({ error: "Missing 'to' or 'verification_link'" });
+    }
+    const r = await sendEmail(to, "Verify your Saka360 account", "verification", {
+      user_name, verification_link
+    });
+    res.json({ ok: true, sent: r });
+  } catch (e) {
+    res.status(500).json({ error: "Failed to send verification email", detail: e.message });
+  }
+});
+
+app.post("/api/admin/email/invoice", authenticateToken, adminOnly, async (req, res) => {
+  try {
+    const {
+      to, user_name = "there",
+      plan_name, plan_code,
+      amount_cents = 0, currency = "USD",
+      invoice_number = "INV-TEST",
+      issued_at = new Date().toISOString(),
+      period_start, period_end,
+      payment_link
+    } = req.body || {};
+    if (!to || !plan_name || !plan_code || !period_start || !period_end) {
+      return res.status(400).json({ error: "Missing required fields: to, plan_name, plan_code, period_start, period_end" });
+    }
+    const r = await sendEmail(to, "Saka360 Invoice", "subscription_invoice", {
+      user_name, plan_name, plan_code, amount_cents, currency,
+      invoice_number, issued_at, period_start, period_end, payment_link
+    });
+    res.json({ ok: true, sent: r });
+  } catch (e) {
+    res.status(500).json({ error: "Failed to send invoice email", detail: e.message });
+  }
+});
+
+app.post("/api/admin/email/affiliate-payout", authenticateToken, adminOnly, async (req, res) => {
+  try {
+    const {
+      to, partner_name = "Partner",
+      payout_id = "PAYOUT-TEST",
+      amount_cents = 0, currency = "USD",
+      payment_method = "M-Pesa",
+      reference = "",
+      period_start, period_end
+    } = req.body || {};
+    if (!to || !period_start || !period_end) {
+      return res.status(400).json({ error: "Missing required fields: to, period_start, period_end" });
+    }
+    const r = await sendEmail(to, "Affiliate Payout Receipt", "affiliate_payout_receipt", {
+      partner_name, payout_id, amount_cents, currency, payment_method, reference, period_start, period_end
+    });
+    res.json({ ok: true, sent: r });
+  } catch (e) {
+    res.status(500).json({ error: "Failed to send payout email", detail: e.message });
+  }
+});
+
+app.post("/api/admin/email/monthly-report", authenticateToken, adminOnly, async (req, res) => {
+  try {
+    const {
+      to, user_name = "there",
+      month_label = "October 2025",
+      total_vehicles = 0, services_count = 0, documents_count = 0, upcoming_count = 0,
+      report_url
+    } = req.body || {};
+    if (!to) return res.status(400).json({ error: "Missing 'to'" });
+    const r = await sendEmail(to, "Your monthly Saka360 report", "monthly_report_delivery", {
+      user_name, month_label, total_vehicles, services_count, documents_count, upcoming_count, report_url
+    });
+    res.json({ ok: true, sent: r });
+  } catch (e) {
+    res.status(500).json({ error: "Failed to send monthly report", detail: e.message });
+  }
+});
+
 /* -----------------------
  * 3) Cron (reminders)
  * ----------------------- */
@@ -194,15 +280,18 @@ require("./routes/service")(app);
 require("./routes/documents")(app);
 require("./routes/reminders")(app);
 require("./routes/reports")(app);
-require("./routes/whatsapp")(app);      // POST /api/webhooks/whatsapp
-require("./routes/subscriptions")(app); // ✅ subscriptions mounted function-style here
+require("./routes/whatsapp")(app); // POST /api/webhooks/whatsapp
 
 // B) router-style routes
-const chatRoutes = require("./routes/chat");     // exports Router
-app.use("/api", chatRoutes);                     // POST /api/chat
+const chatRoutes = require("./routes/chat"); // exports Router (reads pool via req.app.get('pool'))
+app.use("/api", chatRoutes);
+
+// Subscriptions router (router-style). Do NOT mount function-style for subscriptions again.
+const subscriptionsRoutes = require("./routes/subscriptions");
+app.use("/api/subscriptions", subscriptionsRoutes);
 
 const testEmailRoutes = require("./routes/testEmail");
-app.use("/api", testEmailRoutes);                // /api/test-email
+app.use("/api", testEmailRoutes); // /api/test-email
 
 const uploadsRoutes = require("./routes/uploads");
 app.use("/api/uploads", uploadsRoutes);

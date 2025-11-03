@@ -1,0 +1,52 @@
+<table width="100%" cellpadding="0" cellspacing="0" style="font-family:Arial,sans-serif; background:#f7f7f8; padding:24px;">
+  <tr><td align="center">
+    <table width="600" cellpadding="0" cellspacing="0" style="background:#ffffff; border-radius:12px; overflow:hidden;">
+      <tr>
+        <td style="padding:20px 24px; background:#111827; color:#fff; font-size:18px; font-weight:700;">
+          Saka360 — Subscription Invoice
+        </td>
+      </tr>
+      <tr>
+        <td style="padding:24px; color:#111827; font-size:14px; line-height:1.6;">
+          <p>Hi {{user_name}},</p>
+          <p>Here’s your invoice for <strong>{{plan_name}}</strong> ({{plan_code}}) for the period {{period_start}} – {{period_end}}.</p>
+
+          <table width="100%" style="border-collapse:collapse; margin:16px 0;">
+            <tr>
+              <td style="padding:8px; border:1px solid #e5e7eb;">Plan</td>
+              <td style="padding:8px; border:1px solid #e5e7eb;">{{plan_name}} ({{plan_code}})</td>
+            </tr>
+            <tr>
+              <td style="padding:8px; border:1px solid #e5e7eb;">Amount</td>
+              <td style="padding:8px; border:1px solid #e5e7eb;">{{formatCents amount_cents currency}}</td>
+            </tr>
+            <tr>
+              <td style="padding:8px; border:1px solid #e5e7eb;">Invoice #</td>
+              <td style="padding:8px; border:1px solid #e5e7eb;">{{invoice_number}}</td>
+            </tr>
+            <tr>
+              <td style="padding:8px; border:1px solid #e5e7eb;">Date</td>
+              <td style="padding:8px; border:1px solid #e5e7eb;">{{formatDate issued_at}}</td>
+            </tr>
+          </table>
+
+          {{#if payment_link}}
+          <p style="margin:18px 0;">
+            <a href="{{payment_link}}" style="display:inline-block; background:#0ea5e9; color:#fff; padding:10px 16px; border-radius:8px; text-decoration:none; font-weight:700;">
+              Pay Online
+            </a>
+          </p>
+          {{/if}}
+
+          <p>Questions? Reply to this email—happy to help.</p>
+          <p>— Saka360 Billing</p>
+        </td>
+      </tr>
+      <tr>
+        <td style="padding:16px 24px; font-size:12px; color:#6b7280; background:#f3f4f6;">
+          Thank you for choosing Saka360.
+        </td>
+      </tr>
+    </table>
+  </td></tr>
+</table>
