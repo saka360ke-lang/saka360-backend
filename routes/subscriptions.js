@@ -1,141 +1,88 @@
 // routes/subscriptions.js
 const express = require("express");
+const router = express.Router();
+const { Pool } = require("pg");
 
-/**
- * This file is FUNCTION-STYLE: export a function(app) and mount inside index.js with:
- *   require("./routes/subscriptions")(app);
- *
- * DO NOT also mount it as a router-style app.use("/api/subscriptions", ...) or you'll double-mount.
- */
-module.exports = (app) => {
-  const router = express.Router();
-  const pool = app.get("pool");
-  if (!pool) throw new Error("Pool not found on app; set app.set('pool', pool) in index.js");
+// Fallback pool (only used if req.app.get('pool') is missing)
+let fallbackPool = null;
+function getPool(req) {
+  const appPool = req.app && req.app.get && req.app.get("pool");
+  if (appPool) return appPool;
+  if (!fallbackPool) {
+    fallbackPool = new Pool({ connectionString: process.env.DATABASE_URL });
+    console.warn("[subscriptions] Using fallback pg Pool (app pool not set).");
+  }
+  return fallbackPool;
+}
 
-  // Small helper: check if a column exists on a table
-  async function columnsFor(table) {
-    const sql = `
+// GET /api/subscriptions/plans
+router.get("/plans", async (req, res) => {
+  try {
+    const pool = getPool(req);
+
+    // Your DB has a legacy shape; this normalizes to the API we want.
+    // If the new columns (code, price_cents, currency, is_active) exist, use them.
+    // Otherwise, compute from legacy columns.
+    const hasCols = await pool.query(`
       SELECT column_name
       FROM information_schema.columns
-      WHERE table_schema='public' AND table_name=$1
-    `;
-    const r = await pool.query(sql, [table]);
-    const s = new Set(r.rows.map((x) => x.column_name));
-    return s;
-  }
+      WHERE table_schema='public' AND table_name='subscription_plans'
+    `);
 
-  // GET /api/subscriptions/plans
-  router.get("/subscriptions/plans", async (_req, res) => {
-    try {
-      const cols = await columnsFor("subscription_plans");
-
-      const has = (c) => cols.has(c);
-
-      // ---- Build safe expressions that do NOT reference missing columns ----
-      // code
-      const codeExpr = has("code")
-        ? "code"
-        : "regexp_replace(upper(name), '[^A-Z0-9]+', '_', 'g')";
-
-      // name (should exist, but guard anyway)
-      const nameExpr = has("name") ? "name" : "NULL::text AS name";
-
-      // price_cents
-      let priceCentsExpr = "0";
-      if (has("price_cents") && has("price_amount")) {
-        priceCentsExpr = "COALESCE(price_cents, (price_amount*100)::int, 0)";
-      } else if (has("price_cents")) {
-        priceCentsExpr = "COALESCE(price_cents, 0)";
-      } else if (has("price_amount")) {
-        priceCentsExpr = "(price_amount*100)::int";
-      }
-
-      // currency
-      let currencyExpr = "'USD'";
-      if (has("currency") && has("price_currency")) {
-        currencyExpr = "COALESCE(currency, price_currency, 'USD')";
-      } else if (has("currency")) {
-        currencyExpr = "COALESCE(currency, 'USD')";
-      } else if (has("price_currency")) {
-        currencyExpr = "COALESCE(price_currency, 'USD')";
-      }
-
-      // is_active
-      const isActiveExpr = has("is_active")
-        ? "COALESCE(is_active, TRUE)"
-        : "TRUE";
-
-      // features JSON (prefer features_json if present, else derive from features text, else [])
-      let featuresExpr = "'[]'::jsonb";
-      if (has("features_json") && has("features")) {
-        featuresExpr = `
-          COALESCE(
-            features_json,
-            CASE
-              WHEN features IS NULL THEN '[]'::jsonb
-              WHEN features ~ '^\\s*\\[' THEN features::jsonb
-              ELSE to_jsonb(string_to_array(features, ','))
-            END
-          )
-        `;
-      } else if (has("features_json")) {
-        featuresExpr = "COALESCE(features_json, '[]'::jsonb)";
-      } else if (has("features")) {
-        featuresExpr = `
-          CASE
-            WHEN features IS NULL THEN '[]'::jsonb
-            WHEN features ~ '^\\s*\\[' THEN features::jsonb
-            ELSE to_jsonb(string_to_array(features, ','))
-          END
-        `;
-      }
-
-      // Build the SELECT using only safe expressions
-      const sql = `
+    const cols = new Set(hasCols.rows.map(r => r.column_name));
+    const selectSQL = cols.has("code")
+      ? `
         SELECT
-          ${codeExpr}            AS code,
-          ${nameExpr}            AS name,
-          ${priceCentsExpr}      AS price_cents,
-          ${currencyExpr}        AS currency,
-          ${featuresExpr}        AS features,
-          ${isActiveExpr}        AS is_active
-        FROM subscription_plans
+          code,
+          name,
+          price_cents,
+          currency,
+          COALESCE(features::jsonb, '[]'::jsonb) AS features,
+          COALESCE(is_active, TRUE)              AS is_active
+        FROM public.subscription_plans
         ORDER BY price_cents NULLS LAST, name
+      `
+      : `
+        SELECT
+          -- Synthesize a code from the row (fallback)
+          CONCAT('LEGACY_', id::text) AS code,
+          name,
+          -- Compute price_cents if you have legacy price_amount (numeric)
+          COALESCE( (price_amount * 100)::int, 0 ) AS price_cents,
+          COALESCE(price_currency, 'USD')         AS currency,
+          -- Legacy "features" is text; present an empty array if not JSON
+          '[]'::jsonb                              AS features,
+          TRUE                                     AS is_active
+        FROM public.subscription_plans
+        ORDER BY (price_amount IS NULL) ASC, price_amount, name
       `;
 
-      const q = await pool.query(sql);
-      // normalize features to array<string>
-      const plans = q.rows.map((r) => ({
-        code: r.code,
-        name: r.name,
-        price_cents: typeof r.price_cents === "number" ? r.price_cents : 0,
-        currency: r.currency || "USD",
-        features: Array.isArray(r.features) ? r.features : [],
-        is_active: !!r.is_active,
-      }));
+    const out = await pool.query(selectSQL);
+    res.json({ plans: out.rows });
+  } catch (err) {
+    console.error("subscriptions.plans error:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
 
-      return res.json({ plans });
-    } catch (err) {
-      console.error("subscriptions.plans error:", err);
-      return res.status(500).json({ error: "Server error" });
-    }
-  });
+// GET /api/subscriptions/diag/columns
+router.get("/diag/columns", async (req, res) => {
+  try {
+    const pool = getPool(req);
+    const r = await pool.query(`
+      SELECT column_name, data_type
+      FROM information_schema.columns
+      WHERE table_schema='public' AND table_name='subscription_plans'
+      ORDER BY ordinal_position
+    `);
+    res.json({ table: "public.subscription_plans", columns: r.rows });
+  } catch (err) {
+    res.status(500).json({
+      error: "Server error",
+      detail: process.env.DEBUG_MODE === "1" ? err.message : undefined,
+      path: "/api/subscriptions/diag/columns"
+    });
+  }
+});
 
-  // Optionally expose a tiny diag endpoint to see which columns exist
-  router.get("/subscriptions/diag/columns", async (_req, res) => {
-    try {
-      const r = await pool.query(
-        `SELECT column_name
-           FROM information_schema.columns
-          WHERE table_schema='public' AND table_name='subscription_plans'
-          ORDER BY column_name`
-      );
-      res.json({ table: "subscription_plans", columns: r.rows.map((x) => x.column_name) });
-    } catch (e) {
-      res.status(500).json({ error: "diag failed", detail: e.message });
-    }
-  });
-
-  // Mount under /api
-  app.use("/api", router);
-};
+module.exports = router;
