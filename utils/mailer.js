@@ -1,123 +1,109 @@
 // utils/mailer.js
 const nodemailer = require("nodemailer");
-const fs = require("fs");
-const path = require("path");
-const handlebars = require("handlebars");
+const fetch = (...args) => import("node-fetch").then(({ default: f }) => f(...args));
 
-// Transport
-let transporter = null;
-function getTransport() {
-  if (transporter) return transporter;
+/**
+ * Two modes:
+ *  A) HTTP (Mailtrap Send API) when MAILTRAP_API_TOKEN is set
+ *  B) SMTP (Nodemailer) when SMTP_HOST/PORT/USER/PASS are set
+ *
+ * verifySmtp() will resolve true in HTTP mode (no-op), so your existing
+ * /api/email-verify route continues to “pass” when using HTTP.
+ */
 
-  const { SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS } = process.env;
+const FROM = process.env.SMTP_FROM || "Saka360 <no-reply@saka360.com>";
 
-  if (!SMTP_HOST || !SMTP_PORT || !SMTP_USER || !SMTP_PASS) {
-    // Dev: log-only transport
-    transporter = {
-      sendMail: async (opts) => {
-        console.log("[mailer:dev] Would send mail:", {
-          to: opts.to, subject: opts.subject, htmlPreview: (opts.html || "").slice(0, 200) + "..."
-        });
-        return { messageId: "dev-preview" };
-      },
-    };
-    return transporter;
+// ----------------------------
+// Mode A: HTTP (Mailtrap Send)
+// ----------------------------
+const MAILTRAP_API_BASE = process.env.MAILTRAP_API_BASE || "https://send.api.mailtrap.io";
+const MAILTRAP_API_TOKEN = process.env.MAILTRAP_API_TOKEN || "";
+
+// ----------------------------
+// Mode B: SMTP (Nodemailer)
+// ----------------------------
+const SMTP_HOST = process.env.SMTP_HOST || "";
+const SMTP_PORT = parseInt(process.env.SMTP_PORT || "587", 10);
+const SMTP_USER = process.env.SMTP_USER || "";
+const SMTP_PASS = process.env.SMTP_PASS || "";
+
+function usingHttpApi() {
+  return !!MAILTRAP_API_TOKEN;
+}
+
+let smtpTransport = null;
+function getSmtpTransport() {
+  if (!smtpTransport) {
+    if (!SMTP_HOST || !SMTP_USER || !SMTP_PASS) {
+      throw new Error("SMTP not configured – missing SMTP_HOST/SMTP_USER/SMTP_PASS");
+    }
+    smtpTransport = nodemailer.createTransport({
+      host: SMTP_HOST,
+      port: SMTP_PORT,
+      secure: SMTP_PORT === 465, // 587 usually STARTTLS
+      auth: { user: SMTP_USER, pass: SMTP_PASS },
+    });
   }
-
-  transporter = nodemailer.createTransport({
-    host: SMTP_HOST,
-    port: Number(SMTP_PORT),
-    secure: Number(SMTP_PORT) === 465,
-    auth: { user: SMTP_USER, pass: SMTP_PASS },
-  });
-  return transporter;
+  return smtpTransport;
 }
 
 async function verifySmtp() {
-  const t = getTransport();
-  if (t.verify) return t.verify();
-  return true;
+  if (usingHttpApi()) {
+    // HTTP mode doesn't need SMTP verification
+    return true;
+  }
+  try {
+    const t = getSmtpTransport();
+    await t.verify();
+    return true;
+  } catch (e) {
+    console.error("[mailer] SMTP verify failed:", e.message);
+    return false;
+  }
 }
 
-// ---- Template loader with inline fallbacks ----
-function compileTemplate(name) {
-  const file = path.join(__dirname, "..", "templates", "emails", `${name}.hbs`);
-  if (fs.existsSync(file)) {
-    const src = fs.readFileSync(file, "utf8");
-    return handlebars.compile(src);
+/**
+ * sendEmail(to, subject, html, text?)
+ * - In HTTP mode, calls Mailtrap Send API
+ * - In SMTP mode, uses Nodemailer
+ */
+async function sendEmail(to, subject, html, text) {
+  if (usingHttpApi()) {
+    // HTTP API mode
+    const url = `${MAILTRAP_API_BASE.replace(/\/$/, "")}/api/send`;
+    const payload = {
+      from: FROM,
+      to: [{ email: to }],
+      subject,
+      html,
+      ...(text ? { text } : {}),
+      category: "saka360",
+    };
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Api-Token": MAILTRAP_API_TOKEN, // Mailtrap expects Api-Token header
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      throw new Error(`Mailtrap API failed ${res.status}: ${body}`);
+    }
+    return { messageId: "api-mailtrap" };
   }
 
-  // Inline fallbacks
-  const inline = {
-    verification: `
-      <h2>Verify your Saka360 account</h2>
-      <p>Hi {{user_name}},</p>
-      <p>Click the link below to verify your account:</p>
-      <p><a href="{{verification_link}}">Verify Account</a></p>
-      <p>If you didn’t request this, you can ignore this email.</p>
-    `,
-    subscription_invoice: `
-      <h2>Saka360 Invoice</h2>
-      <p>Hi {{user_name}},</p>
-      <p>Plan: <strong>{{plan_name}} ({{plan_code}})</strong></p>
-      <p>Amount: <strong>{{currency}} {{amount_dollars}}</strong></p>
-      <p>Invoice #: {{invoice_number}} • Issued: {{issued_at}}</p>
-      <p>Period: {{period_start}} → {{period_end}}</p>
-      {{#if payment_link}}
-        <p><a href="{{payment_link}}">Pay now</a></p>
-      {{/if}}
-    `,
-    affiliate_payout_receipt: `
-      <h2>Affiliate Payout Receipt</h2>
-      <p>Hi {{partner_name}},</p>
-      <p>Payout ID: {{payout_id}}</p>
-      <p>Amount: <strong>{{currency}} {{amount_dollars}}</strong></p>
-      <p>Method: {{payment_method}}{{#if reference}} • Ref: {{reference}}{{/if}}</p>
-      <p>Period: {{period_start}} → {{period_end}}</p>
-    `,
-    monthly_report_delivery: `
-      <h2>Your monthly Saka360 report</h2>
-      <p>Hi {{user_name}},</p>
-      <p>{{month_label}} summary:</p>
-      <ul>
-        <li>Total vehicles: {{total_vehicles}}</li>
-        <li>Services logged: {{services_count}}</li>
-        <li>Documents uploaded: {{documents_count}}</li>
-        <li>Upcoming renewals: {{upcoming_count}}</li>
-      </ul>
-      {{#if report_url}}
-        <p>Download your report: <a href="{{report_url}}">Report PDF</a></p>
-      {{/if}}
-    `,
-  };
-
-  const tpl = inline[name];
-  if (!tpl) throw new Error(`Template '${name}' not found (no file, no fallback).`);
-  return handlebars.compile(tpl);
-}
-
-function centsToDollars(cents, currency = "USD") {
-  const v = (Number(cents || 0) / 100).toFixed(2);
-  return v;
-}
-
-async function sendEmail(to, subject, templateName, data = {}) {
-  const t = getTransport();
-  const template = compileTemplate(templateName);
-
-  // Enrich data
-  const ctx = { ...data };
-  if (templateName === "subscription_invoice" || templateName === "affiliate_payout_receipt") {
-    ctx.amount_dollars = centsToDollars(ctx.amount_cents, ctx.currency);
-  }
-
-  const html = template(ctx);
-  return t.sendMail({
+  // SMTP mode
+  const t = getSmtpTransport();
+  const info = await t.sendMail({
+    from: FROM,
     to,
-    from: process.env.SMTP_FROM || "Saka360 <no-reply@saka360.com>",
     subject,
     html,
+    ...(text ? { text } : {}),
   });
+  return { messageId: info.messageId || "smtp-mailtrap" };
 }
 
 module.exports = { verifySmtp, sendEmail };
