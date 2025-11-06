@@ -296,7 +296,7 @@ app.use("/api", testEmailRoutes); // /api/test-email
 const uploadsRoutes = require("./routes/uploads");
 app.use("/api/uploads", uploadsRoutes);
 
-const adminEmailRoutes = require("./routes/admin_email");
+const adminEmailRoutes = require("./routes/adminEmails");
 app.use("/api/admin/email", adminEmailRoutes);
 
 // Optional/defensive dynamic mounts
