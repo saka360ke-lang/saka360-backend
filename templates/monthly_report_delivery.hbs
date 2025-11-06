@@ -1,40 +1,13 @@
-<table width="100%" cellpadding="0" cellspacing="0" style="font-family:Arial,sans-serif; background:#f7f7f8; padding:24px;">
-  <tr><td align="center">
-    <table width="600" cellpadding="0" cellspacing="0" style="background:#ffffff; border-radius:12px; overflow:hidden;">
-      <tr>
-        <td style="padding:20px 24px; background:#111827; color:#fff; font-size:18px; font-weight:700;">
-          Saka360 — Your Monthly Report
-        </td>
-      </tr>
-      <tr>
-        <td style="padding:24px; color:#111827; font-size:14px; line-height:1.6;">
-          <p>Hi {{user_name}},</p>
-          <p>Your <strong>{{month_label}}</strong> report is ready.</p>
-
-          <ul style="padding-left:18px; margin: 12px 0;">
-            <li>Total vehicles: <strong>{{total_vehicles}}</strong></li>
-            <li>Services logged: <strong>{{services_count}}</strong></li>
-            <li>Documents uploaded: <strong>{{documents_count}}</strong></li>
-            <li>Upcoming expiries next 30 days: <strong>{{upcoming_count}}</strong></li>
-          </ul>
-
-          {{#if report_url}}
-          <p style="margin:18px 0;">
-            <a href="{{report_url}}" style="display:inline-block; background:#0ea5e9; color:#fff; padding:10px 16px; border-radius:8px; text-decoration:none; font-weight:700;">
-              Download Report
-            </a>
-          </p>
-          {{/if}}
-
-          <p>For WhatsApp delivery, reply “REPORT PDF” and we’ll send it to your WhatsApp number on file.</p>
-          <p>— Saka360</p>
-        </td>
-      </tr>
-      <tr>
-        <td style="padding:16px 24px; font-size:12px; color:#6b7280; background:#f3f4f6;">
-          Automated email from Saka360.
-        </td>
-      </tr>
-    </table>
-  </td></tr>
-</table>
+<!DOCTYPE html>
+<html>
+  <body style="font-family:Arial,Helvetica,sans-serif; line-height:1.6; color:#222;">
+    <h2>Your Monthly Report — {{month_label}}</h2>
+    <p><strong>Vehicles:</strong> {{vehicle_count}}</p>
+    <p><strong>Documents:</strong> {{document_count}}</p>
+    <p>
+      <a href="{{download_url}}" style="background:#16a34a;color:#fff;padding:10px 16px;border-radius:6px;text-decoration:none;">
+        Download Report
+      </a>
+    </p>
+  </body>
+</html>

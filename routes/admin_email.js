@@ -2,27 +2,14 @@
 const express = require("express");
 const router = express.Router();
 const path = require("path");
-
-// We use HTTP Mailtrap sender + Handlebars renderer
 const { sendMailHttp, renderTemplate } = require("../utils/mailer_https");
 
-// Helpers
-function pick(obj, keys) {
-  const out = {};
-  for (const k of keys) if (obj[k] !== undefined) out[k] = obj[k];
-  return out;
-}
+const TEMPLATE_DIR = process.env.TEMPLATE_DIR || "templates";
+
+// helpers
 function asString(x) {
   if (x === undefined || x === null) return undefined;
   return String(x);
-}
-function parseUsdToCents(v) {
-  if (v === undefined || v === null || v === "") return undefined;
-  if (typeof v === "number") return Math.round(v * 100);
-  // string like "50.00"
-  const n = Number(v);
-  if (Number.isFinite(n)) return Math.round(n * 100);
-  return undefined;
 }
 function firstNonEmpty(...vals) {
   for (const v of vals) {
@@ -30,32 +17,36 @@ function firstNonEmpty(...vals) {
   }
   return undefined;
 }
+function parseUsdToCents(v) {
+  if (v === undefined || v === null || v === "") return undefined;
+  if (typeof v === "number") return Math.round(v * 100);
+  const n = Number(v);
+  if (Number.isFinite(n)) return Math.round(n * 100);
+  return undefined;
+}
 
-// Base template dir (can override with env)
-const TEMPLATE_DIR = process.env.TEMPLATE_DIR || "templates";
-
-// ----------------------------------------------------
-// 1) VERIFICATION
-// Body accepts:
+// -----------------------------
+// 1) Account verification
+// Accepts:
 //   to (required)
 //   name (optional)
 //   verification_link  OR verifyUrl (required)
-// ----------------------------------------------------
+// -----------------------------
 router.post("/verification", async (req, res) => {
   try {
-    const body = req.body || {};
-    const to = asString(body.to);
-    const name = asString(body.name) || "there";
-    const verification_link = asString(firstNonEmpty(body.verification_link, body.verifyUrl));
+    const b = req.body || {};
+    const to = asString(b.to);
+    const name = asString(b.name) || "there";
+    const verification_link = asString(firstNonEmpty(b.verification_link, b.verifyUrl));
 
     if (!to || !verification_link) {
       return res.status(400).json({ error: "Missing 'to' or 'verification_link'" });
     }
 
-    const html = await renderTemplate(path.join(TEMPLATE_DIR, "emails/verification.hbs"), {
-      name,
-      verification_link
-    });
+    const html = await renderTemplate(
+      path.join(TEMPLATE_DIR, "emails/verification.hbs"),
+      { name, verification_link }
+    );
 
     const text = `Hi ${name},
 
@@ -80,9 +71,9 @@ If you didn’t request this, you can ignore this message.
   }
 });
 
-// ----------------------------------------------------
-// 2) SUBSCRIPTION INVOICE
-// Body accepts either canonical keys OR friendly aliases:
+// -----------------------------
+// 2) Subscription invoice
+// Accepts canonical or friendly aliases:
 //   to (required)
 //   plan_name | planName
 //   plan_code | planCode
@@ -92,20 +83,19 @@ If you didn’t request this, you can ignore this message.
 //   invoice_number | invoiceNumber
 //   invoice_date   | invoiceDate
 //   due_date       | dueDate
-// ----------------------------------------------------
+// -----------------------------
 router.post("/invoice", async (req, res) => {
   try {
     const b = req.body || {};
     const to = asString(b.to);
 
-    const plan_name  = asString(firstNonEmpty(b.plan_name, b.planName));
-    const plan_code  = asString(firstNonEmpty(b.plan_code, b.planCode));
+    const plan_name = asString(firstNonEmpty(b.plan_name, b.planName));
+    const plan_code = asString(firstNonEmpty(b.plan_code, b.planCode));
 
     const period_start = asString(firstNonEmpty(b.period_start, b.periodStart, b.invoiceDate));
     const period_end   = asString(firstNonEmpty(b.period_end, b.periodEnd, b.dueDate));
 
-    // amount normalization
-    let amount_cents = b.amount_cents;
+    let amount_cents = b.amount_cents ?? b.amountCents;
     if (amount_cents === undefined) {
       amount_cents = parseUsdToCents(firstNonEmpty(b.amountUSD, b.amountUsd));
     }
@@ -114,32 +104,32 @@ router.post("/invoice", async (req, res) => {
     }
 
     const invoice_number = asString(firstNonEmpty(b.invoice_number, b.invoiceNumber));
-    const invoice_date   = asString(firstNonEmpty(b.invoice_date, b.invoiceDate));
-    const due_date       = asString(firstNonEmpty(b.due_date, b.dueDate));
+    const invoice_date   = asString(firstNonEmpty(b.invoice_date, b.invoiceDate)) || period_start;
+    const due_date       = asString(firstNonEmpty(b.due_date, b.dueDate)) || period_end;
 
-    if (!to) {
-      return res.status(400).json({ error: "Missing 'to'" });
-    }
-    if (!plan_name || !plan_code || !period_start || !period_end) {
+    if (!to || !plan_name || !plan_code || !period_start || !period_end) {
       return res.status(400).json({
-        error: "Missing required fields: plan_name/planName, plan_code/planCode, period_start/periodStart, period_end/periodEnd"
+        error: "Missing required fields: to, plan_name/planName, plan_code/planCode, period_start/periodStart, period_end/periodEnd"
       });
     }
     if (amount_cents === undefined || !Number.isFinite(Number(amount_cents))) {
-      return res.status(400).json({ error: "Missing or invalid amount (amount_cents or amountUSD)" });
+      return res.status(400).json({ error: "Missing or invalid amount (amount_cents/amountCents or amountUSD)" });
     }
 
-    const html = await renderTemplate(path.join(TEMPLATE_DIR, "emails/subscription_invoice.hbs"), {
-      plan_name,
-      plan_code,
-      period_start,
-      period_end,
-      amount_cents: Number(amount_cents),
-      amount_usd: (Number(amount_cents) / 100).toFixed(2),
-      invoice_number: invoice_number || undefined,
-      invoice_date:   invoice_date   || period_start,
-      due_date:       due_date       || period_end
-    });
+    const html = await renderTemplate(
+      path.join(TEMPLATE_DIR, "emails/subscription_invoice.hbs"),
+      {
+        plan_name,
+        plan_code,
+        period_start,
+        period_end,
+        amount_cents: Number(amount_cents),
+        amount_usd: (Number(amount_cents) / 100).toFixed(2),
+        invoice_number: invoice_number || "-",
+        invoice_date,
+        due_date
+      }
+    );
 
     const text =
 `Your Saka360 subscription invoice
@@ -165,10 +155,11 @@ Thank you for your business.`;
   }
 });
 
-// ----------------------------------------------------
-// 3) AFFILIATE PAYOUT RECEIPT
-// Accepts: to, affiliate_name, period_start, period_end, amount_cents|amountUSD, payout_id
-// ----------------------------------------------------
+// -----------------------------
+// 3) Affiliate payout receipt
+// Accepts: to, affiliate_name|affiliateName, period_start|periodStart, period_end|periodEnd,
+//          amount_cents|amountCents|amountUSD, payout_id|payoutId
+// -----------------------------
 router.post("/affiliate-payout", async (req, res) => {
   try {
     const b = req.body || {};
@@ -176,22 +167,30 @@ router.post("/affiliate-payout", async (req, res) => {
     const affiliate_name = asString(firstNonEmpty(b.affiliate_name, b.affiliateName)) || "Affiliate";
     const period_start = asString(firstNonEmpty(b.period_start, b.periodStart));
     const period_end   = asString(firstNonEmpty(b.period_end, b.periodEnd));
-    let amount_cents = b.amount_cents ?? parseUsdToCents(firstNonEmpty(b.amountUSD, b.amountUsd));
+
+    let amount_cents = b.amount_cents ?? b.amountCents;
+    if (amount_cents === undefined) {
+      amount_cents = parseUsdToCents(firstNonEmpty(b.amountUSD, b.amountUsd));
+    }
     if (typeof amount_cents === "string" && /^\d+$/.test(amount_cents)) amount_cents = Number(amount_cents);
-    const payout_id = asString(firstNonEmpty(b.payout_id, b.payoutId));
+
+    const payout_id = asString(firstNonEmpty(b.payout_id, b.payoutId)) || "-";
 
     if (!to || !period_start || !period_end || amount_cents === undefined) {
       return res.status(400).json({ error: "Missing required fields: to, period_start, period_end, amount" });
     }
 
-    const html = await renderTemplate(path.join(TEMPLATE_DIR, "emails/affiliate_payout_receipt.hbs"), {
-      affiliate_name,
-      period_start,
-      period_end,
-      amount_cents: Number(amount_cents),
-      amount_usd: (Number(amount_cents) / 100).toFixed(2),
-      payout_id: payout_id || undefined
-    });
+    const html = await renderTemplate(
+      path.join(TEMPLATE_DIR, "emails/affiliate_payout_receipt.hbs"),
+      {
+        affiliate_name,
+        period_start,
+        period_end,
+        amount_cents: Number(amount_cents),
+        amount_usd: (Number(amount_cents) / 100).toFixed(2),
+        payout_id
+      }
+    );
 
     const text =
 `Affiliate Payout Receipt
@@ -199,7 +198,7 @@ router.post("/affiliate-payout", async (req, res) => {
 Affiliate: ${affiliate_name}
 Period: ${period_start} → ${period_end}
 Amount: $${(Number(amount_cents)/100).toFixed(2)}
-Payout ID: ${payout_id || "-"}
+Payout ID: ${payout_id}
 
 Thank you for partnering with Saka360.`;
 
@@ -217,10 +216,10 @@ Thank you for partnering with Saka360.`;
   }
 });
 
-// ----------------------------------------------------
-// 4) MONTHLY REPORT DELIVERY
-// Accepts: to, month_label, download_url (or downloadUrl), vehicle_count, document_count
-// ----------------------------------------------------
+// -----------------------------
+// 4) Monthly report delivery
+// Accepts: to, month_label|monthLabel, download_url|downloadUrl, vehicle_count|vehicleCount, document_count|documentCount
+// -----------------------------
 router.post("/monthly-report", async (req, res) => {
   try {
     const b = req.body || {};
@@ -234,18 +233,21 @@ router.post("/monthly-report", async (req, res) => {
       return res.status(400).json({ error: "Missing 'to' or 'download_url/downloadUrl'" });
     }
 
-    const html = await renderTemplate(path.join(TEMPLATE_DIR, "emails/monthly_report_delivery.hbs"), {
-      month_label,
-      download_url,
-      vehicle_count: Number.isFinite(vehicle_count) ? vehicle_count : 0,
-      document_count: Number.isFinite(document_count) ? document_count : 0
-    });
+    const html = await renderTemplate(
+      path.join(TEMPLATE_DIR, "emails/monthly_report_delivery.hbs"),
+      {
+        month_label,
+        download_url,
+        vehicle_count: Number.isFinite(vehicle_count) ? vehicle_count : 0,
+        document_count: Number.isFinite(document_count) ? document_count : 0
+      }
+    );
 
     const text =
 `Your Saka360 Monthly Report — ${month_label}
 
-Vehicles: ${vehicle_count}
-Documents: ${document_count}
+Vehicles: ${Number.isFinite(vehicle_count) ? vehicle_count : 0}
+Documents: ${Number.isFinite(document_count) ? document_count : 0}
 
 Download: ${download_url}
 `;

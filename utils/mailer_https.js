@@ -1,82 +1,85 @@
 // utils/mailer_https.js
-const fs = require("fs");
+const fs = require("fs/promises");
 const path = require("path");
 const Handlebars = require("handlebars");
 
-const API_BASE = process.env.MAILTRAP_API_BASE || "https://send.api.mailtrap.io";
-const API_TOKEN = process.env.MAILTRAP_API_TOKEN;
-const SENDER_EMAIL = process.env.MAIL_SENDER_EMAIL || "no-reply@example.com";
-const SENDER_NAME  = process.env.MAIL_SENDER_NAME  || "Saka360";
-const TEMPLATE_DIR = process.env.TEMPLATE_DIR || "templates";
+// Mailtrap HTTP API
+const MAILTRAP_API_BASE = process.env.MAILTRAP_API_BASE || "https://send.api.mailtrap.io";
+const MAILTRAP_API_TOKEN = process.env.MAILTRAP_API_TOKEN;
+const MAIL_SENDER_EMAIL = process.env.MAIL_SENDER_EMAIL || "no-reply@example.com";
+const MAIL_SENDER_NAME  = process.env.MAIL_SENDER_NAME  || "Saka360";
 
-/** Load and compile a handlebars template from /templates/emails/<name>.hbs */
-function renderTemplate(name, vars = {}) {
-  const file = path.join(process.cwd(), TEMPLATE_DIR, "emails", `${name}.hbs`);
-  if (!fs.existsSync(file)) {
-    throw new Error(`Template not found: ${file}`);
-  }
-  const src = fs.readFileSync(file, "utf8");
-  const tpl = Handlebars.compile(src, { noEscape: true });
-  return tpl(vars || {});
-}
-
-/** Very simple HTML -> text fallback */
-function htmlToText(html = "") {
-  return html
-    .replace(/<style[\s\S]*?<\/style>/gi, "")
-    .replace(/<script[\s\S]*?<\/script>/gi, "")
-    .replace(/<[^>]+>/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
+if (!MAILTRAP_API_TOKEN) {
+  console.warn("[mailer_https] MAILTRAP_API_TOKEN is missing — sending will fail until set.");
 }
 
 /**
- * Send email via Mailtrap HTTP API with HTML (rendered from handlebars).
- * @param {Object} opts
- *  - to: string | {email,name}
- *  - subject: string
- *  - template: string (file name without .hbs in templates/emails/)
- *  - variables: object (template variables)
- *  - cc/bcc: optional arrays
+ * Render a handlebars template from disk.
+ * @param {string} absPath Absolute path to .hbs
+ * @param {object} data Template data
+ * @returns {Promise<string>} HTML
  */
-async function sendMailHttp({ to, subject, template, variables = {}, cc = [], bcc = [] }) {
-  if (!API_TOKEN) throw new Error("MAILTRAP_API_TOKEN missing");
-  if (!template) throw new Error("template is required");
-
-  const html = renderTemplate(template, variables);
-  const text = htmlToText(html);
-
-  const toArr = Array.isArray(to)
-    ? to.map(t => (typeof t === "string" ? { email: t } : t))
-    : [typeof to === "string" ? { email: to } : to];
-
-  const body = {
-    from: { email: SENDER_EMAIL, name: SENDER_NAME },
-    to: toArr,
-    subject,
-    html,
-    text,               // Mailtrap expects string, not object
-  };
-
-  if (cc?.length) body.cc = cc.map(x => (typeof x === "string" ? { email: x } : x));
-  if (bcc?.length) body.bcc = bcc.map(x => (typeof x === "string" ? { email: x } : x));
-
-  const res = await fetch(`${API_BASE}/api/send`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${API_TOKEN}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(body),
-  });
-
-  const data = await res.json().catch(() => ({}));
-
-  if (!res.ok || data?.success === false) {
-    throw new Error(`Mailtrap API failed ${res.status}: ${JSON.stringify(data)}`);
+async function renderTemplate(absPath, data) {
+  try {
+    const src = await fs.readFile(absPath, "utf8");
+    const tpl = Handlebars.compile(src);
+    return tpl(data || {});
+  } catch (e) {
+    // Surface a clear error for missing/invalid templates
+    throw new Error(`Template render failed for ${absPath}: ${e.message}`);
   }
-
-  return data;
 }
 
-module.exports = { sendMailHttp };
+/**
+ * Send an email via Mailtrap HTTP API
+ * @param {object} param0
+ * @param {string} param0.to
+ * @param {string} param0.subject
+ * @param {string} [param0.html]
+ * @param {string} [param0.text]
+ */
+async function sendMailHttp({ to, subject, html, text }) {
+  if (!MAILTRAP_API_TOKEN) {
+    throw new Error("MAILTRAP_API_TOKEN not configured");
+  }
+  if (!to) throw new Error("Missing 'to'");
+  if (!subject) throw new Error("Missing 'subject'");
+
+  // Ensure text is string
+  const textString = typeof text === "string" ? text : (text ? String(text) : "");
+
+  const payload = {
+    from: {
+      email: MAIL_SENDER_EMAIL,
+      name: MAIL_SENDER_NAME
+    },
+    to: [{ email: to }],
+    subject,
+    text: textString || undefined,
+    html: html || undefined,
+    category: "transactional"
+  };
+
+  const res = await fetch(`${MAILTRAP_API_BASE}/api/send`, {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${MAILTRAP_API_TOKEN}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(payload)
+  });
+
+  const body = await res.text();
+  let parsed;
+  try { parsed = JSON.parse(body); } catch { parsed = { raw: body }; }
+
+  if (!res.ok) {
+    throw new Error(`Mailtrap API failed ${res.status}: ${body}`);
+  }
+  // Mailtrap returns { success:true, message_ids:[...] } or similar
+  return {
+    messageId: parsed?.message_ids?.[0] || parsed?.message_id || "dev-preview"
+  };
+}
+
+module.exports = { sendMailHttp, renderTemplate };
