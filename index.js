@@ -222,6 +222,9 @@ app.use("/api/uploads", uploadsRoutes);
 const billingRoutes = require("./routes/billing"); // NEW
 app.use("/api/billing", billingRoutes);
 
+const paymentsRoutes = require("./routes/payments");
+app.use("/api/payments", paymentsRoutes);
+
 
 // Optional/defensive dynamic mounts
 let vehiclesRoutes = null;
