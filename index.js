@@ -283,6 +283,9 @@ require("./routes/reports")(app);
 require("./routes/whatsapp")(app); // POST /api/webhooks/whatsapp
 
 // B) router-style routes
+const adminEmailRoutes = require("./routes/admin_email");
+app.use("/api/admin/email", adminEmailRoutes);
+
 const chatRoutes = require("./routes/chat"); // exports Router (reads pool via req.app.get('pool'))
 app.use("/api", chatRoutes);
 
