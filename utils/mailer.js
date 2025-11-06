@@ -1,36 +1,58 @@
 // utils/mailer.js
 //
-// Pure HTTP Mailtrap (Send API) mailer.
-// No SMTP. No nodemailer. Works on Render without special ports.
+// Pure HTTP Mailtrap (Send API) mailer (no SMTP).
+// Fixes: Mailtrap requires `from` to be an object, not a string.
 //
-// ENV required:
-//   MAILTRAP_API_TOKEN=  (from Mailtrap Email Sending -> API -> Tokens)
-//   SMTP_FROM= Saka360 <no-reply@saka360.com>   (display name + email you verified in Mailtrap)
+// Required ENV (Render → Environment):
+//   MAILTRAP_API_TOKEN=   (Mailtrap Email Sending → API → Tokens)
+//   SMTP_FROM= Saka360 <no-reply@saka360.com>   (your verified sender in Mailtrap)
+//
 // Optional:
-//   MAILTRAP_API_BASE=https://send.api.mailtrap.io   (default already set)
+//   MAILTRAP_API_BASE=https://send.api.mailtrap.io
 
 const MAILTRAP_API_BASE = (process.env.MAILTRAP_API_BASE || "https://send.api.mailtrap.io").replace(/\/$/, "");
 const MAILTRAP_API_TOKEN = process.env.MAILTRAP_API_TOKEN || "";
-const FROM = process.env.SMTP_FROM || "Saka360 <no-reply@saka360.com>";
+const FROM_RAW = process.env.SMTP_FROM || "Saka360 <no-reply@saka360.com>";
+
+// Parse "Name <email@domain>" or "email@domain" into { email, name? }
+function parseAddress(input) {
+  if (!input) return null;
+  if (typeof input === "object" && input.email) {
+    // already an object {email,name?}
+    return { email: String(input.email), ...(input.name ? { name: String(input.name) } : {}) };
+  }
+  const s = String(input).trim();
+  const m = s.match(/^(.+?)\s*<([^>]+)>$/); // Name <email>
+  if (m) {
+    const name = m[1].trim();
+    const email = m[2].trim();
+    return { email, ...(name ? { name } : {}) };
+  }
+  // just an email
+  return { email: s };
+}
+
+// Normalize recipients: string | object | array -> [{email,name?}, ...]
+function normalizeRecipients(to) {
+  if (!to) throw new Error("Missing 'to'");
+  if (Array.isArray(to)) return to.map(parseAddress).filter(Boolean);
+  return [parseAddress(to)];
+}
 
 function assertConfigured() {
   if (!MAILTRAP_API_TOKEN) {
     throw new Error("MAILTRAP_API_TOKEN missing (Mailtrap Email Sending → API → Tokens).");
   }
-  if (!FROM) {
-    throw new Error("SMTP_FROM missing (e.g., 'Saka360 <no-reply@saka360.com>').");
+  const fromObj = parseAddress(FROM_RAW);
+  if (!fromObj?.email) {
+    throw new Error("SMTP_FROM invalid. Use format like: Saka360 <no-reply@saka360.com>");
   }
 }
 
-/**
- * verifySmtp() kept for compatibility with existing routes.
- * In HTTP mode we just check config is present and do a lightweight call.
- */
 async function verifySmtp() {
   try {
     assertConfigured();
-    // Do a tiny no-op: Mailtrap doesn't provide a ping endpoint for Send API,
-    // so we just return true if token is present.
+    // No ping endpoint; if token + from parse OK, consider verified.
     return true;
   } catch (e) {
     console.error("[mailer] verify failed:", e.message);
@@ -40,38 +62,51 @@ async function verifySmtp() {
 
 /**
  * sendEmail(to, subject, html, text?)
- * Uses Mailtrap Send API (HTTP)
+ * - `to`: string | {email,name?} | Array of those
+ * - `subject`: string
+ * - `html`: string
+ * - `text`: string (optional)
  */
 async function sendEmail(to, subject, html, text) {
   assertConfigured();
 
+  const from = parseAddress(FROM_RAW);
+  const toList = normalizeRecipients(to);
+
   const url = `${MAILTRAP_API_BASE}/api/send`;
   const payload = {
-    from: FROM,
-    to: [{ email: to }],
+    from,                 // { email, name? }
+    to: toList,           // [ { email, name? }, ... ]
     subject,
     html,
     ...(text ? { text } : {}),
     category: "saka360",
   };
 
-  // Node 18+/20+ has global fetch; no dependency required.
   const res = await fetch(url, {
     method: "POST",
     headers: {
-      "Api-Token": MAILTRAP_API_TOKEN,   // <— important header name
+      "Api-Token": MAILTRAP_API_TOKEN,   // IMPORTANT header name
       "Content-Type": "application/json",
     },
     body: JSON.stringify(payload),
   });
 
+  // Parse body for better error messages
+  let bodyText = "";
+  try { bodyText = await res.text(); } catch {}
+
   if (!res.ok) {
-    const body = await res.text().catch(() => "");
-    throw new Error(`Mailtrap API failed ${res.status}: ${body}`);
+    throw new Error(`Mailtrap API failed ${res.status}: ${bodyText || "<no body>"}`);
   }
 
-  // Mailtrap returns JSON; but we don’t need the full payload for now.
-  return { messageId: "api-mailtrap" };
+  // Optionally parse JSON if you want the id:
+  try {
+    const json = bodyText ? JSON.parse(bodyText) : {};
+    return { messageId: json?.message_ids?.[0] || "api-mailtrap" };
+  } catch {
+    return { messageId: "api-mailtrap" };
+  }
 }
 
 module.exports = { verifySmtp, sendEmail };
