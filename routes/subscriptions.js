@@ -1,87 +1,91 @@
 // routes/subscriptions.js
 const express = require("express");
 const router = express.Router();
-const { Pool } = require("pg");
 
-// Fallback pool (only used if req.app.get('pool') is missing)
-let fallbackPool = null;
 function getPool(req) {
-  const appPool = req.app && req.app.get && req.app.get("pool");
-  if (appPool) return appPool;
-  if (!fallbackPool) {
-    fallbackPool = new Pool({ connectionString: process.env.DATABASE_URL });
-    console.warn("[subscriptions] Using fallback pg Pool (app pool not set).");
-  }
-  return fallbackPool;
+  return req.app.get("pool");
 }
 
-// GET /api/subscriptions/plans
+function toCode(row) {
+  // Prefer explicit codes if present; else derive a stable code
+  if (row.code) return row.code;
+  if (row.plan_code) return row.plan_code;
+  if (row.slug) return String(row.slug).toUpperCase();
+  if (row.name) return String(row.name).toUpperCase().replace(/\s+/g, "_");
+  return `PLAN_${row.id || "UNKNOWN"}`;
+}
+
+function toFeatures(row, cols) {
+  if (cols.has("features_json") && row.features_json) return row.features_json;
+  if (cols.has("features") && row.features) {
+    // could be json or text
+    try {
+      const parsed = typeof row.features === "string" ? JSON.parse(row.features) : row.features;
+      if (Array.isArray(parsed)) return parsed;
+    } catch (_) {
+      /* fallthrough */
+    }
+    // fallback: comma-separated string -> array
+    if (typeof row.features === "string") {
+      return row.features.split(",").map(s => s.trim()).filter(Boolean);
+    }
+  }
+  return [];
+}
+
+function toPriceCents(row, cols) {
+  if (cols.has("price_cents") && row.price_cents != null) return Number(row.price_cents);
+  if (cols.has("price_amount") && row.price_amount != null) {
+    const n = Number(row.price_amount);
+    if (!Number.isNaN(n)) return Math.round(n * 100);
+  }
+  return 0;
+}
+
+function toCurrency(row, cols) {
+  return row.currency || row.price_currency || "USD";
+}
+
 router.get("/plans", async (req, res) => {
   try {
     const pool = getPool(req);
+    if (!pool) return res.status(500).json({ error: "DB not attached" });
 
-    // Your DB has a legacy shape; this normalizes to the API we want.
-    // If the new columns (code, price_cents, currency, is_active) exist, use them.
-    // Otherwise, compute from legacy columns.
-    const hasCols = await pool.query(`
-      SELECT column_name
-      FROM information_schema.columns
-      WHERE table_schema='public' AND table_name='subscription_plans'
-    `);
+    // detect columns
+    const colQ = await pool.query(
+      `SELECT column_name
+         FROM information_schema.columns
+        WHERE table_schema='public' AND table_name='subscription_plans'`
+    );
+    const cols = new Set(colQ.rows.map(r => r.column_name));
 
-    const cols = new Set(hasCols.rows.map(r => r.column_name));
-    const selectSQL = cols.has("code")
-      ? `
-        SELECT
-          code,
-          name,
-          price_cents,
-          currency,
-          COALESCE(features::jsonb, '[]'::jsonb) AS features,
-          COALESCE(is_active, TRUE)              AS is_active
-        FROM public.subscription_plans
-        ORDER BY price_cents NULLS LAST, name
-      `
-      : `
-        SELECT
-          -- Synthesize a code from the row (fallback)
-          CONCAT('LEGACY_', id::text) AS code,
-          name,
-          -- Compute price_cents if you have legacy price_amount (numeric)
-          COALESCE( (price_amount * 100)::int, 0 ) AS price_cents,
-          COALESCE(price_currency, 'USD')         AS currency,
-          -- Legacy "features" is text; present an empty array if not JSON
-          '[]'::jsonb                              AS features,
-          TRUE                                     AS is_active
-        FROM public.subscription_plans
-        ORDER BY (price_amount IS NULL) ASC, price_amount, name
-      `;
+    // load rows (generic)
+    const rowsQ = await pool.query(
+      `SELECT * FROM public.subscription_plans`
+    );
 
-    const out = await pool.query(selectSQL);
-    res.json({ plans: out.rows });
-  } catch (err) {
-    console.error("subscriptions.plans error:", err);
+    // normalize
+    const normalized = rowsQ.rows.map(r => ({
+      code: toCode(r),
+      name: r.name || "Plan",
+      price_cents: toPriceCents(r, cols),
+      currency: toCurrency(r, cols),
+      is_active: (cols.has("is_active") ? !!r.is_active : true),
+      features: toFeatures(r, cols),
+      paystack_plan_code: cols.has("paystack_plan_code") ? (r.paystack_plan_code || null) : null,
+      sort: (cols.has("sort_order") ? (r.sort_order || 0) : (toPriceCents(r, cols) || 0))
+    }));
+
+    // sort by price or sort_order
+    normalized.sort((a, b) => a.sort - b.sort);
+
+    // drop helper property
+    normalized.forEach(p => delete p.sort);
+
+    res.json({ plans: normalized });
+  } catch (e) {
+    console.error("subscriptions.plans error:", e);
     res.status(500).json({ error: "Server error" });
-  }
-});
-
-// GET /api/subscriptions/diag/columns
-router.get("/diag/columns", async (req, res) => {
-  try {
-    const pool = getPool(req);
-    const r = await pool.query(`
-      SELECT column_name, data_type
-      FROM information_schema.columns
-      WHERE table_schema='public' AND table_name='subscription_plans'
-      ORDER BY ordinal_position
-    `);
-    res.json({ table: "public.subscription_plans", columns: r.rows });
-  } catch (err) {
-    res.status(500).json({
-      error: "Server error",
-      detail: process.env.DEBUG_MODE === "1" ? err.message : undefined,
-      path: "/api/subscriptions/diag/columns"
-    });
   }
 });
 

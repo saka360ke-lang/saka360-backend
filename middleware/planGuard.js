@@ -5,19 +5,19 @@ async function getUserPlan(pool, userId) {
     `SELECT us.plan_code
        FROM public.user_subscriptions us
       WHERE us.user_id=$1 AND us.status='active'
-      ORDER BY us.renewed_at DESC
+      ORDER BY COALESCE(us.renewed_at, us.started_at) DESC
       LIMIT 1`,
     [userId]
   );
-  return r.rows[0]?.plan_code || 'FREE';
+  return r.rows[0]?.plan_code || "FREE";
 }
 
 function rulesFor(planCode) {
   switch (planCode) {
-    case "FLEET_PRO": return { maxVehicles: 9999, docsEnabled: true, whatsappReminders: true };
-    case "PREMIUM" :  return { maxVehicles: 10,   docsEnabled: true,  whatsappReminders: true };
-    case "BASIC"   :  return { maxVehicles: 3,    docsEnabled: true,  whatsappReminders: true };
-    default        :  return { maxVehicles: 1,    docsEnabled: false, whatsappReminders: false }; // FREE
+    case "FLEET_PRO": return { maxVehicles: 9999, docsEnabled: true,  whatsappReminders: true };
+    case "PREMIUM":   return { maxVehicles: 10,   docsEnabled: true,  whatsappReminders: true };
+    case "BASIC":     return { maxVehicles: 3,    docsEnabled: true,  whatsappReminders: true };
+    default:          return { maxVehicles: 1,    docsEnabled: false, whatsappReminders: false }; // FREE
   }
 }
 
@@ -32,7 +32,10 @@ function planGuard(opts = {}) {
       const r = { ...rulesFor(planCode), ...opts };
 
       if (req.enforceMaxVehicles && typeof r.maxVehicles === "number") {
-        const q = await pool.query(`SELECT COUNT(*)::int AS c FROM public.vehicles WHERE user_id=$1`, [userId]);
+        const q = await pool.query(
+          `SELECT COUNT(*)::int AS c FROM public.vehicles WHERE user_id=$1`,
+          [userId]
+        );
         const count = q.rows[0]?.c || 0;
         if (count >= r.maxVehicles) {
           return res.status(403).json({ error: `Vehicle limit reached for your ${planCode} plan` });
@@ -52,4 +55,4 @@ function planGuard(opts = {}) {
   };
 }
 
-module.exports = { planGuard };
+module.exports = { planGuard, rulesFor, getUserPlan };

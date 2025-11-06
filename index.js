@@ -219,6 +219,10 @@ app.use("/api", testEmailRoutes);
 const uploadsRoutes = require("./routes/uploads"); // Router (we’ll paste guarded version below)
 app.use("/api/uploads", uploadsRoutes);
 
+const billingRoutes = require("./routes/billing"); // NEW
+app.use("/api/billing", billingRoutes);
+
+
 // Optional/defensive dynamic mounts
 let vehiclesRoutes = null;
 try { vehiclesRoutes = require("./routes/vehicles"); } catch (_) {}
