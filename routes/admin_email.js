@@ -2,42 +2,66 @@
 const express = require("express");
 const router = express.Router();
 const path = require("path");
+const fs = require("fs");
 const { sendMailHttp, renderTemplate } = require("../utils/mailer_https");
+
+// Version flag so we can verify on /_diag
+const ADMIN_EMAIL_ROUTE_VERSION = "v2-templates-aliases-2025-11-06";
 
 const TEMPLATE_DIR = process.env.TEMPLATE_DIR || "templates";
 
-// helpers
-function asString(x) {
+// ---- helpers ----
+function s(x) {
   if (x === undefined || x === null) return undefined;
   return String(x);
 }
-function firstNonEmpty(...vals) {
+function first(...vals) {
   for (const v of vals) {
     if (v !== undefined && v !== null && String(v).trim() !== "") return v;
   }
   return undefined;
 }
-function parseUsdToCents(v) {
+function usdToCents(v) {
   if (v === undefined || v === null || v === "") return undefined;
   if (typeof v === "number") return Math.round(v * 100);
   const n = Number(v);
   if (Number.isFinite(n)) return Math.round(n * 100);
   return undefined;
 }
+function toInt(x) {
+  const n = Number(x);
+  return Number.isFinite(n) ? n : undefined;
+}
 
-// -----------------------------
+// ---- DIAG: confirm correct file + templates are present ----
+router.get("/_diag", (req, res) => {
+  const files = [
+    "emails/verification.hbs",
+    "emails/subscription_invoice.hbs",
+    "emails/affiliate_payout_receipt.hbs",
+    "emails/monthly_report_delivery.hbs",
+  ];
+  const exists = files.map(f => ({
+    file: f,
+    path: path.join(TEMPLATE_DIR, f),
+    exists: fs.existsSync(path.join(TEMPLATE_DIR, f))
+  }));
+  return res.json({
+    ok: true,
+    version: ADMIN_EMAIL_ROUTE_VERSION,
+    template_dir: TEMPLATE_DIR,
+    templates: exists
+  });
+});
+
 // 1) Account verification
-// Accepts:
-//   to (required)
-//   name (optional)
-//   verification_link  OR verifyUrl (required)
-// -----------------------------
+// Accepts: to (required), name, verification_link OR verifyUrl (required)
 router.post("/verification", async (req, res) => {
   try {
     const b = req.body || {};
-    const to = asString(b.to);
-    const name = asString(b.name) || "there";
-    const verification_link = asString(firstNonEmpty(b.verification_link, b.verifyUrl));
+    const to = s(b.to);
+    const name = s(b.name) || "there";
+    const verification_link = s(first(b.verification_link, b.verifyUrl));
 
     if (!to || !verification_link) {
       return res.status(400).json({ error: "Missing 'to' or 'verification_link'" });
@@ -47,8 +71,8 @@ router.post("/verification", async (req, res) => {
       path.join(TEMPLATE_DIR, "emails/verification.hbs"),
       { name, verification_link }
     );
-
-    const text = `Hi ${name},
+    const text =
+`Hi ${name},
 
 Please verify your Saka360 account:
 
@@ -63,7 +87,6 @@ If you didn’t request this, you can ignore this message.
       html,
       text
     });
-
     res.json({ ok: true, sent });
   } catch (err) {
     console.error("admin_email.verification error:", err);
@@ -71,10 +94,9 @@ If you didn’t request this, you can ignore this message.
   }
 });
 
-// -----------------------------
 // 2) Subscription invoice
-// Accepts canonical or friendly aliases:
-//   to (required)
+// Accepts aliases:
+//   to
 //   plan_name | planName
 //   plan_code | planCode
 //   period_start | periodStart | invoiceDate
@@ -83,29 +105,27 @@ If you didn’t request this, you can ignore this message.
 //   invoice_number | invoiceNumber
 //   invoice_date   | invoiceDate
 //   due_date       | dueDate
-// -----------------------------
 router.post("/invoice", async (req, res) => {
   try {
     const b = req.body || {};
-    const to = asString(b.to);
+    const to = s(b.to);
 
-    const plan_name = asString(firstNonEmpty(b.plan_name, b.planName));
-    const plan_code = asString(firstNonEmpty(b.plan_code, b.planCode));
-
-    const period_start = asString(firstNonEmpty(b.period_start, b.periodStart, b.invoiceDate));
-    const period_end   = asString(firstNonEmpty(b.period_end, b.periodEnd, b.dueDate));
+    const plan_name = s(first(b.plan_name, b.planName));
+    const plan_code = s(first(b.plan_code, b.planCode));
+    const period_start = s(first(b.period_start, b.periodStart, b.invoiceDate));
+    const period_end   = s(first(b.period_end, b.periodEnd, b.dueDate));
 
     let amount_cents = b.amount_cents ?? b.amountCents;
     if (amount_cents === undefined) {
-      amount_cents = parseUsdToCents(firstNonEmpty(b.amountUSD, b.amountUsd));
+      amount_cents = usdToCents(first(b.amountUSD, b.amountUsd));
     }
     if (typeof amount_cents === "string" && /^\d+$/.test(amount_cents)) {
       amount_cents = Number(amount_cents);
     }
 
-    const invoice_number = asString(firstNonEmpty(b.invoice_number, b.invoiceNumber));
-    const invoice_date   = asString(firstNonEmpty(b.invoice_date, b.invoiceDate)) || period_start;
-    const due_date       = asString(firstNonEmpty(b.due_date, b.dueDate)) || period_end;
+    const invoice_number = s(first(b.invoice_number, b.invoiceNumber)) || "-";
+    const invoice_date   = s(first(b.invoice_date, b.invoiceDate)) || period_start;
+    const due_date       = s(first(b.due_date, b.dueDate)) || period_end;
 
     if (!to || !plan_name || !plan_code || !period_start || !period_end) {
       return res.status(400).json({
@@ -125,19 +145,18 @@ router.post("/invoice", async (req, res) => {
         period_end,
         amount_cents: Number(amount_cents),
         amount_usd: (Number(amount_cents) / 100).toFixed(2),
-        invoice_number: invoice_number || "-",
+        invoice_number,
         invoice_date,
         due_date
       }
     );
-
     const text =
 `Your Saka360 subscription invoice
 
 Plan: ${plan_name} (${plan_code})
 Period: ${period_start} → ${period_end}
 Amount: $${(Number(amount_cents)/100).toFixed(2)}
-Invoice: ${invoice_number || "-"}
+Invoice: ${invoice_number}
 
 Thank you for your business.`;
 
@@ -147,7 +166,6 @@ Thank you for your business.`;
       html,
       text
     });
-
     res.json({ ok: true, sent });
   } catch (err) {
     console.error("admin_email.invoice error:", err);
@@ -155,26 +173,24 @@ Thank you for your business.`;
   }
 });
 
-// -----------------------------
-// 3) Affiliate payout receipt
+// 3) Affiliate payout
 // Accepts: to, affiliate_name|affiliateName, period_start|periodStart, period_end|periodEnd,
 //          amount_cents|amountCents|amountUSD, payout_id|payoutId
-// -----------------------------
 router.post("/affiliate-payout", async (req, res) => {
   try {
     const b = req.body || {};
-    const to = asString(b.to);
-    const affiliate_name = asString(firstNonEmpty(b.affiliate_name, b.affiliateName)) || "Affiliate";
-    const period_start = asString(firstNonEmpty(b.period_start, b.periodStart));
-    const period_end   = asString(firstNonEmpty(b.period_end, b.periodEnd));
+    const to = s(b.to);
+    const affiliate_name = s(first(b.affiliate_name, b.affiliateName)) || "Affiliate";
+    const period_start = s(first(b.period_start, b.periodStart));
+    const period_end   = s(first(b.period_end, b.periodEnd));
 
     let amount_cents = b.amount_cents ?? b.amountCents;
     if (amount_cents === undefined) {
-      amount_cents = parseUsdToCents(firstNonEmpty(b.amountUSD, b.amountUsd));
+      amount_cents = usdToCents(first(b.amountUSD, b.amountUsd));
     }
     if (typeof amount_cents === "string" && /^\d+$/.test(amount_cents)) amount_cents = Number(amount_cents);
 
-    const payout_id = asString(firstNonEmpty(b.payout_id, b.payoutId)) || "-";
+    const payout_id = s(first(b.payout_id, b.payoutId)) || "-";
 
     if (!to || !period_start || !period_end || amount_cents === undefined) {
       return res.status(400).json({ error: "Missing required fields: to, period_start, period_end, amount" });
@@ -191,7 +207,6 @@ router.post("/affiliate-payout", async (req, res) => {
         payout_id
       }
     );
-
     const text =
 `Affiliate Payout Receipt
 
@@ -208,7 +223,6 @@ Thank you for partnering with Saka360.`;
       html,
       text
     });
-
     res.json({ ok: true, sent });
   } catch (err) {
     console.error("admin_email.affiliate-payout error:", err);
@@ -216,18 +230,16 @@ Thank you for partnering with Saka360.`;
   }
 });
 
-// -----------------------------
 // 4) Monthly report delivery
 // Accepts: to, month_label|monthLabel, download_url|downloadUrl, vehicle_count|vehicleCount, document_count|documentCount
-// -----------------------------
 router.post("/monthly-report", async (req, res) => {
   try {
     const b = req.body || {};
-    const to = asString(b.to);
-    const month_label = asString(firstNonEmpty(b.month_label, b.monthLabel)) || "This month";
-    const download_url = asString(firstNonEmpty(b.download_url, b.downloadUrl));
-    const vehicle_count = Number(firstNonEmpty(b.vehicle_count, b.vehicleCount, 0));
-    const document_count = Number(firstNonEmpty(b.document_count, b.documentCount, 0));
+    const to = s(b.to);
+    const month_label = s(first(b.month_label, b.monthLabel)) || "This month";
+    const download_url = s(first(b.download_url, b.downloadUrl));
+    const vehicle_count = toInt(first(b.vehicle_count, b.vehicleCount, 0)) ?? 0;
+    const document_count = toInt(first(b.document_count, b.documentCount, 0)) ?? 0;
 
     if (!to || !download_url) {
       return res.status(400).json({ error: "Missing 'to' or 'download_url/downloadUrl'" });
@@ -235,22 +247,15 @@ router.post("/monthly-report", async (req, res) => {
 
     const html = await renderTemplate(
       path.join(TEMPLATE_DIR, "emails/monthly_report_delivery.hbs"),
-      {
-        month_label,
-        download_url,
-        vehicle_count: Number.isFinite(vehicle_count) ? vehicle_count : 0,
-        document_count: Number.isFinite(document_count) ? document_count : 0
-      }
+      { month_label, download_url, vehicle_count, document_count }
     );
-
     const text =
 `Your Saka360 Monthly Report — ${month_label}
 
-Vehicles: ${Number.isFinite(vehicle_count) ? vehicle_count : 0}
-Documents: ${Number.isFinite(document_count) ? document_count : 0}
+Vehicles: ${vehicle_count}
+Documents: ${document_count}
 
-Download: ${download_url}
-`;
+Download: ${download_url}`;
 
     const sent = await sendMailHttp({
       to,
@@ -258,7 +263,6 @@ Download: ${download_url}
       html,
       text
     });
-
     res.json({ ok: true, sent });
   } catch (err) {
     console.error("admin_email.monthly-report error:", err);
