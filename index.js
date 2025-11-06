@@ -4,22 +4,12 @@ require("dotenv").config();
 const express = require("express");
 const app = express();
 
-// Trust proxy (Render/Heroku) so rate-limit & IPs behave
+// Trust proxy (Render/Heroku)
 app.set("trust proxy", 1);
 
-// ---------------------------
-// SPECIAL: Body parsers
-// We must NOT parse JSON for Paystack webhook so we can verify signature.
-// ---------------------------
-app.use((req, res, next) => {
-  // Skip normal parsers for the exact webhook path; the route will use express.raw()
-  if (req.path === "/api/payments/paystack/webhook") return next();
-
-  // Normal JSON + urlencoded for everything else
-  express.json()(req, res, () => {
-    express.urlencoded({ extended: false })(req, res, next);
-  });
-});
+// ---------- Body parsers (global) ----------
+app.use(express.json());
+app.use(express.urlencoded({ extended: false })); // twilio form posts
 
 // Return JSON for malformed JSON bodies instead of HTML
 app.use((err, req, res, next) => {
@@ -29,36 +19,29 @@ app.use((err, req, res, next) => {
   next(err);
 });
 
-// ---------------------------
-// HTTP request logger
-// ---------------------------
+// ---------- Logging ----------
 const morgan = require("morgan");
 app.use(morgan("tiny"));
 
-/* -----------------------------
- * 0) Minimal health first
- * ----------------------------- */
-app.get("/api/health", (_req, res) => {
-  res.status(200).json({ status: "OK" });
-});
+// ---------- Health ----------
+app.get("/api/health", (_req, res) => res.status(200).json({ status: "OK" }));
 
-// Security & safety middleware
+// ---------- Security ----------
 const cors = require("cors");
 const helmet = require("helmet");
 const rateLimit = require("express-rate-limit");
 
-// Helmet (secure headers)
 app.use(helmet());
 
-// Lock CORS to specific origins via env ALLOWED_ORIGINS (comma-separated)
 const ALLOWED = (process.env.ALLOWED_ORIGINS || "")
   .split(",")
-  .map((s) => s.trim())
+  .map(s => s.trim())
   .filter(Boolean);
 
 app.use(
   cors({
     origin(origin, cb) {
+      // allow Postman/curl (no origin) or explicitly allowed
       if (!origin || ALLOWED.includes(origin)) return cb(null, true);
       return cb(new Error(`CORS blocked for origin: ${origin}`));
     },
@@ -68,7 +51,6 @@ app.use(
   })
 );
 
-// Rate limiting
 app.use(
   rateLimit({
     windowMs: 15 * 60 * 1000,
@@ -78,16 +60,11 @@ app.use(
   })
 );
 
-/* -----------------------------
- * 1) Database (shared pool)
- * ----------------------------- */
+// ---------- Database ----------
 const { Pool } = require("pg");
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
-
-// expose pool to function-style route modules via app.get("pool")
 app.set("pool", pool);
 
-// Optional DB health
 app.get("/api/health/db", async (_req, res) => {
   try {
     const r = await pool.query("SELECT NOW()");
@@ -96,19 +73,14 @@ app.get("/api/health/db", async (_req, res) => {
     res.status(500).json({ db: "error", error: e.message });
   }
 });
-
-// Quick diag: confirm pool attached
 app.get("/api/diag/pool", (req, res) => {
   res.json({ pool_attached: !!app.get("pool") });
 });
 
-/* ------------------------------------------------
- * 2) Infra helpers (Mailer + Twilio test endpoints)
- * ------------------------------------------------ */
+// ---------- Infra helpers ----------
 const { verifySmtp, sendEmail } = require("./utils/mailer");
 const { runExpiryCheckCore } = require("./utils/reminders");
 
-// Twilio (for test WhatsApp)
 const twilio = require("twilio");
 const TWILIO_FROM = process.env.TWILIO_WHATSAPP_FROM; // e.g. +14155238886
 function getTwilioClient() {
@@ -131,11 +103,10 @@ async function sendWhatsAppText(toE164, body) {
     body,
   });
 }
-// Safe wrapper for cron usage (never throws out)
 function sendWhatsAppTextSafe(to, body) {
-  return sendWhatsAppText(to, body).catch((err) => {
-    console.error("sendWhatsAppTextSafe error:", err.message);
-  });
+  return sendWhatsAppText(to, body).catch(err =>
+    console.error("sendWhatsAppTextSafe error:", err.message)
+  );
 }
 
 const { authenticateToken, adminOnly } = require("./middleware/auth");
@@ -162,108 +133,140 @@ app.post("/api/test-whatsapp", authenticateToken, adminOnly, async (req, res) =>
   }
 });
 
-/* -----------------------
- * 3) Cron (reminders)
- * ----------------------- */
+// ---------- Cron (reminders) ----------
 let cron = null;
-try {
-  cron = require("node-cron");
-} catch (e) {
+try { cron = require("node-cron"); } catch (e) {
   console.error("[cron] node-cron not available; skipping schedules:", e.message);
 }
 
-// Expose the real reminder runner to routes (e.g., /api/reminders/run-check)
 app.set("runExpiryCheck", () =>
   runExpiryCheckCore(pool, { sendEmail, sendWhatsAppTextSafe })
 );
 
-// Only schedule if cron loaded
 if (cron) {
   cron.schedule(
     "0 8 * * *",
-    () =>
-      runExpiryCheckCore(pool, { sendEmail, sendWhatsAppTextSafe }).catch((e) =>
-        console.error("runExpiryCheckCore error:", e)
-      ),
+    () => runExpiryCheckCore(pool, { sendEmail, sendWhatsAppTextSafe })
+            .catch(e => console.error("runExpiryCheckCore error:", e)),
     { timezone: "Africa/Nairobi" }
   );
 }
 
-/* -------------------------------------------
- * 4) Mount your real app routes (consistent)
- * -------------------------------------------
- * Function-style routes (export a function(app)) → CALL them.
- * Router-style routes (export Router) → app.use(...).
- */
+// ----------------------------------------------------
+// Safe mount helpers: prevent "reading 'apply' of undefined"
+// ----------------------------------------------------
+function safeUse(path, mod) {
+  try {
+    if (!mod) {
+      console.warn(`[mount-skip] ${path}: module is undefined`);
+      return;
+    }
+    // If the module exported a Router directly:
+    if (typeof mod === "function" && mod.name === "router") {
+      app.use(path, mod);
+      console.log(`[mounted] ${path} (router)`);
+      return;
+    }
+    // If it exported a function that returns a Router:
+    if (typeof mod === "function" && !mod.name) {
+      const maybe = mod();
+      if (maybe && typeof maybe === "function" && maybe.name === "router") {
+        app.use(path, maybe);
+        console.log(`[mounted] ${path} (factory->router)`);
+        return;
+      }
+    }
+    // If it exported an object that *is* a Router:
+    if (mod && typeof mod === "function") {
+      app.use(path, mod);
+      console.log(`[mounted] ${path} (router-like)`);
+      return;
+    }
+    console.warn(`[mount-skip] ${path}: not a Router/function export`);
+  } catch (e) {
+    console.error(`[mount-error] ${path}:`, e.message);
+  }
+}
 
-// A) function-style routes (CALL them)
-require("./routes/users")(app);
-require("./routes/fuel")(app);
-require("./routes/service")(app);
-require("./routes/documents")(app);
-require("./routes/reminders")(app);
-require("./routes/reports")(app);
-require("./routes/whatsapp")(app);     // /api/webhooks/whatsapp (TwiML)
-require("./routes/payments")(app);     // <-- includes /api/payments/paystack/webhook (raw)
+function safeCallMount(mounter, label) {
+  try {
+    if (typeof mounter === "function") {
+      mounter(app);
+      console.log(`[mounted] ${label} (function-style)`);
+    } else {
+      console.warn(`[mount-skip] ${label}: not a function (got ${typeof mounter})`);
+    }
+  } catch (e) {
+    console.error(`[mount-error] ${label}:`, e.message);
+  }
+}
 
-// B) router-style routes
-const chatRoutes = require("./routes/chat");     // exports Router
-app.use("/api", chatRoutes);
+// -------------------------------------------
+// 4) Mount your real app routes (consistent)
+// -------------------------------------------
+// A) function-style routes (export a function(app)) → CALL them.
+safeCallMount(require("./routes/users"), "users");
+safeCallMount(require("./routes/fuel"), "fuel");
+safeCallMount(require("./routes/service"), "service");
+safeCallMount(require("./routes/documents"), "documents");
+safeCallMount(require("./routes/reminders"), "reminders");
+safeCallMount(require("./routes/reports"), "reports");
+safeCallMount(require("./routes/whatsapp"), "whatsapp"); // /api/webhooks/whatsapp
 
-const subscriptionsRoutes = require("./routes/subscriptions"); // exports Router
-app.use("/api/subscriptions", subscriptionsRoutes);
+// B) router-style routes (export an Express Router) → app.use(...)
+const chatRoutes = require("./routes/chat");               // Router (reads pool via req.app.get('pool'))
+safeUse("/api", chatRoutes);
 
-const testEmailRoutes = require("./routes/testEmail"); // Router
-app.use("/api", testEmailRoutes);
+const subscriptionsRoutes = require("./routes/subscriptions"); // Router
+safeUse("/api/subscriptions", subscriptionsRoutes);
 
-const uploadsRoutes = require("./routes/uploads"); // Router (we’ll paste guarded version below)
-app.use("/api/uploads", uploadsRoutes);
+const billingRoutes = require("./routes/billing");             // Router
+safeUse("/api/billing", billingRoutes);
 
-const billingRoutes = require("./routes/billing"); // NEW
-app.use("/api/billing", billingRoutes);
+const testEmailRoutes = require("./routes/testEmail");         // Router
+safeUse("/api", testEmailRoutes);
 
-const paymentsRoutes = require("./routes/payments");
-app.use("/api/payments", paymentsRoutes);
+const uploadsRoutes = require("./routes/uploads");             // Router
+safeUse("/api/uploads", uploadsRoutes);
 
+const adminEmailRoutes = require("./routes/adminEmails");      // Router
+safeUse("/api/admin/email", adminEmailRoutes);
 
-// Optional/defensive dynamic mounts
-let vehiclesRoutes = null;
-try { vehiclesRoutes = require("./routes/vehicles"); } catch (_) {}
-if (vehiclesRoutes) app.use("/api/vehicles", vehiclesRoutes);
+const paymentsRoutes = require("./routes/payments");           // Router (Paystack)
+safeUse("/api/payments", paymentsRoutes);
 
-let affiliatesRoutes = null;
-try { affiliatesRoutes = require("./routes/affiliates"); } catch (_) {}
-if (affiliatesRoutes) app.use("/api/affiliates", affiliatesRoutes);
-
-// Admin email template test routes (Router)
+// Optional dynamic mounts
 try {
-  const adminEmailRoutes = require("./routes/adminEmails");
-  app.use("/api/admin/email", adminEmailRoutes);
-} catch (_) { /* ignore if missing */ }
+  const vehiclesRoutes = require("./routes/vehicles");         // Router
+  safeUse("/api/vehicles", vehiclesRoutes);
+} catch (_) {}
 
-/* -----------------------
- * 5) 404 fallback
- * ----------------------- */
+try {
+  const affiliatesRoutes = require("./routes/affiliates");     // Router
+  safeUse("/api/affiliates", affiliatesRoutes);
+} catch (_) {}
+
+try {
+  const optionalPaymentsFn = require("./routes/payments_fn");  // function-style alt (if you ever had one)
+  if (optionalPaymentsFn) safeCallMount(optionalPaymentsFn, "payments_fn");
+} catch (_) {}
+
+// ---------- 404 ----------
 app.use((req, res) => {
   res.status(404).json({ error: "Not found", path: req.originalUrl });
 });
 
-// Global JSON error handler (last middleware)
+// ---------- Global JSON error handler ----------
 app.use((err, req, res, next) => {
   console.error("[unhandled]", err);
   const status = err.status || 500;
-  res
-    .status(status)
-    .type("application/json")
-    .send({
-      error: status === 404 ? "Not found" : "Server error",
-      detail: process.env.DEBUG_MODE === "1" ? err?.message || String(err) : undefined,
-      path: req.originalUrl,
-    });
+  res.status(status).type("application/json").send({
+    error: status === 404 ? "Not found" : "Server error",
+    detail: process.env.DEBUG_MODE === "1" ? (err?.message || String(err)) : undefined,
+    path: req.originalUrl,
+  });
 });
 
-/* -----------------------
- * 6) Start server
- * ----------------------- */
+// ---------- Start ----------
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
