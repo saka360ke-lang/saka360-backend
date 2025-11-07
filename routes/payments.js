@@ -19,6 +19,11 @@ function norm(s = "") {
 /**
  * POST /api/payments/start
  * Body: { plan_code: "BASIC" }  // also accepts plan name e.g. "Basic", "Fleet Pro"
+ *
+ * Paystack expects KES as whole shillings (no cents). We:
+ *   - read your stored price in cents (price_cents)
+ *   - divide by 100 and round to the nearest KES integer
+ *   - send that integer to Paystack
  */
 router.post("/start", authenticateToken, async (req, res) => {
   try {
@@ -55,46 +60,60 @@ router.post("/start", authenticateToken, async (req, res) => {
       });
     }
 
-    // Amount must be a positive integer in the smallest unit (cents)
-    const amount = parseInt(plan.effective_cents, 10);
-    if (!Number.isFinite(amount) || amount <= 0) {
+    // Convert stored cents → whole KES integer (rounding)
+    const cents = parseInt(plan.effective_cents, 10);
+    if (!Number.isFinite(cents) || cents <= 0) {
       return res.status(400).json({
         error: "Plan has invalid amount",
         detail: { code: plan.code, name: plan.name, effective_cents: plan.effective_cents }
       });
     }
+    const amountKES = Math.round(cents / 100); // e.g. 50000 cents → 500 KES
 
-    // Currency: keep 'KES' for Kenya; if your Paystack business isn't enabled for KES,
-    // their API will complain — but "invalid_amount" almost always means amount<=0 or decimals.
+    if (amountKES <= 0) {
+      return res.status(400).json({
+        error: "Invalid plan amount after rounding",
+        detail: { code: plan.code, cents: plan.effective_cents }
+      });
+    }
+
     const currency = plan.effective_currency || "KES";
 
     // Fetch the user for email
-    const user = (await pool.query(`SELECT id, email, name FROM users WHERE id=$1`, [req.user.id])).rows[0];
+    const user = (await pool.query(
+      `SELECT id, email, name FROM users WHERE id=$1`,
+      [req.user.id]
+    )).rows[0];
     if (!user) return res.status(401).json({ error: "User not found" });
 
-    const reference = `S360_${user.id}_${plan.code}_${Date.now()}`;
+    const reference = `S360_${user.id}_${plan.code || 'PLAN'}_${Date.now()}`;
     const payload = {
       email: user.email,
-      amount: amount,                   // integer, no decimals
-      currency: currency,               // 'KES'
+      amount: amountKES, // send clean integer KES amount to Paystack
+      currency: currency, // 'KES'
       reference,
-      callback_url: process.env.PAYSTACK_CALLBACK_URL || `${process.env.APP_BASE_URL || ""}/billing/thanks`,
-      metadata: { user_id: user.id, plan_code: plan.code, plan_name: plan.name },
+      callback_url:
+        process.env.PAYSTACK_CALLBACK_URL ||
+        `${process.env.APP_BASE_URL || ""}/billing/thanks`,
+      metadata: {
+        user_id: user.id,
+        plan_code: plan.code,
+        plan_name: plan.name,
+      },
     };
 
     const resp = await fetch("https://api.paystack.co/transaction/initialize", {
       method: "POST",
       headers: {
-        "Authorization": `Bearer ${process.env.PAYSTACK_SECRET_KEY}`,
+        Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify(payload),
     });
 
     const data = await resp.json();
-
     if (!data?.status) {
-      // Return payload diagnostic to help you debug amounts/currency quickly
+      // Return payload diagnostic to help debug amounts/currency quickly
       return res.status(400).json({
         error: "Paystack init failed",
         detail: data,
@@ -110,8 +129,9 @@ router.post("/start", authenticateToken, async (req, res) => {
       plan: {
         code: plan.code,
         name: plan.name,
-        price_cents: amount,
-        currency: currency
+        price_cents: cents,
+        currency: currency,
+        rounded_kes: amountKES
       }
     });
   } catch (e) {
@@ -176,18 +196,24 @@ router.get("/status", authenticateToken, async (req, res) => {
       [req.user.id]
     )).rows[0];
 
-    const planCode = sub?.plan_code || 'FREE';
+    const planCode = sub?.plan_code || "FREE";
 
     const plan = (await pool.query(
       `SELECT code, name,
               COALESCE(price_cents, (NULLIF(price_amount,0) * 100)::int, 0) AS price_cents,
               COALESCE(currency, price_currency, 'KES') AS currency,
               features
-       FROM subscription_plans WHERE code = $1`,
+       FROM subscription_plans WHERE UPPER(code) = UPPER($1)`,
       [planCode]
     )).rows[0];
 
-    const fallback = { code: 'FREE', name: 'Free', price_cents: 0, currency: 'KES', features: ['1 vehicle','basic logs'] };
+    const fallback = {
+      code: "FREE",
+      name: "Free",
+      price_cents: 0,
+      currency: "KES",
+      features: ["1 vehicle", "basic logs"],
+    };
     const effective = plan || fallback;
 
     const vehiclesCount = (await pool.query(
@@ -200,6 +226,7 @@ router.get("/status", authenticateToken, async (req, res) => {
       [req.user.id]
     )).rows[0]?.c || 0;
 
+    // Hard caps per plan (backend enforced elsewhere as well)
     const caps = {
       FREE:     { maxVehicles: 1,   docsEnabled: false, whatsappReminders: false },
       BASIC:    { maxVehicles: 3,   docsEnabled: true,  whatsappReminders: true  },
@@ -209,7 +236,7 @@ router.get("/status", authenticateToken, async (req, res) => {
 
     res.json({
       plan: { code: effective.code, ...caps[effective.code] },
-      usage: { vehicles: vehiclesCount, documents: documentsCount }
+      usage: { vehicles: vehiclesCount, documents: documentsCount },
     });
   } catch (e) {
     console.error("billing.status error:", e);
