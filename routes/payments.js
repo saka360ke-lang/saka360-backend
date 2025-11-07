@@ -12,16 +12,13 @@ function getPool(req) {
   return pool;
 }
 
-/**
- * Normalize a plan label for matching (remove non-alphanumerics, uppercase)
- */
 function norm(s = "") {
   return s.toString().toUpperCase().replace(/[^A-Z0-9]/g, "");
 }
 
 /**
  * POST /api/payments/start
- * Body: { plan_code: "BASIC" }   // can be name e.g. "Basic" too
+ * Body: { plan_code: "BASIC" }  // also accepts plan name e.g. "Basic", "Fleet Pro"
  */
 router.post("/start", authenticateToken, async (req, res) => {
   try {
@@ -30,9 +27,12 @@ router.post("/start", authenticateToken, async (req, res) => {
 
     const pool = getPool(req);
 
-    // Try match by code OR by name (both normalized)
+    // Match by code OR by normalized name
     const sql = `
-      SELECT code, name, price_cents, currency, is_active
+      SELECT code, name, price_cents, currency, is_active,
+             -- fallback to legacy columns if price_cents is missing/0
+             COALESCE(price_cents, (NULLIF(price_amount,0) * 100)::int, 0) AS effective_cents,
+             COALESCE(currency, price_currency, 'KES') AS effective_currency
       FROM subscription_plans
       WHERE
         UPPER(code) = UPPER($1)
@@ -44,22 +44,42 @@ router.post("/start", authenticateToken, async (req, res) => {
     if (!plan || !plan.is_active) {
       return res.status(400).json({ error: "Unknown or inactive plan_code" });
     }
-    if ((plan.currency || "KES") !== "KES") {
-      return res.status(400).json({ error: "Only KES plans are supported right now" });
+
+    // FREE plan -> nothing to charge
+    if (plan.code === "FREE") {
+      return res.json({
+        ok: true,
+        free: true,
+        message: "Free plan selected — no payment required.",
+        plan: { code: plan.code, name: plan.name }
+      });
     }
 
-    const u = (await pool.query(`SELECT id, email, name FROM users WHERE id=$1`, [req.user.id])).rows[0];
-    if (!u) return res.status(401).json({ error: "User not found" });
+    // Amount must be a positive integer in the smallest unit (cents)
+    const amount = parseInt(plan.effective_cents, 10);
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return res.status(400).json({
+        error: "Plan has invalid amount",
+        detail: { code: plan.code, name: plan.name, effective_cents: plan.effective_cents }
+      });
+    }
 
-    // If you want to take a card once via Paystack, keep this; if you decide to use another PSP later, you can swap here.
-    const reference = `S360_${req.user.id}_${plan.code}_${Date.now()}`;
+    // Currency: keep 'KES' for Kenya; if your Paystack business isn't enabled for KES,
+    // their API will complain — but "invalid_amount" almost always means amount<=0 or decimals.
+    const currency = plan.effective_currency || "KES";
+
+    // Fetch the user for email
+    const user = (await pool.query(`SELECT id, email, name FROM users WHERE id=$1`, [req.user.id])).rows[0];
+    if (!user) return res.status(401).json({ error: "User not found" });
+
+    const reference = `S360_${user.id}_${plan.code}_${Date.now()}`;
     const payload = {
-      email: u.email,
-      amount: plan.price_cents,              // KES cents
-      currency: "KES",
+      email: user.email,
+      amount: amount,                   // integer, no decimals
+      currency: currency,               // 'KES'
       reference,
       callback_url: process.env.PAYSTACK_CALLBACK_URL || `${process.env.APP_BASE_URL || ""}/billing/thanks`,
-      metadata: { user_id: req.user.id, plan_code: plan.code, plan_name: plan.name },
+      metadata: { user_id: user.id, plan_code: plan.code, plan_name: plan.name },
     };
 
     const resp = await fetch("https://api.paystack.co/transaction/initialize", {
@@ -72,8 +92,14 @@ router.post("/start", authenticateToken, async (req, res) => {
     });
 
     const data = await resp.json();
+
     if (!data?.status) {
-      return res.status(400).json({ error: "Paystack init failed", detail: data });
+      // Return payload diagnostic to help you debug amounts/currency quickly
+      return res.status(400).json({
+        error: "Paystack init failed",
+        detail: data,
+        debug_payload: payload
+      });
     }
 
     return res.json({
@@ -81,7 +107,12 @@ router.post("/start", authenticateToken, async (req, res) => {
       reference: data.data?.reference || reference,
       authorization_url: data.data?.authorization_url,
       access_code: data.data?.access_code,
-      plan: { code: plan.code, name: plan.name, price_cents: plan.price_cents, currency: plan.currency }
+      plan: {
+        code: plan.code,
+        name: plan.name,
+        price_cents: amount,
+        currency: currency
+      }
     });
   } catch (e) {
     console.error("payments.start error:", e);
@@ -90,7 +121,7 @@ router.post("/start", authenticateToken, async (req, res) => {
 });
 
 /**
- * POST /api/payments/webhook   (raw body required)
+ * POST /api/payments/webhook  (raw body required in index.js)
  */
 router.post("/webhook", express.raw({ type: "application/json" }), async (req, res) => {
   try {
@@ -110,7 +141,6 @@ router.post("/webhook", express.raw({ type: "application/json" }), async (req, r
     if (!user_id || !plan_code) return res.status(200).send("ok");
 
     const pool = getPool(req);
-
     await pool.query(
       `
       INSERT INTO user_subscriptions (user_id, plan_code, status, started_at, renewed_at, meta)
@@ -149,7 +179,10 @@ router.get("/status", authenticateToken, async (req, res) => {
     const planCode = sub?.plan_code || 'FREE';
 
     const plan = (await pool.query(
-      `SELECT code, name, price_cents, currency, features
+      `SELECT code, name,
+              COALESCE(price_cents, (NULLIF(price_amount,0) * 100)::int, 0) AS price_cents,
+              COALESCE(currency, price_currency, 'KES') AS currency,
+              features
        FROM subscription_plans WHERE code = $1`,
       [planCode]
     )).rows[0];
