@@ -16,6 +16,17 @@ function norm(s = "") {
   return s.toString().toUpperCase().replace(/[^A-Z0-9]/g, "");
 }
 
+// Paystack wants the smallest unit (NGN kobo, GHS pesewas, ZAR cents, USD cents, KES “cents”)
+// This helper converts a major unit integer (e.g., 500 KES) to minor units (50000)
+function toPaystackMinorUnits(currency, amountMajorInteger) {
+  const c = (currency || "KES").toUpperCase();
+  // currencies Paystack supports all use x100 minor units
+  const x100 = new Set(["NGN", "GHS", "ZAR", "USD", "KES"]);
+  const major = Math.round(Number(amountMajorInteger || 0));
+  if (!x100.has(c)) return major * 100; // safe default
+  return major * 100;
+}
+
 /**
  * POST /api/payments/start
  * Body: { plan_code: "BASIC" }  // also accepts plan name e.g. "Basic", "Fleet Pro"
@@ -52,7 +63,7 @@ router.post("/start", authenticateToken, async (req, res) => {
     }
 
     // FREE plan → nothing to charge
-    if (plan.code && plan.code.toUpperCase() === "FREE") {
+    if ((plan.code || "").toUpperCase() === "FREE") {
       return res.json({
         ok: true,
         free: true,
@@ -94,10 +105,14 @@ router.post("/start", authenticateToken, async (req, res) => {
     if (!user) return res.status(401).json({ error: "User not found" });
 
     const reference = `S360_${user.id}_${(plan.code || "PLAN").toUpperCase()}_${Date.now()}`;
+
+    // Convert to Paystack minor units (e.g., 500 KES -> 50000)
+    const amountMinor = toPaystackMinorUnits(currency, amountKES);
+
     const payload = {
       email: user.email,
-      amount: amountKES, // integer KES for Paystack
-      currency,
+      amount: amountMinor,              // integer, smallest unit required by Paystack
+      currency,                         // 'KES'
       reference,
       callback_url:
         process.env.PAYSTACK_CALLBACK_URL ||
@@ -131,8 +146,8 @@ router.post("/start", authenticateToken, async (req, res) => {
       plan: {
         code: plan.code,
         name: plan.name,
-        amount_kes: amountKES,
-        currency: currency
+        amount_kes: amountKES, // major unit you intended to charge
+        currency
       }
     });
   } catch (e) {
