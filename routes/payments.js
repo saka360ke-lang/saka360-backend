@@ -2,12 +2,10 @@
 const express = require("express");
 const crypto = require("crypto");
 const fetch = require("node-fetch");
+const { authenticateToken } = require("../middleware/auth");
 
 const router = express.Router();
 
-/**
- * Utility: get shared PG pool from app
- */
 function getPool(req) {
   const pool = req.app.get("pool");
   if (!pool) throw new Error("Pool not found on app; set app.set('pool', pool) in index.js");
@@ -15,55 +13,53 @@ function getPool(req) {
 }
 
 /**
- * Utility: require auth middleware (your existing one)
+ * Normalize a plan label for matching (remove non-alphanumerics, uppercase)
  */
-const { authenticateToken } = require("../middleware/auth");
+function norm(s = "") {
+  return s.toString().toUpperCase().replace(/[^A-Z0-9]/g, "");
+}
 
 /**
  * POST /api/payments/start
- * Body: { plan_code: "BASIC" }
- * - Reads price from subscription_plans.price_cents in KES
- * - Initializes a Paystack transaction (no plan codes)
- * - Returns authorization_url for user to complete payment
+ * Body: { plan_code: "BASIC" }   // can be name e.g. "Basic" too
  */
 router.post("/start", authenticateToken, async (req, res) => {
   try {
-    const { plan_code } = req.body || {};
-    if (!plan_code) return res.status(400).json({ error: "Missing plan_code" });
+    const raw = (req.body?.plan_code || "").trim();
+    if (!raw) return res.status(400).json({ error: "Missing plan_code" });
 
     const pool = getPool(req);
 
-    // find plan from DB
-    const planSql = `
-      SELECT code, name, price_cents, currency
+    // Try match by code OR by name (both normalized)
+    const sql = `
+      SELECT code, name, price_cents, currency, is_active
       FROM subscription_plans
-      WHERE code = $1 AND is_active = TRUE
+      WHERE
+        UPPER(code) = UPPER($1)
+        OR REGEXP_REPLACE(UPPER(name),'[^A-Z0-9]','','g') = REGEXP_REPLACE(UPPER($1),'[^A-Z0-9]','','g')
       LIMIT 1
     `;
-    const plan = (await pool.query(planSql, [plan_code])).rows[0];
-    if (!plan) return res.status(400).json({ error: "Unknown or inactive plan_code" });
+    const plan = (await pool.query(sql, [raw])).rows[0];
+
+    if (!plan || !plan.is_active) {
+      return res.status(400).json({ error: "Unknown or inactive plan_code" });
+    }
     if ((plan.currency || "KES") !== "KES") {
       return res.status(400).json({ error: "Only KES plans are supported right now" });
     }
 
-    // get the current user email from DB (based on req.user.id)
-    const u = (await pool.query(`SELECT id, email, name FROM users WHERE id = $1`, [req.user.id])).rows[0];
+    const u = (await pool.query(`SELECT id, email, name FROM users WHERE id=$1`, [req.user.id])).rows[0];
     if (!u) return res.status(401).json({ error: "User not found" });
 
+    // If you want to take a card once via Paystack, keep this; if you decide to use another PSP later, you can swap here.
     const reference = `S360_${req.user.id}_${plan.code}_${Date.now()}`;
-    const amount = plan.price_cents; // already in KES cents (Paystack expects lowest unit)
-
     const payload = {
       email: u.email,
-      amount,
+      amount: plan.price_cents,              // KES cents
       currency: "KES",
       reference,
       callback_url: process.env.PAYSTACK_CALLBACK_URL || `${process.env.APP_BASE_URL || ""}/billing/thanks`,
-      metadata: {
-        user_id: req.user.id,
-        plan_code: plan.code,
-        plan_name: plan.name,
-      },
+      metadata: { user_id: req.user.id, plan_code: plan.code, plan_name: plan.name },
     };
 
     const resp = await fetch("https://api.paystack.co/transaction/initialize", {
@@ -85,6 +81,7 @@ router.post("/start", authenticateToken, async (req, res) => {
       reference: data.data?.reference || reference,
       authorization_url: data.data?.authorization_url,
       access_code: data.data?.access_code,
+      plan: { code: plan.code, name: plan.name, price_cents: plan.price_cents, currency: plan.currency }
     });
   } catch (e) {
     console.error("payments.start error:", e);
@@ -93,45 +90,27 @@ router.post("/start", authenticateToken, async (req, res) => {
 });
 
 /**
- * POST /api/payments/webhook
- * Paystack will POST here (raw body needed to verify signature)
- * Expect: event === 'charge.success'
- * We will: upsert user_subscriptions (activate chosen plan)
+ * POST /api/payments/webhook   (raw body required)
  */
 router.post("/webhook", express.raw({ type: "application/json" }), async (req, res) => {
   try {
     const secret = process.env.PAYSTACK_SECRET_KEY;
     const signature = req.headers["x-paystack-signature"];
-
     if (!signature) return res.status(400).send("Missing signature");
 
-    const hash = crypto
-      .createHmac("sha512", secret)
-      .update(req.body) // raw Buffer
-      .digest("hex");
-
-    if (hash !== signature) {
-      console.warn("Paystack signature mismatch");
-      return res.status(401).send("Invalid signature");
-    }
+    const hash = crypto.createHmac("sha512", secret).update(req.body).digest("hex");
+    if (hash !== signature) return res.status(401).send("Invalid signature");
 
     const payload = JSON.parse(req.body.toString("utf8"));
-    if (payload?.event !== "charge.success") {
-      return res.status(200).send("ignored");
-    }
+    if (payload?.event !== "charge.success") return res.status(200).send("ignored");
 
     const meta = payload?.data?.metadata || {};
     const user_id = meta.user_id;
     const plan_code = meta.plan_code;
-
-    if (!user_id || !plan_code) {
-      console.warn("webhook missing user_id/plan_code in metadata");
-      return res.status(200).send("ok");
-    }
+    if (!user_id || !plan_code) return res.status(200).send("ok");
 
     const pool = getPool(req);
 
-    // Upsert: one "current" subscription row (simple approach)
     await pool.query(
       `
       INSERT INTO user_subscriptions (user_id, plan_code, status, started_at, renewed_at, meta)
@@ -152,14 +131,12 @@ router.post("/webhook", express.raw({ type: "application/json" }), async (req, r
 });
 
 /**
- * GET /api/billing/status
- * Returns the user's current plan and usage (very similar to your previous status route)
+ * GET /api/payments/status
  */
 router.get("/status", authenticateToken, async (req, res) => {
   try {
     const pool = getPool(req);
 
-    // naive: pick the most recently renewed subscription as "current"
     const sub = (await pool.query(
       `SELECT plan_code, status, started_at, renewed_at
        FROM user_subscriptions
@@ -169,21 +146,17 @@ router.get("/status", authenticateToken, async (req, res) => {
       [req.user.id]
     )).rows[0];
 
-    const planCode = sub?.plan_code || "FREE";
+    const planCode = sub?.plan_code || 'FREE';
 
     const plan = (await pool.query(
       `SELECT code, name, price_cents, currency, features
        FROM subscription_plans WHERE code = $1`,
       [planCode]
-    )).rows[0] || {
-      code: "FREE",
-      name: "Free",
-      price_cents: 0,
-      currency: "KES",
-      features: ["1 vehicle","basic logs"]
-    };
+    )).rows[0];
 
-    // usage (adjust to your schema)
+    const fallback = { code: 'FREE', name: 'Free', price_cents: 0, currency: 'KES', features: ['1 vehicle','basic logs'] };
+    const effective = plan || fallback;
+
     const vehiclesCount = (await pool.query(
       `SELECT COUNT(*)::int AS c FROM vehicles WHERE user_id = $1`,
       [req.user.id]
@@ -194,7 +167,6 @@ router.get("/status", authenticateToken, async (req, res) => {
       [req.user.id]
     )).rows[0]?.c || 0;
 
-    // simple caps based on plan code
     const caps = {
       FREE:     { maxVehicles: 1,   docsEnabled: false, whatsappReminders: false },
       BASIC:    { maxVehicles: 3,   docsEnabled: true,  whatsappReminders: true  },
@@ -203,7 +175,7 @@ router.get("/status", authenticateToken, async (req, res) => {
     };
 
     res.json({
-      plan: { code: plan.code, ...caps[plan.code] },
+      plan: { code: effective.code, ...caps[effective.code] },
       usage: { vehicles: vehiclesCount, documents: documentsCount }
     });
   } catch (e) {
