@@ -13,14 +13,17 @@ function getPool(req) {
   return pool;
 }
 
-function toPaystackMinorUnits(currency, amountMajorInteger) {
-  const major = Math.round(Number(amountMajorInteger || 0));
-  return major * 100; // KES to kobo (minor)
+function normCode(s = "") {
+  return s.toString().trim().toUpperCase().replace(/[^A-Z0-9]/g, "");
+}
+function normName(s = "") {
+  return s.toString().trim().toUpperCase().replace(/[^A-Z0-9]/g, "");
 }
 
 /**
  * POST /api/payments/start
- * Body: { plan_code: "BASIC" }  // also accepts plan name (Basic, Fleet Pro, etc.)
+ * Body: { "plan_code": "BASIC" }  // accepts code OR human name (e.g. "basic", "Fleet Pro")
+ * Uses price_cents if present, else falls back to price_amount * 100 (integer).
  */
 router.post("/start", authenticateToken, async (req, res) => {
   try {
@@ -30,11 +33,10 @@ router.post("/start", authenticateToken, async (req, res) => {
     const pool = getPool(req);
 
     const sql = `
-      SELECT code, name,
-             price_amount,
-             price_cents,
-             COALESCE(currency, price_currency, 'KES') AS currency,
-             is_active
+      SELECT code, name, is_active,
+             COALESCE(price_cents,
+                      (NULLIF(price_amount,0) * 100)::int, 0) AS effective_cents,
+             COALESCE(currency, price_currency, 'KES')        AS effective_currency
       FROM subscription_plans
       WHERE UPPER(code) = UPPER($1)
          OR REGEXP_REPLACE(UPPER(name),'[^A-Z0-9]','','g')
@@ -42,11 +44,13 @@ router.post("/start", authenticateToken, async (req, res) => {
       LIMIT 1
     `;
     const plan = (await pool.query(sql, [raw])).rows[0];
+
     if (!plan || !plan.is_active) {
       return res.status(400).json({ error: "Unknown or inactive plan_code" });
     }
 
-    if ((plan.code || "").toUpperCase() === "FREE") {
+    // FREE plan shortcut
+    if (plan.code && plan.code.toUpperCase() === "FREE") {
       return res.json({
         ok: true,
         free: true,
@@ -55,75 +59,79 @@ router.post("/start", authenticateToken, async (req, res) => {
       });
     }
 
-    let amountKES = Number(plan.price_amount);
-    if (!Number.isFinite(amountKES) || amountKES <= 0) {
-      const cents = Number.parseInt(plan.price_cents, 10);
-      if (!Number.isFinite(cents) || cents <= 0) {
-        return res.status(400).json({
-          error: "Plan has invalid amount",
-          detail: { code: plan.code, name: plan.name, price_amount: plan.price_amount, price_cents: plan.price_cents }
-        });
-      }
-      amountKES = Math.round(cents / 100);
-    } else {
-      amountKES = Math.round(amountKES);
-    }
-    if (amountKES <= 0) {
-      return res.status(400).json({ error: "Invalid plan amount after normalization" });
+    // Amount must be an integer in minor units
+    let amount = parseInt(plan.effective_cents, 10);
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return res.status(400).json({
+        error: "Plan has invalid amount",
+        detail: { code: plan.code || null, name: plan.name, effective_cents: plan.effective_cents }
+      });
     }
 
-    const currency = plan.currency || "KES";
+    const currency = plan.effective_currency || "KES";
 
+    // (Optional) guard for very tiny KES amounts in LIVE – Paystack may reject too-small values
+    const isTestKey = (process.env.PAYSTACK_SECRET_KEY || "").startsWith("sk_test_");
+    if (!isTestKey && currency === "KES" && amount < 50) {
+      // 50 (minor units) == 0.50 KES. If you see "Invalid Amount" in live, bump to >= 5000 for KES 50.00
+      // For testing tiny amounts, use a test secret key.
+      return res.status(400).json({
+        error: "Amount likely too small for live KES",
+        hint: "Use a test Paystack key for tiny test charges or raise price to a realistic minimum.",
+        detail: { amount_minor: amount, currency }
+      });
+    }
+
+    // Fetch user (for email & metadata)
     const user = (await pool.query(
-      `SELECT id, email, name FROM users WHERE id=$1`,
+      `SELECT id, email, name FROM users WHERE id = $1`,
       [req.user.id]
     )).rows[0];
     if (!user) return res.status(401).json({ error: "User not found" });
 
-    const reference = `S360_${user.id}_${(plan.code || "PLAN").toUpperCase()}_${Date.now()}`;
-    const amountMinor = toPaystackMinorUnits(currency, amountKES);
-
+    const reference = `S360_${user.id}_${(plan.code || normName(plan.name))}_${Date.now()}`;
     const payload = {
       email: user.email,
-      amount: amountMinor,
-      currency,
+      amount,               // integer minor units
+      currency,             // KES if you configured it on Paystack
       reference,
       callback_url: process.env.PAYSTACK_CALLBACK_URL || `${process.env.APP_BASE_URL || ""}/billing/thanks`,
-      metadata: { user_id: user.id, plan_code: plan.code, plan_name: plan.name },
+      metadata: {
+        user_id: user.id,
+        plan_code: plan.code || null,
+        plan_name: plan.name
+      }
     };
 
     const resp = await fetch("https://api.paystack.co/transaction/initialize", {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`,
+        "Authorization": `Bearer ${process.env.PAYSTACK_SECRET_KEY}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify(payload),
     });
-
     const data = await resp.json();
+
     if (!data?.status) {
-      return res.status(400).json({ error: "Paystack init failed", detail: data, debug_payload: payload });
+      return res.status(400).json({
+        error: "Paystack init failed",
+        detail: data,
+        debug_payload: payload
+      });
     }
 
-    // Log initialization
-    try {
-      await pool.query(
-        `INSERT INTO payments (user_id, reference, plan_code, currency, amount_minor, amount_major, status, raw)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-         ON CONFLICT (reference) DO NOTHING`,
-        [user.id, reference, plan.code, currency, amountMinor, amountKES, "initialized", payload]
-      );
-    } catch (e) {
-      console.error("payments init log warn:", e.message);
-    }
-
-    return res.json({
+    res.json({
       ok: true,
       reference: data.data?.reference || reference,
       authorization_url: data.data?.authorization_url,
       access_code: data.data?.access_code,
-      plan: { code: plan.code, name: plan.name, amount_kes: amountKES, currency }
+      plan: {
+        code: plan.code || null,
+        name: plan.name,
+        price_cents: amount,
+        currency
+      }
     });
   } catch (e) {
     console.error("payments.start error:", e);
@@ -132,82 +140,90 @@ router.post("/start", authenticateToken, async (req, res) => {
 });
 
 /**
- * IMPORTANT: webhook must receive RAW body for signature.
- * We’ll still keep express.raw here, but we will also skip global JSON parser
- * for this path in index.js (see the new index.js below).
+ * POST /api/payments/webhook  (index.js must pass RAW body for application/json)
+ * Verifies signature, stores payment, flips/renews subscription, emails invoice.
  */
 router.post("/webhook", express.raw({ type: "application/json" }), async (req, res) => {
   try {
-    const secret = process.env.PAYSTACK_SECRET_KEY;
     const signature = req.headers["x-paystack-signature"];
     if (!signature) return res.status(400).send("Missing signature");
 
+    const secret = process.env.PAYSTACK_SECRET_KEY || "";
     const hash = crypto.createHmac("sha512", secret).update(req.body).digest("hex");
     if (hash !== signature) return res.status(401).send("Invalid signature");
 
-    const payload = JSON.parse(req.body.toString("utf8"));
-    const event = payload?.event;
-    if (event !== "charge.success") return res.status(200).send("ignored");
+    const event = JSON.parse(req.body.toString("utf8"));
 
-    const data = payload?.data || {};
-    const meta = data?.metadata || {};
-    const user_id = meta.user_id;
-    const plan_code = (meta.plan_code || "").toUpperCase();
-    const reference = data?.reference;
-    const currency = (data?.currency || "KES").toUpperCase();
-    const amount_minor = Number(data?.amount || 0);
-    const amount_major = Math.round(amount_minor / 100);
+    // Only handle successful charge events
+    if (event?.event !== "charge.success") return res.status(200).send("ignored");
+
+    const d = event.data || {};
+    const currency = (d.currency || "KES").toUpperCase();
+    const amountMinor = parseInt(d.amount, 10) || 0; // minor units
+    const amountMajor = Math.round(amountMinor) / 100; // for display
+    const reference   = d.reference || "";
+    const meta        = d.metadata || {};
+    const planName    = meta.plan_name || "Unknown Plan";
+    const planCode    = meta.plan_code ? normCode(meta.plan_code) : null;
+    const userId      = meta.user_id || null;
+    const status      = (d.status || "success").toLowerCase();
 
     const pool = getPool(req);
 
-    // Save payment
+    // 1) Log payment
     await pool.query(
-      `INSERT INTO payments (user_id, reference, plan_code, currency, amount_minor, amount_major, status, raw)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-       ON CONFLICT (reference) DO UPDATE
-         SET status='success', raw = EXCLUDED.raw`,
-      [user_id || null, reference || null, plan_code || null, currency, amount_minor, amount_major, "success", payload]
+      `
+      INSERT INTO payments (user_id, reference, plan_code, currency, amount_minor, status, payload, created_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,NOW())
+      ON CONFLICT (reference) DO UPDATE
+        SET status = EXCLUDED.status,
+            payload = EXCLUDED.payload
+      `,
+      [userId, reference, planCode, currency, amountMinor, status, event]
     );
 
-    // Activate subscription
-    if (user_id && plan_code) {
+    // 2) Flip/renew subscription (idempotent)
+    if (userId) {
+      const effectivePlan = planCode || normName(planName); // fallback to normalized name
       await pool.query(
-        `INSERT INTO user_subscriptions (user_id, plan_code, status, started_at, renewed_at, meta)
-         VALUES ($1, $2, 'active', NOW(), NOW(), $3)
-         ON CONFLICT (user_id, plan_code) DO UPDATE
-           SET status='active',
-               renewed_at = NOW(),
-               meta = COALESCE(user_subscriptions.meta, '{}'::jsonb) || EXCLUDED.meta`,
-        [user_id, plan_code, payload]
+        `
+        INSERT INTO user_subscriptions (user_id, plan_code, status, started_at, renewed_at, meta)
+        VALUES ($1, $2, 'active', NOW(), NOW(), $3)
+        ON CONFLICT (user_id, plan_code) DO UPDATE
+          SET status='active',
+              renewed_at = NOW(),
+              meta = COALESCE(user_subscriptions.meta, '{}'::jsonb) || EXCLUDED.meta
+        `,
+        [userId, effectivePlan, event]
       );
+    }
 
-      // Send your invoice email
-      const userRow = (await pool.query(`SELECT email, name FROM users WHERE id=$1`, [user_id])).rows[0];
-      if (userRow?.email) {
-        const planRow = (await pool.query(
-          `SELECT name, COALESCE(currency, price_currency, 'KES') AS currency
-           FROM subscription_plans WHERE UPPER(code)=UPPER($1)`,
-          [plan_code]
-        )).rows[0];
-
+    // 3) Send invoice email (best-effort)
+    try {
+      if (d?.customer?.email) {
+        // Optional date/periods if you want them on the invoice
+        const issued_at = new Date().toISOString();
         await sendEmail(
-          userRow.email,
+          d.customer.email,
           "Your Saka360 Subscription Invoice",
           "subscription_invoice",
           {
-            user_name: userRow.name || "there",
-            plan_name: planRow?.name || plan_code,
-            plan_code,
-            amount_cents: amount_minor, // template will display major
+            user_name: d?.customer?.first_name ? `${d.customer.first_name} ${d.customer.last_name || ""}`.trim() : "there",
+            plan_name: planName,
+            plan_code: planCode || normName(planName),
+            amount_cents: amountMinor,
             currency,
-            invoice_number: reference || `INV-${Date.now()}`,
-            issued_at: new Date().toISOString(),
-            period_start: new Date().toISOString().slice(0,10),
-            period_end:   new Date(Date.now()+27*24*3600*1000).toISOString().slice(0,10),
-            payment_link: process.env.APP_BASE_URL ? `${process.env.APP_BASE_URL}/billing` : undefined
+            invoice_number: reference,
+            issued_at,
+            period_start: issued_at.substring(0,10),
+            period_end: issued_at.substring(0,10),
+            payment_link: null
           }
         );
       }
+    } catch (mailErr) {
+      console.error("payments.webhook: email send warning:", mailErr.message);
+      // do not fail webhook because of email
     }
 
     return res.status(200).send("ok");
@@ -219,6 +235,7 @@ router.post("/webhook", express.raw({ type: "application/json" }), async (req, r
 
 /**
  * GET /api/payments/status
+ * Returns current plan snapshot + simple usage caps.
  */
 router.get("/status", authenticateToken, async (req, res) => {
   try {
@@ -236,18 +253,27 @@ router.get("/status", authenticateToken, async (req, res) => {
     const planCode = (sub?.plan_code || "FREE").toUpperCase();
 
     const plan = (await pool.query(
-      `SELECT code, name, price_amount,
+      `SELECT code, name,
+              COALESCE(price_cents, (NULLIF(price_amount,0) * 100)::int, 0) AS price_cents,
               COALESCE(currency, price_currency, 'KES') AS currency,
               features
-       FROM subscription_plans WHERE UPPER(code) = UPPER($1)`,
+       FROM subscription_plans
+       WHERE UPPER(code) = $1`,
       [planCode]
     )).rows[0];
 
-    const fallback = { code: "FREE", name: "Free", price_amount: 0, currency: "KES", features: ["1 vehicle","basic logs"] };
+    const fallback = { code: 'FREE', name: 'Free', price_cents: 0, currency: 'KES', features: ['1 vehicle','basic logs'] };
     const effective = plan || fallback;
 
-    const vc = (await pool.query(`SELECT COUNT(*)::int AS c FROM vehicles WHERE user_id = $1`, [req.user.id])).rows[0]?.c || 0;
-    const dc = (await pool.query(`SELECT COUNT(*)::int AS c FROM documents WHERE user_id = $1`, [req.user.id])).rows[0]?.c || 0;
+    const vehiclesCount = (await pool.query(
+      `SELECT COUNT(*)::int AS c FROM vehicles WHERE user_id = $1`,
+      [req.user.id]
+    )).rows[0]?.c || 0;
+
+    const documentsCount = (await pool.query(
+      `SELECT COUNT(*)::int AS c FROM documents WHERE user_id = $1`,
+      [req.user.id]
+    )).rows[0]?.c || 0;
 
     const caps = {
       FREE:     { maxVehicles: 1,   docsEnabled: false, whatsappReminders: false },
@@ -257,40 +283,54 @@ router.get("/status", authenticateToken, async (req, res) => {
     };
 
     res.json({
-      plan: { code: effective.code, ...caps[effective.code] },
-      usage: { vehicles: vc, documents: dc }
+      plan: { code: effective.code?.toUpperCase() || 'FREE', ...caps[effective.code?.toUpperCase() || 'FREE'] },
+      usage: { vehicles: vehiclesCount, documents: documentsCount }
     });
   } catch (e) {
-    console.error("billing.status error:", e);
+    console.error("payments.status error:", e);
     res.status(500).json({ error: "Failed to load billing status", detail: e.message });
   }
 });
 
 /**
- * GET /api/payments/_diag  (admin-only recommended; left open here for speed)
- * Shows last 10 payments & last subscription row for current user.
+ * GET /api/payments/_diag
+ * Safe diagnostics; never references non-existent columns.
  */
 router.get("/_diag", authenticateToken, async (req, res) => {
   try {
     const pool = getPool(req);
-    const payments = (await pool.query(
-      `SELECT id, reference, plan_code, currency, amount_major, status, created_at
-       FROM payments
-       WHERE user_id=$1
-       ORDER BY id DESC LIMIT 10`,
-      [req.user.id]
+
+    const plans = (await pool.query(
+      `SELECT code, name,
+              COALESCE(price_cents, (NULLIF(price_amount,0) * 100)::int, 0) AS price_cents,
+              COALESCE(currency, price_currency, 'KES') AS currency,
+              is_active
+       FROM subscription_plans
+       ORDER BY COALESCE(code, name)`
     )).rows;
 
-    const sub = (await pool.query(
-      `SELECT plan_code, status, started_at, renewed_at
-       FROM user_subscriptions WHERE user_id=$1
-       ORDER BY COALESCE(renewed_at, started_at) DESC
-       LIMIT 1`,
-      [req.user.id]
-    )).rows[0] || null;
+    const payments = (await pool.query(
+      `SELECT id, user_id, reference, plan_code, currency,
+              amount_minor,
+              ROUND((amount_minor::numeric / 100.0)::numeric, 2) AS amount_major,
+              status, created_at
+       FROM payments
+       ORDER BY id DESC
+       LIMIT 10`
+    )).rows;
 
-    res.json({ payments, subscription: sub });
+    res.json({
+      ok: true,
+      env: {
+        paystack_key_present: !!process.env.PAYSTACK_SECRET_KEY,
+        callback_url: process.env.PAYSTACK_CALLBACK_URL || null
+      },
+      sample_user: req.user?.id || null,
+      plans,
+      last_payments: payments
+    });
   } catch (e) {
+    console.error("payments._diag error:", e);
     res.status(500).json({ error: "diag failed", detail: e.message });
   }
 });
