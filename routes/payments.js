@@ -13,16 +13,14 @@ function getPool(req) {
   return pool;
 }
 
-// Paystack uses smallest currency unit. For KES => x100
 function toPaystackMinorUnits(currency, amountMajorInteger) {
-  const c = (currency || "KES").toUpperCase();
   const major = Math.round(Number(amountMajorInteger || 0));
-  return major * 100; // safe for KES, NGN, GHS, ZAR, USD
+  return major * 100; // KES to kobo (minor)
 }
 
 /**
  * POST /api/payments/start
- * Body: { plan_code: "BASIC" }  // also accepts plan name e.g. "Basic", "Fleet Pro"
+ * Body: { plan_code: "BASIC" }  // also accepts plan name (Basic, Fleet Pro, etc.)
  */
 router.post("/start", authenticateToken, async (req, res) => {
   try {
@@ -33,9 +31,9 @@ router.post("/start", authenticateToken, async (req, res) => {
 
     const sql = `
       SELECT code, name,
-             price_amount,                                -- numeric KES (major units)
+             price_amount,
              price_cents,
-             COALESCE(currency, price_currency, 'KES') AS effective_currency,
+             COALESCE(currency, price_currency, 'KES') AS currency,
              is_active
       FROM subscription_plans
       WHERE UPPER(code) = UPPER($1)
@@ -57,7 +55,6 @@ router.post("/start", authenticateToken, async (req, res) => {
       });
     }
 
-    // Determine whole KES (major units)
     let amountKES = Number(plan.price_amount);
     if (!Number.isFinite(amountKES) || amountKES <= 0) {
       const cents = Number.parseInt(plan.price_cents, 10);
@@ -75,9 +72,8 @@ router.post("/start", authenticateToken, async (req, res) => {
       return res.status(400).json({ error: "Invalid plan amount after normalization" });
     }
 
-    const currency = plan.effective_currency || "KES";
+    const currency = plan.currency || "KES";
 
-    // User
     const user = (await pool.query(
       `SELECT id, email, name FROM users WHERE id=$1`,
       [req.user.id]
@@ -110,7 +106,7 @@ router.post("/start", authenticateToken, async (req, res) => {
       return res.status(400).json({ error: "Paystack init failed", detail: data, debug_payload: payload });
     }
 
-    // (Optional) log a pending payment row
+    // Log initialization
     try {
       await pool.query(
         `INSERT INTO payments (user_id, reference, plan_code, currency, amount_minor, amount_major, status, raw)
@@ -136,8 +132,9 @@ router.post("/start", authenticateToken, async (req, res) => {
 });
 
 /**
- * POST /api/payments/webhook
- * NOTE: index.js must mount raw body for this route.
+ * IMPORTANT: webhook must receive RAW body for signature.
+ * We’ll still keep express.raw here, but we will also skip global JSON parser
+ * for this path in index.js (see the new index.js below).
  */
 router.post("/webhook", express.raw({ type: "application/json" }), async (req, res) => {
   try {
@@ -150,8 +147,6 @@ router.post("/webhook", express.raw({ type: "application/json" }), async (req, r
 
     const payload = JSON.parse(req.body.toString("utf8"));
     const event = payload?.event;
-
-    // We only care about successful charges
     if (event !== "charge.success") return res.status(200).send("ignored");
 
     const data = payload?.data || {};
@@ -160,38 +155,33 @@ router.post("/webhook", express.raw({ type: "application/json" }), async (req, r
     const plan_code = (meta.plan_code || "").toUpperCase();
     const reference = data?.reference;
     const currency = (data?.currency || "KES").toUpperCase();
-
-    // amount in minor units coming from Paystack
     const amount_minor = Number(data?.amount || 0);
     const amount_major = Math.round(amount_minor / 100);
 
     const pool = getPool(req);
 
-    // Upsert payment log
+    // Save payment
     await pool.query(
       `INSERT INTO payments (user_id, reference, plan_code, currency, amount_minor, amount_major, status, raw)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
        ON CONFLICT (reference) DO UPDATE
-         SET status='success',
-             raw = EXCLUDED.raw`,
+         SET status='success', raw = EXCLUDED.raw`,
       [user_id || null, reference || null, plan_code || null, currency, amount_minor, amount_major, "success", payload]
     );
 
-    // Activate subscription (latest wins)
+    // Activate subscription
     if (user_id && plan_code) {
       await pool.query(
-        `
-        INSERT INTO user_subscriptions (user_id, plan_code, status, started_at, renewed_at, meta)
-        VALUES ($1, $2, 'active', NOW(), NOW(), $3)
-        ON CONFLICT (user_id, plan_code) DO UPDATE
-          SET status='active',
-              renewed_at = NOW(),
-              meta = COALESCE(user_subscriptions.meta, '{}'::jsonb) || EXCLUDED.meta
-        `,
+        `INSERT INTO user_subscriptions (user_id, plan_code, status, started_at, renewed_at, meta)
+         VALUES ($1, $2, 'active', NOW(), NOW(), $3)
+         ON CONFLICT (user_id, plan_code) DO UPDATE
+           SET status='active',
+               renewed_at = NOW(),
+               meta = COALESCE(user_subscriptions.meta, '{}'::jsonb) || EXCLUDED.meta`,
         [user_id, plan_code, payload]
       );
 
-      // Send invoice email
+      // Send your invoice email
       const userRow = (await pool.query(`SELECT email, name FROM users WHERE id=$1`, [user_id])).rows[0];
       if (userRow?.email) {
         const planRow = (await pool.query(
@@ -208,12 +198,12 @@ router.post("/webhook", express.raw({ type: "application/json" }), async (req, r
             user_name: userRow.name || "there",
             plan_name: planRow?.name || plan_code,
             plan_code,
-            amount_cents: amount_minor,         // template formats it as major
+            amount_cents: amount_minor, // template will display major
             currency,
             invoice_number: reference || `INV-${Date.now()}`,
             issued_at: new Date().toISOString(),
             period_start: new Date().toISOString().slice(0,10),
-            period_end:   new Date(Date.now()+27*24*3600*1000).toISOString().slice(0,10), // rough 28d window
+            period_end:   new Date(Date.now()+27*24*3600*1000).toISOString().slice(0,10),
             payment_link: process.env.APP_BASE_URL ? `${process.env.APP_BASE_URL}/billing` : undefined
           }
         );
@@ -246,8 +236,10 @@ router.get("/status", authenticateToken, async (req, res) => {
     const planCode = (sub?.plan_code || "FREE").toUpperCase();
 
     const plan = (await pool.query(
-      `SELECT code, name, price_amount, COALESCE(currency, price_currency, 'KES') AS currency, features
-         FROM subscription_plans WHERE UPPER(code) = UPPER($1)`,
+      `SELECT code, name, price_amount,
+              COALESCE(currency, price_currency, 'KES') AS currency,
+              features
+       FROM subscription_plans WHERE UPPER(code) = UPPER($1)`,
       [planCode]
     )).rows[0];
 
@@ -271,6 +263,35 @@ router.get("/status", authenticateToken, async (req, res) => {
   } catch (e) {
     console.error("billing.status error:", e);
     res.status(500).json({ error: "Failed to load billing status", detail: e.message });
+  }
+});
+
+/**
+ * GET /api/payments/_diag  (admin-only recommended; left open here for speed)
+ * Shows last 10 payments & last subscription row for current user.
+ */
+router.get("/_diag", authenticateToken, async (req, res) => {
+  try {
+    const pool = getPool(req);
+    const payments = (await pool.query(
+      `SELECT id, reference, plan_code, currency, amount_major, status, created_at
+       FROM payments
+       WHERE user_id=$1
+       ORDER BY id DESC LIMIT 10`,
+      [req.user.id]
+    )).rows;
+
+    const sub = (await pool.query(
+      `SELECT plan_code, status, started_at, renewed_at
+       FROM user_subscriptions WHERE user_id=$1
+       ORDER BY COALESCE(renewed_at, started_at) DESC
+       LIMIT 1`,
+      [req.user.id]
+    )).rows[0] || null;
+
+    res.json({ payments, subscription: sub });
+  } catch (e) {
+    res.status(500).json({ error: "diag failed", detail: e.message });
   }
 });
 
