@@ -8,21 +8,29 @@ function getPool(req) {
   return pool;
 }
 
+// turn "a,b,c" or "a; b; c" into ["a","b","c"]
+function splitFeatures(s) {
+  if (!s) return [];
+  // accept commas or semicolons
+  return String(s)
+    .split(/[;,]/g)
+    .map(x => x.trim())
+    .filter(Boolean);
+}
+
 router.get("/plans", async (req, res) => {
   try {
     const pool = getPool(req);
     const sql = `
       SELECT
-        COALESCE(NULLIF(TRIM(code), ''), UPPER(REGEXP_REPLACE(name,'[^A-Za-z0-9]','','g'))) AS code,
+        /* prefer code; fallback to normalized name as code */
+        COALESCE(NULLIF(TRIM(code), ''), UPPER(REGEXP_REPLACE(name,'[^A-Za-z0-9]','','g')))       AS code,
         name,
-        COALESCE(price_cents, (NULLIF(price_amount,0) * 100)::int, 0) AS price_cents,
-        COALESCE(currency, price_currency, 'KES') AS currency,
-        COALESCE(is_active, TRUE) AS is_active,
-        CASE
-          WHEN jsonb_typeof(features_json) IS NOT NULL THEN features_json
-          WHEN features IS NOT NULL THEN to_jsonb(string_to_array(features, ','))  -- legacy text list
-          ELSE '[]'::jsonb
-        END AS features,
+        /* prefer price_cents; else price_amount *100 */
+        COALESCE(price_cents, (NULLIF(price_amount,0) * 100)::int, 0)                              AS price_cents,
+        COALESCE(currency, price_currency, 'KES')                                                  AS currency,
+        COALESCE(is_active, TRUE)                                                                  AS is_active,
+        features,        -- TEXT in your DB
         paystack_plan_code
       FROM subscription_plans
       ORDER BY
@@ -37,7 +45,7 @@ router.get("/plans", async (req, res) => {
       price_cents: r.price_cents || 0,
       currency: r.currency || "KES",
       is_active: !!r.is_active,
-      features: Array.isArray(r.features) ? r.features : (r.features?.map?.(x => String(x)) || []),
+      features: splitFeatures(r.features),      // convert TEXT → string[]
       paystack_plan_code: r.paystack_plan_code || null
     }));
 
