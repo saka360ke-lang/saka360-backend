@@ -3,6 +3,7 @@ const express = require("express");
 const crypto = require("crypto");
 const fetch = require("node-fetch");
 const { authenticateToken } = require("../middleware/auth");
+const { sendEmail } = require("../utils/mailer");
 
 const router = express.Router();
 
@@ -16,98 +17,39 @@ function norm(s = "") {
   return s.toString().toUpperCase().replace(/[^A-Z0-9]/g, "");
 }
 
-/* -------------------------------------------
- * Helpers: table/column introspection + logging
- * ------------------------------------------- */
-async function getPaymentsColumns(pool) {
-  const cols = (await pool.query(
-    `SELECT column_name
-       FROM information_schema.columns
-      WHERE table_schema='public' AND table_name='payments'`
-  )).rows.map(r => r.column_name);
-
-  return {
-    cols,
-    has: (name) => cols.includes(name),
-  };
-}
-
-async function logPayment(pool, fields) {
-  // fields: { user_id, reference, plan_code, currency, amount_minor, status, payloadObj }
-  const meta = await getPaymentsColumns(pool);
-
-  const columns = ["created_at"];
-  const values = ["NOW()"];
-  const params = [];
-  let i = 1;
-
-  function add(colName, val) {
-    columns.push(colName);
-    values.push(`$${i++}`);
-    params.push(val);
-  }
-
-  if (meta.has("user_id") && fields.user_id != null) add("user_id", fields.user_id);
-  if (meta.has("reference") && fields.reference) add("reference", fields.reference);
-  if (meta.has("plan_code") && fields.plan_code) add("plan_code", fields.plan_code);
-  if (meta.has("currency") && fields.currency) add("currency", fields.currency);
-
-  // amount: prefer amount_minor → else amount_cents → else skip
-  if (Number.isFinite(fields.amount_minor)) {
-    if (meta.has("amount_minor")) add("amount_minor", fields.amount_minor);
-    else if (meta.has("amount_cents")) add("amount_cents", fields.amount_minor);
-  }
-
-  if (meta.has("status") && fields.status) add("status", fields.status);
-
-  // payload: prefer 'payload' → else 'raw' if present
-  const payloadJSON = fields.payloadObj ? JSON.stringify(fields.payloadObj) : null;
-  if (payloadJSON) {
-    if (meta.has("payload")) add("payload", payloadJSON);
-    else if (meta.has("raw")) add("raw", payloadJSON);
-  }
-
+async function getPlanByAny(pool, raw) {
   const sql = `
-    INSERT INTO payments (${columns.join(", ")})
-    VALUES (${values.join(", ")})
-    ON CONFLICT (${meta.has("reference") ? "reference" : "id"}) DO UPDATE
-      SET ${columns
-        .filter(c => c !== (meta.has("reference") ? "reference" : "id") && c !== "created_at")
-        .map(c => `${c}=EXCLUDED.${c}`)
-        .join(", ")}
+    SELECT code, name,
+           COALESCE(price_cents, (NULLIF(price_amount,0) * 100)::int, 0) AS price_cents,
+           COALESCE(currency, price_currency, 'KES') AS currency,
+           COALESCE(is_active, TRUE) AS is_active
+    FROM subscription_plans
+    WHERE
+      UPPER(code) = UPPER($1)
+      OR REGEXP_REPLACE(UPPER(name),'[^A-Z0-9]','','g') = REGEXP_REPLACE(UPPER($1),'[^A-Z0-9]','','g')
+    LIMIT 1
   `;
-
-  return pool.query(sql, params);
+  const r = await pool.query(sql, [raw]);
+  return r.rows[0];
 }
 
-/* -------------------------------------------
+/**
  * POST /api/payments/start
- * Body: { plan_code: "BASIC" } // also accepts "Basic" / "Fleet Pro"
- * ------------------------------------------- */
+ * Body: { plan_code: "BASIC" }  // also accepts "Basic", "Fleet Pro"
+ */
 router.post("/start", authenticateToken, async (req, res) => {
   try {
     const raw = (req.body?.plan_code || "").trim();
     if (!raw) return res.status(400).json({ error: "Missing plan_code" });
 
     const pool = getPool(req);
-
-    const sql = `
-      SELECT code, name, is_active,
-             COALESCE(price_cents, (NULLIF(price_amount,0) * 100)::int, 0) AS effective_cents,
-             COALESCE(currency, price_currency, 'KES') AS effective_currency
-      FROM subscription_plans
-      WHERE
-        UPPER(code) = UPPER($1)
-        OR REGEXP_REPLACE(UPPER(name),'[^A-Z0-9]','','g') = REGEXP_REPLACE(UPPER($1),'[^A-Z0-9]','','g')
-      LIMIT 1
-    `;
-    const plan = (await pool.query(sql, [raw])).rows[0];
+    const plan = await getPlanByAny(pool, raw);
 
     if (!plan || !plan.is_active) {
       return res.status(400).json({ error: "Unknown or inactive plan_code" });
     }
 
-    // FREE -> no charge
+    // FREE: no checkout
     if ((plan.code || "").toUpperCase() === "FREE") {
       return res.json({
         ok: true,
@@ -117,29 +59,31 @@ router.post("/start", authenticateToken, async (req, res) => {
       });
     }
 
-    const amount = parseInt(plan.effective_cents, 10);
+    // amount MUST be integer, > 0
+    const amount = parseInt(plan.price_cents, 10);
     if (!Number.isFinite(amount) || amount <= 0) {
       return res.status(400).json({
         error: "Plan has invalid amount",
-        detail: { code: plan.code, name: plan.name, effective_cents: plan.effective_cents }
+        detail: { code: plan.code, name: plan.name, price_cents: plan.price_cents }
       });
     }
 
-    const currency = plan.effective_currency || "KES";
+    const currency = plan.currency || "KES";
 
-    const user = (await pool.query(`SELECT id, email, name FROM users WHERE id=$1`, [req.user.id])).rows[0];
+    // fetch user for email
+    const user = (await pool.query(
+      `SELECT id, email, name FROM users WHERE id=$1`, [req.user.id]
+    )).rows[0];
     if (!user) return res.status(401).json({ error: "User not found" });
 
-    const planCode = (plan.code || norm(plan.name)).toUpperCase();
-    const reference = `S360_${user.id}_${planCode}_${Date.now()}`;
-
+    const reference = `S360_${user.id}_${(plan.code || "").toUpperCase()}_${Date.now()}`;
     const payload = {
       email: user.email,
-      amount: amount,               // integer, smallest unit
-      currency: currency,
+      amount,                 // integer (minor unit)
+      currency,               // KES
       reference,
       callback_url: process.env.PAYSTACK_CALLBACK_URL || `${process.env.APP_BASE_URL || ""}/billing/thanks`,
-      metadata: { user_id: user.id, plan_code: planCode, plan_name: plan.name },
+      metadata: { user_id: user.id, plan_code: (plan.code || "").toUpperCase(), plan_name: plan.name }
     };
 
     const resp = await fetch("https://api.paystack.co/transaction/initialize", {
@@ -152,25 +96,20 @@ router.post("/start", authenticateToken, async (req, res) => {
     });
 
     const data = await resp.json();
-
     if (!data?.status) {
-      return res.status(400).json({
-        error: "Paystack init failed",
-        detail: data,
-        debug_payload: payload
-      });
+      return res.status(400).json({ error: "Paystack init failed", detail: data, debug_payload: payload });
     }
 
-    return res.json({
+    res.json({
       ok: true,
       reference: data.data?.reference || reference,
       authorization_url: data.data?.authorization_url,
       access_code: data.data?.access_code,
       plan: {
-        code: planCode,
+        code: (plan.code || "").toUpperCase(),
         name: plan.name,
         price_cents: amount,
-        currency: currency
+        currency
       }
     });
   } catch (e) {
@@ -179,114 +118,132 @@ router.post("/start", authenticateToken, async (req, res) => {
   }
 });
 
-/* -------------------------------------------
- * POST /api/payments/webhook  (raw body)
- * ------------------------------------------- */
+/**
+ * Webhook: POST /api/payments/webhook  (must receive RAW body; index.js handles that)
+ * Verifies signature, records payment, upserts subscription, emails invoice.
+ */
 router.post("/webhook", express.raw({ type: "application/json" }), async (req, res) => {
   try {
     const secret = process.env.PAYSTACK_SECRET_KEY;
     const signature = req.headers["x-paystack-signature"];
     if (!signature) return res.status(400).send("Missing signature");
 
-    const hash = crypto.createHmac("sha512", secret).update(req.body).digest("hex");
-    if (hash !== signature) return res.status(401).send("Invalid signature");
+    const computed = crypto.createHmac("sha512", secret).update(req.body).digest("hex");
+    if (computed !== signature) return res.status(401).send("Invalid signature");
 
-    const payload = JSON.parse(req.body.toString("utf8"));
-    if (payload?.event !== "charge.success") return res.status(200).send("ignored");
+    const evt = JSON.parse(req.body.toString("utf8"));
+    if (evt?.event !== "charge.success") return res.status(200).send("ignored");
 
-    const meta = payload?.data?.metadata || {};
-    const user_id = meta.user_id;
-    const plan_code = (meta.plan_code || "").toUpperCase();
-    const currency = payload?.data?.currency || "KES";
-    const amount_minor = payload?.data?.amount; // smallest unit (kobo/cents)
+    const data = evt.data || {};
+    const meta = data.metadata || {};
+    const reference = data.reference;
+    const amount_minor = Number(data.amount) || 0;            // Paystack sends minor units
+    const currency = (data.currency || "KES").toUpperCase();
+    const channel  = (data.channel || "").toString();
+    const status   = (data.status  || "success").toString();
 
-    if (!user_id || !plan_code) return res.status(200).send("ok");
+    const user_id  = meta.user_id;
+    const planCode = (meta.plan_code || "").toUpperCase();
 
     const pool = getPool(req);
 
-    // Log payment in a schema-agnostic way
-    await logPayment(pool, {
-      user_id,
-      reference: payload?.data?.reference || null,
-      plan_code,
-      currency,
-      amount_minor: Number.isFinite(amount_minor) ? amount_minor : null,
-      status: "paid",
-      payloadObj: payload
-    });
-
-    // Upsert subscription
+    // Insert (or ignore duplicates) into payments table using existing columns
     await pool.query(
       `
-      INSERT INTO user_subscriptions (user_id, plan_code, status, started_at, renewed_at, meta)
-      VALUES ($1, $2, 'active', NOW(), NOW(), $3)
-      ON CONFLICT (user_id, plan_code) DO UPDATE
-        SET status='active',
-            renewed_at = NOW(),
-            meta = COALESCE(user_subscriptions.meta, '{}'::jsonb) || EXCLUDED.meta
+      INSERT INTO payments (user_id, provider, reference, amount_cents, currency, channel, plan_code, status, raw, created_at)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, NOW())
+      ON CONFLICT (reference) DO NOTHING
       `,
-      [user_id, plan_code, payload]
+      [user_id || null, 'paystack', reference, amount_minor, currency, channel, planCode || null, status, JSON.stringify(evt)]
     );
 
-    // Fire-and-forget email (don’t break webhook)
-    try {
-      const { sendEmail } = require("../utils/mailer");
-      const u = (await pool.query(`SELECT email, name FROM users WHERE id=$1`, [user_id])).rows[0];
-      if (u?.email) {
-        await sendEmail(
-          u.email,
-          "Your Saka360 Subscription Invoice",
-          "subscription_invoice",
-          {
-            user_name: u.name || "there",
-            plan_name: plan_code,
-            plan_code,
-            amount_cents: amount_minor || 0,
-            currency,
-            invoice_number: payload?.data?.reference || `INV-${Date.now()}`,
-            issued_at: new Date().toISOString(),
-            period_start: new Date().toISOString().slice(0,10),
-            period_end: new Date(Date.now()+27*86400000).toISOString().slice(0,10),
-            payment_link: null
-          }
-        );
+    // Upsert user_subscriptions (create if not exists; otherwise bump renewed_at)
+    if (user_id && planCode) {
+      await pool.query(
+        `
+        INSERT INTO user_subscriptions (user_id, plan_code, status, started_at, renewed_at, meta)
+        VALUES ($1, $2, 'active', NOW(), NOW(), $3)
+        ON CONFLICT (user_id, plan_code)
+        DO UPDATE SET status='active', renewed_at=NOW(), meta = COALESCE(user_subscriptions.meta, '{}'::jsonb) || EXCLUDED.meta
+        `,
+        [user_id, planCode, evt]
+      );
+    }
+
+    // Email invoice to user (if we can resolve user + plan)
+    if (user_id) {
+      const user = (await pool.query(`SELECT email, name FROM users WHERE id=$1`, [user_id])).rows[0];
+      if (user?.email) {
+        // Try to get a friendly plan name (fallback to code)
+        const planRow = (await pool.query(
+          `SELECT name FROM subscription_plans WHERE UPPER(code)=UPPER($1) LIMIT 1`,
+          [planCode]
+        )).rows[0];
+        const plan_name = planRow?.name || planCode || "Subscription";
+
+        // Build invoice fields for your subscription_invoice.hbs
+        const amount_cents = amount_minor;
+        const issued_at = new Date().toISOString();
+        const period_start = new Date().toISOString().slice(0,10);
+        const period_end   = new Date(Date.now() + 30*24*60*60*1000).toISOString().slice(0,10);
+        const invoice_number = `INV-${reference}`;
+
+        try {
+          await sendEmail(
+            user.email,
+            "Your Saka360 Subscription Invoice",
+            "subscription_invoice",
+            {
+              user_name: user.name || "there",
+              plan_name,
+              plan_code: planCode || "",
+              amount_cents,
+              currency,
+              invoice_number,
+              issued_at,
+              period_start,
+              period_end,
+              payment_link: (process.env.APP_BASE_URL || "https://app.saka360.com") + "/billing"
+            }
+          );
+        } catch (mailErr) {
+          console.error("invoice email send warning:", mailErr.message);
+        }
       }
-    } catch (e) {
-      console.error("payments.webhook email warn:", e.message);
     }
 
     return res.status(200).send("ok");
   } catch (e) {
     console.error("payments.webhook error:", e);
-    res.status(500).send("error");
+    return res.status(500).send("error");
   }
 });
 
-/* -------------------------------------------
+/**
  * GET /api/payments/status
- * ------------------------------------------- */
+ * Returns current plan caps + usage
+ */
 router.get("/status", authenticateToken, async (req, res) => {
   try {
     const pool = getPool(req);
 
     const sub = (await pool.query(
       `SELECT plan_code, status, started_at, renewed_at
-         FROM user_subscriptions
-        WHERE user_id = $1
-        ORDER BY COALESCE(renewed_at, started_at) DESC
-        LIMIT 1`,
+       FROM user_subscriptions
+       WHERE user_id = $1
+       ORDER BY COALESCE(renewed_at, started_at) DESC
+       LIMIT 1`,
       [req.user.id]
     )).rows[0];
 
-    const planCode = (sub?.plan_code || "FREE").toUpperCase();
+    const planCode = sub?.plan_code || 'FREE';
 
     const plan = (await pool.query(
       `SELECT code, name,
               COALESCE(price_cents, (NULLIF(price_amount,0) * 100)::int, 0) AS price_cents,
               COALESCE(currency, price_currency, 'KES') AS currency,
               features
-         FROM subscription_plans
-        WHERE UPPER(code) = $1`,
+       FROM subscription_plans WHERE UPPER(code) = UPPER($1)`,
       [planCode]
     )).rows[0];
 
@@ -311,7 +268,7 @@ router.get("/status", authenticateToken, async (req, res) => {
     };
 
     res.json({
-      plan: { code: effective.code?.toUpperCase() || 'FREE', ...caps[effective.code?.toUpperCase() || 'FREE'] },
+      plan: { code: (effective.code || 'FREE').toUpperCase(), ...(caps[(effective.code || 'FREE').toUpperCase()] || caps.FREE) },
       usage: { vehicles: vehiclesCount, documents: documentsCount }
     });
   } catch (e) {
@@ -320,37 +277,27 @@ router.get("/status", authenticateToken, async (req, res) => {
   }
 });
 
-/* -------------------------------------------
- * GET /api/payments/_diag (never 500s)
- * ------------------------------------------- */
+/**
+ * GET /api/payments/_diag
+ */
 router.get("/_diag", authenticateToken, async (req, res) => {
   try {
     const pool = getPool(req);
-    const meta = await getPaymentsColumns(pool);
+    const cols = (await pool.query(
+      `SELECT column_name FROM information_schema.columns
+       WHERE table_schema='public' AND table_name='payments'
+       ORDER BY ordinal_position`
+    )).rows.map(r => r.column_name);
 
-    const payments = (await pool.query(
-      `
-      SELECT
-        id,
-        ${meta.has("user_id") ? "user_id" : "NULL::bigint AS user_id"},
-        ${meta.has("provider") ? "provider" : "NULL::text AS provider"},
-        ${meta.has("reference") ? "reference" : "NULL::text AS reference"},
-        ${meta.has("amount_minor") ? "amount_minor" : (meta.has("amount_cents") ? "amount_cents" : "NULL::integer AS amount_minor")},
-        ${meta.has("currency") ? "currency" : "NULL::text AS currency"},
-        ${meta.has("channel") ? "channel" : "NULL::text AS channel"},
-        ${meta.has("plan_code") ? "plan_code" : "NULL::text AS plan_code"},
-        ${meta.has("status") ? "status" : "NULL::text AS status"},
-        ${meta.has("raw") ? "raw" : (meta.has("payload") ? "payload" : "NULL::jsonb AS raw")},
-        ${meta.has("created_at") ? "created_at" : "NOW() AS created_at"}
-      FROM payments
-      ORDER BY id DESC
-      LIMIT 20
-      `
+    const sample = (await pool.query(
+      `SELECT id, user_id, provider, reference, amount_cents, currency, channel, plan_code, status, created_at
+       FROM payments
+       ORDER BY id DESC
+       LIMIT 5`
     )).rows;
 
-    res.json({ ok: true, columns: meta.cols, sample: payments });
+    res.json({ ok: true, columns: cols, sample });
   } catch (e) {
-    console.error("payments._diag error:", e);
     res.status(500).json({ error: "diag failed", detail: e.message });
   }
 });

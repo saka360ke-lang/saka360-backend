@@ -4,27 +4,22 @@ require("dotenv").config();
 const express = require("express");
 const app = express();
 
-// Trust proxy for Render/Heroku
 app.set("trust proxy", 1);
 
-// ----------------------------------------------------
-// 0) BODY PARSERS — SPECIAL-CASE THE PAYSTACK WEBHOOK
-// ----------------------------------------------------
-// We must NOT JSON-parse the Paystack webhook body globally,
-// because we need the raw bytes to validate the signature.
-//
-// So: if the path is the webhook, skip the global parsers.
-// Otherwise, parse as normal.
+/* -------------------------------------------------
+ * IMPORTANT: Raw body ONLY for /api/payments/webhook
+ * ------------------------------------------------- */
+const rawBodyPaths = new Set(["/api/payments/webhook"]);
 app.use((req, res, next) => {
-  if (req.path === "/api/payments/webhook") return next();
-  return express.json({ limit: "2mb" })(req, res, next);
+  if (rawBodyPaths.has(req.path)) return next();
+  return express.json()(req, res, next);
 });
 app.use((req, res, next) => {
-  if (req.path === "/api/payments/webhook") return next();
+  if (rawBodyPaths.has(req.path)) return next();
   return express.urlencoded({ extended: false })(req, res, next);
 });
 
-// Malformed JSON → JSON error (only affects non-webhook routes)
+// Malformed JSON → JSON error
 app.use((err, req, res, next) => {
   if (err instanceof SyntaxError && "body" in err) {
     return res.status(400).json({ error: "Invalid JSON body" });
@@ -32,21 +27,16 @@ app.use((err, req, res, next) => {
   next(err);
 });
 
-// ---------------------------
-// 1) LOGGING & HEALTH
-// ---------------------------
 const morgan = require("morgan");
 app.use(morgan("tiny"));
 
+// Health
 app.get("/api/health", (_req, res) => res.status(200).json({ status: "OK" }));
 
-// ---------------------------
-// 2) SECURITY / CORS / LIMIT
-// ---------------------------
+// Security/cors/rate-limit
 const cors = require("cors");
 const helmet = require("helmet");
 const rateLimit = require("express-rate-limit");
-
 app.use(helmet());
 
 const ALLOWED = (process.env.ALLOWED_ORIGINS || "")
@@ -71,9 +61,7 @@ app.use(rateLimit({
   legacyHeaders: false
 }));
 
-// ---------------------------
-// 3) DATABASE
-// ---------------------------
+// DB
 const { Pool } = require("pg");
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 app.set("pool", pool);
@@ -91,50 +79,59 @@ app.get("/api/diag/pool", (req, res) => {
   res.json({ pool_attached: !!app.get("pool") });
 });
 
-// ---------------------------
-/* 4) MOUNT ROUTES IN A SAFE ORDER
- *    - adminEmails (works with global parsers)
- *    - function-style routes that take `app`
- *    - chat/uploads (router-style)
- *    - payments (router-style) — contains its own express.raw ONLY on /webhook
- */
-// ---------------------------
-const { verifySmtp } = require("./utils/mailer");
+// Mailers / reminders helpers (used by some routes)
+const { verifySmtp, sendEmail } = require("./utils/mailer");
+const { runExpiryCheckCore } = require("./utils/reminders");
+
+// Auth middlewares for admin/test routes you already use
 const { authenticateToken, adminOnly } = require("./middleware/auth");
 
-// Admin email testing routes (your templates)
+// Test/admin email routes (already working)
 const adminEmailRoutes = require("./routes/adminEmails");
 app.use("/api/admin/email", adminEmailRoutes);
 
-// Function-style (export = (app) => {})
+/* -------------------------
+ * Function-style routes
+ * ------------------------- */
 require("./routes/users")(app);
 require("./routes/fuel")(app);
 require("./routes/service")(app);
 require("./routes/documents")(app);
 require("./routes/reminders")(app);
 require("./routes/reports")(app);
-require("./routes/whatsapp")(app);
+require("./routes/whatsapp")(app); // POST /api/webhooks/whatsapp
 
-// Chat (router-style)
+/* -------------------------
+ * Router-style routes
+ * ------------------------- */
 const chatRoutes = require("./routes/chat");
 app.use("/api", chatRoutes);
 
-// Uploads (router-style)
+// Uploads
 const uploadsRoutes = require("./routes/uploads");
 app.use("/api/uploads", uploadsRoutes);
 
-// Payments (router-style). Inside this file, the /webhook route uses express.raw({ type: 'application/json' }) again.
-// Because we skipped global parsers for that single path above, the raw body reaches the router intact.
+// Payments (includes /start, /status, /_diag and the raw-body /webhook)
 const paymentsRoutes = require("./routes/payments");
 app.use("/api/payments", paymentsRoutes);
 
-// ---------------------------
-// 5) 404 + GLOBAL ERROR
-// ---------------------------
+// Subscriptions (==> fixes your 404 on /api/subscriptions/plans)
+const subscriptionsRoutes = require("./routes/subscriptions");
+app.use("/api/subscriptions", subscriptionsRoutes);
+
+// Optional/defensive mounts
+let vehiclesRoutes = null;
+try { vehiclesRoutes = require("./routes/vehicles"); } catch (_) {}
+if (vehiclesRoutes) app.use("/api/vehicles", vehiclesRoutes);
+
+/* -----------------------
+ * 404 fallback
+ * ----------------------- */
 app.use((req, res) => {
   res.status(404).json({ error: "Not found", path: req.originalUrl });
 });
 
+// Global error
 app.use((err, req, res, _next) => {
   console.error("[unhandled]", err);
   const status = err.status || 500;
@@ -145,8 +142,5 @@ app.use((err, req, res, _next) => {
   });
 });
 
-// ---------------------------
-// 6) START
-// ---------------------------
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
