@@ -13,37 +13,59 @@ function getPool(req) {
   return pool;
 }
 
-async function getPlanByAny(pool, raw) {
+// --- helpers -------------------------------------------------
+
+async function fetchPlanByAny(pool, raw) {
   const sql = `
-    SELECT code, name,
-           COALESCE(price_cents, (NULLIF(price_amount,0) * 100)::int, 0) AS price_cents,
-           COALESCE(currency, price_currency, 'KES') AS currency,
-           COALESCE(is_active, TRUE) AS is_active
+    SELECT
+      /* robust code even if DB code is null */
+      COALESCE(NULLIF(TRIM(code), ''), UPPER(REGEXP_REPLACE(name,'[^A-Za-z0-9]','','g'))) AS code,
+      name,
+      COALESCE(price_cents, (NULLIF(price_amount,0) * 100)::int, 0) AS price_cents,
+      COALESCE(currency, price_currency, 'KES') AS currency,
+      COALESCE(is_active, TRUE) AS is_active
     FROM subscription_plans
     WHERE
       UPPER(code) = UPPER($1)
       OR REGEXP_REPLACE(UPPER(name),'[^A-Z0-9]','','g') = REGEXP_REPLACE(UPPER($1),'[^A-Z0-9]','','g')
     LIMIT 1
   `;
-  return (await pool.query(sql, [raw])).rows[0];
+  const row = (await pool.query(sql, [raw])).rows[0];
+  if (!row) return null;
+  row.code = (row.code || "").toUpperCase();
+  return row;
 }
 
-/* -----------------------------
- * POST /api/payments/start
- * ----------------------------- */
+async function fetchPlanByAmount(pool, amountCents) {
+  const sql = `
+    SELECT
+      COALESCE(NULLIF(TRIM(code), ''), UPPER(REGEXP_REPLACE(name,'[^A-Za-z0-9]','','g'))) AS code,
+      name
+    FROM subscription_plans
+    WHERE COALESCE(price_cents, (NULLIF(price_amount,0) * 100)::int, 0) = $1
+    LIMIT 1
+  `;
+  const row = (await pool.query(sql, [amountCents])).rows[0];
+  if (!row) return null;
+  row.code = (row.code || "").toUpperCase();
+  return row;
+}
+
+// --- start checkout ------------------------------------------
+
 router.post("/start", authenticateToken, async (req, res) => {
   try {
     const raw = (req.body?.plan_code || "").trim();
     if (!raw) return res.status(400).json({ error: "Missing plan_code" });
 
     const pool = getPool(req);
-    const plan = await getPlanByAny(pool, raw);
+    const plan = await fetchPlanByAny(pool, raw);
 
     if (!plan || !plan.is_active) {
       return res.status(400).json({ error: "Unknown or inactive plan_code" });
     }
 
-    if ((plan.code || "").toUpperCase() === "FREE") {
+    if (plan.code === "FREE") {
       return res.json({
         ok: true,
         free: true,
@@ -64,14 +86,14 @@ router.post("/start", authenticateToken, async (req, res) => {
     const user = (await pool.query(`SELECT id, email, name FROM users WHERE id=$1`, [req.user.id])).rows[0];
     if (!user) return res.status(401).json({ error: "User not found" });
 
-    const reference = `S360_${user.id}_${(plan.code || "").toUpperCase()}_${Date.now()}`;
+    const reference = `S360_${user.id}_${plan.code}_${Date.now()}`;
     const payload = {
       email: user.email,
-      amount,
-      currency,
+      amount: amount,         // integer minor units
+      currency: currency,     // KES
       reference,
       callback_url: process.env.PAYSTACK_CALLBACK_URL || `${process.env.APP_BASE_URL || ""}/billing/thanks`,
-      metadata: { user_id: user.id, plan_code: (plan.code || "").toUpperCase(), plan_name: plan.name }
+      metadata: { user_id: user.id, plan_code: plan.code, plan_name: plan.name },
     };
 
     const resp = await fetch("https://api.paystack.co/transaction/initialize", {
@@ -94,7 +116,7 @@ router.post("/start", authenticateToken, async (req, res) => {
       authorization_url: data.data?.authorization_url,
       access_code: data.data?.access_code,
       plan: {
-        code: (plan.code || "").toUpperCase(),
+        code: plan.code,
         name: plan.name,
         price_cents: amount,
         currency
@@ -106,10 +128,8 @@ router.post("/start", authenticateToken, async (req, res) => {
   }
 });
 
-/* -----------------------------
- * POST /api/payments/webhook
- * (raw body; index.js already ensures raw)
- * ----------------------------- */
+// --- webhook -------------------------------------------------
+
 router.post("/webhook", express.raw({ type: "application/json" }), async (req, res) => {
   try {
     const secret = process.env.PAYSTACK_SECRET_KEY;
@@ -124,50 +144,64 @@ router.post("/webhook", express.raw({ type: "application/json" }), async (req, r
 
     const data = evt.data || {};
     const meta = data.metadata || {};
-    const reference = data.reference;
-    const amount_cents = Number(data.amount) || 0;         // minor units
-    const currency = (data.currency || "KES").toUpperCase();
-    const channel  = (data.channel || "").toString();
-    const status   = (data.status  || "success").toString();
 
-    const user_id  = meta.user_id || null;
-    const planCode = (meta.plan_code || "").toUpperCase() || null;
+    const reference     = data.reference;
+    const amount_cents  = Number(data.amount) || 0;
+    const currency      = (data.currency || "KES").toUpperCase();
+    const channel       = (data.channel || "").toString();
+    const status        = (data.status  || "success").toString();
+
+    const user_id_meta  = meta.user_id || null;
+    let plan_code_meta  = (meta.plan_code || meta.plan || meta.planCode || "").toString().toUpperCase();
 
     const pool = getPool(req);
 
-    // Record payment (your existing columns)
+    // If metadata missing (common in some test flows), derive by amount
+    if (!plan_code_meta) {
+      const p = await fetchPlanByAmount(pool, amount_cents);
+      plan_code_meta = p?.code || null;
+    }
+
+    // Log payment (upsert by reference)
     await pool.query(
       `
       INSERT INTO payments (user_id, provider, reference, amount_cents, currency, channel, plan_code, status, raw, created_at)
-      VALUES ($1, 'paystack', $2, $3, $4, $5, $6, $7, $8::jsonb, NOW())
-      ON CONFLICT (reference) DO NOTHING
+      VALUES ($1,'paystack',$2,$3,$4,$5,$6,$7,$8::jsonb,NOW())
+      ON CONFLICT (reference) DO UPDATE
+        SET user_id   = COALESCE(EXCLUDED.user_id, payments.user_id),
+            amount_cents = EXCLUDED.amount_cents,
+            currency  = EXCLUDED.currency,
+            channel   = EXCLUDED.channel,
+            plan_code = COALESCE(EXCLUDED.plan_code, payments.plan_code),
+            status    = EXCLUDED.status,
+            raw       = EXCLUDED.raw
       `,
-      [user_id, reference, amount_cents, currency, channel, planCode, status, JSON.stringify(evt)]
+      [user_id_meta, reference, amount_cents, currency, channel, plan_code_meta, status, JSON.stringify(evt)]
     );
 
-    // Upsert subscription
-    if (user_id && planCode) {
+    // Upsert subscription if we have both user and plan
+    if (user_id_meta && plan_code_meta) {
       await pool.query(
         `
         INSERT INTO user_subscriptions (user_id, plan_code, status, started_at, renewed_at, meta)
         VALUES ($1, $2, 'active', NOW(), NOW(), $3)
         ON CONFLICT (user_id, plan_code)
-        DO UPDATE SET status='active', renewed_at=NOW(), meta = COALESCE(user_subscriptions.meta, '{}'::jsonb) || EXCLUDED.meta
+        DO UPDATE SET status='active', renewed_at=NOW(),
+                      meta = COALESCE(user_subscriptions.meta, '{}'::jsonb) || EXCLUDED.meta
         `,
-        [user_id, planCode, evt]
+        [user_id_meta, plan_code_meta, evt]
       );
     }
 
-    // Send invoice email
-    if (user_id) {
-      const user = (await pool.query(`SELECT email, name FROM users WHERE id=$1`, [user_id])).rows[0];
+    // Email invoice (uses the same template key that worked in your admin tests)
+    if (user_id_meta) {
+      const user = (await pool.query(`SELECT email, name FROM users WHERE id=$1`, [user_id_meta])).rows[0];
       if (user?.email) {
-        const planRow = (await pool.query(
-          `SELECT name FROM subscription_plans WHERE UPPER(code)=UPPER($1) LIMIT 1`,
-          [planCode]
-        )).rows[0];
-        const plan_name = planRow?.name || planCode || "Subscription";
+        const planRow = plan_code_meta
+          ? (await pool.query(`SELECT name FROM subscription_plans WHERE UPPER(code)=UPPER($1) LIMIT 1`, [plan_code_meta])).rows[0]
+          : null;
 
+        const plan_name = planRow?.name || plan_code_meta || "Subscription";
         const issued_at = new Date().toISOString();
         const period_start = new Date().toISOString().slice(0,10);
         const period_end   = new Date(Date.now() + 30*24*60*60*1000).toISOString().slice(0,10);
@@ -177,11 +211,11 @@ router.post("/webhook", express.raw({ type: "application/json" }), async (req, r
           await sendEmail(
             user.email,
             "Your Saka360 Subscription Invoice",
-            "subscription_invoice", // keep same template key you used in admin tests
+            "subscription_invoice",       // <-- template key (singular) matches your working admin test
             {
               user_name: user.name || "there",
               plan_name,
-              plan_code: planCode || "",
+              plan_code: plan_code_meta || "",
               amount_cents,
               currency,
               invoice_number,
@@ -204,62 +238,51 @@ router.post("/webhook", express.raw({ type: "application/json" }), async (req, r
   }
 });
 
-/* -----------------------------
- * GET /api/payments/status
- * Try subscription; if missing, adopt latest successful payment.
- * ----------------------------- */
+// --- status --------------------------------------------------
+
 router.get("/status", authenticateToken, async (req, res) => {
   try {
     const pool = getPool(req);
 
-    // 1) try user_subscriptions
+    // First, try existing subscription
     let sub = (await pool.query(
-      `SELECT plan_code, status, started_at, renewed_at
-       FROM user_subscriptions
+      `SELECT plan_code, status FROM user_subscriptions
        WHERE user_id = $1
        ORDER BY COALESCE(renewed_at, started_at) DESC
        LIMIT 1`,
       [req.user.id]
     )).rows[0];
 
-    // 2) if none, check latest successful payment and backfill
+    // If none, check latest successful payment and adopt (derive plan if needed)
     if (!sub) {
       const pay = (await pool.query(
-        `SELECT plan_code
+        `SELECT plan_code, amount_cents
            FROM payments
-          WHERE user_id = $1 AND status = 'success' AND plan_code IS NOT NULL
+          WHERE user_id = $1 AND status = 'success'
           ORDER BY id DESC
           LIMIT 1`,
         [req.user.id]
       )).rows[0];
 
-      if (pay?.plan_code) {
-        // create a subscription row
+      let planCode = (pay?.plan_code || "").toUpperCase();
+      if (!planCode && pay?.amount_cents) {
+        const p = await fetchPlanByAmount(pool, pay.amount_cents);
+        planCode = p?.code || "";
+      }
+
+      if (planCode) {
         await pool.query(
           `INSERT INTO user_subscriptions (user_id, plan_code, status, started_at, renewed_at, meta)
            VALUES ($1, $2, 'active', NOW(), NOW(), '{}'::jsonb)
            ON CONFLICT (user_id, plan_code)
            DO UPDATE SET status='active', renewed_at=NOW()`,
-          [req.user.id, pay.plan_code]
+          [req.user.id, planCode]
         );
-
-        sub = { plan_code: pay.plan_code, status: "active" };
+        sub = { plan_code: planCode, status: "active" };
       }
     }
 
-    const planCode = (sub?.plan_code || 'FREE').toUpperCase();
-
-    const plan = (await pool.query(
-      `SELECT code, name,
-              COALESCE(price_cents, (NULLIF(price_amount,0) * 100)::int, 0) AS price_cents,
-              COALESCE(currency, price_currency, 'KES') AS currency,
-              features
-       FROM subscription_plans WHERE UPPER(code) = UPPER($1)`,
-      [planCode]
-    )).rows[0];
-
-    const fallback = { code: 'FREE', name: 'Free', price_cents: 0, currency: 'KES', features: '1 vehicle,basic logs' };
-    const effective = plan || fallback;
+    const code = (sub?.plan_code || 'FREE').toUpperCase();
 
     const vehiclesCount = (await pool.query(
       `SELECT COUNT(*)::int AS c FROM vehicles WHERE user_id = $1`,
@@ -279,7 +302,7 @@ router.get("/status", authenticateToken, async (req, res) => {
     };
 
     res.json({
-      plan: { code: planCode, ...(caps[planCode] || caps.FREE) },
+      plan: { code, ...(caps[code] || caps.FREE) },
       usage: { vehicles: vehiclesCount, documents: documentsCount }
     });
   } catch (e) {
@@ -288,9 +311,8 @@ router.get("/status", authenticateToken, async (req, res) => {
   }
 });
 
-/* -----------------------------
- * GET /api/payments/_diag
- * ----------------------------- */
+// --- diag ----------------------------------------------------
+
 router.get("/_diag", authenticateToken, async (req, res) => {
   try {
     const pool = getPool(req);
