@@ -6,16 +6,13 @@ const app = express();
 
 app.set("trust proxy", 1);
 
-/* -------------------------------------------------
- * IMPORTANT: Raw body ONLY for /api/payments/webhook
- * ------------------------------------------------- */
-const rawBodyPaths = new Set(["/api/payments/webhook"]);
+// --- IMPORTANT: Skip JSON/urlencoded parsing for the Paystack webhook path
 app.use((req, res, next) => {
-  if (rawBodyPaths.has(req.path)) return next();
+  if (req.path === "/api/payments/webhook") return next();
   return express.json()(req, res, next);
 });
 app.use((req, res, next) => {
-  if (rawBodyPaths.has(req.path)) return next();
+  if (req.path === "/api/payments/webhook") return next();
   return express.urlencoded({ extended: false })(req, res, next);
 });
 
@@ -79,54 +76,41 @@ app.get("/api/diag/pool", (req, res) => {
   res.json({ pool_attached: !!app.get("pool") });
 });
 
-// Mailers / reminders helpers (used by some routes)
+// Mailers & reminders (unchanged)
 const { verifySmtp, sendEmail } = require("./utils/mailer");
 const { runExpiryCheckCore } = require("./utils/reminders");
 
-// Auth middlewares for admin/test routes you already use
+// Auth middlewares
 const { authenticateToken, adminOnly } = require("./middleware/auth");
 
-// Test/admin email routes (already working)
+// Admin email test endpoints
 const adminEmailRoutes = require("./routes/adminEmails");
 app.use("/api/admin/email", adminEmailRoutes);
 
-/* -------------------------
- * Function-style routes
- * ------------------------- */
+// Function-style core routes
 require("./routes/users")(app);
 require("./routes/fuel")(app);
 require("./routes/service")(app);
 require("./routes/documents")(app);
 require("./routes/reminders")(app);
 require("./routes/reports")(app);
-require("./routes/whatsapp")(app); // POST /api/webhooks/whatsapp
+require("./routes/whatsapp")(app);
 
-/* -------------------------
- * Router-style routes
- * ------------------------- */
+// Router-style
 const chatRoutes = require("./routes/chat");
 app.use("/api", chatRoutes);
 
-// Uploads
 const uploadsRoutes = require("./routes/uploads");
 app.use("/api/uploads", uploadsRoutes);
 
-// Payments (includes /start, /status, /_diag and the raw-body /webhook)
 const paymentsRoutes = require("./routes/payments");
 app.use("/api/payments", paymentsRoutes);
 
-// Subscriptions (==> fixes your 404 on /api/subscriptions/plans)
-const subscriptionsRoutes = require("./routes/subscriptions");
-app.use("/api/subscriptions", subscriptionsRoutes);
+// NEW: Payments admin backfill router
+const paymentsAdminRoutes = require("./routes/payments_admin");
+app.use("/api/payments", paymentsAdminRoutes);
 
-// Optional/defensive mounts
-let vehiclesRoutes = null;
-try { vehiclesRoutes = require("./routes/vehicles"); } catch (_) {}
-if (vehiclesRoutes) app.use("/api/vehicles", vehiclesRoutes);
-
-/* -----------------------
- * 404 fallback
- * ----------------------- */
+// 404
 app.use((req, res) => {
   res.status(404).json({ error: "Not found", path: req.originalUrl });
 });
