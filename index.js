@@ -26,11 +26,36 @@ app.get("/", (req, res) => {
 // Twilio WhatsApp webhook (incoming messages)
 app.post("/whatsapp/inbound", async (req, res) => {
   try {
-    const from = req.body.From;      // WhatsApp sender
-    const to = req.body.To;          // Your WhatsApp number
-    const text = req.body.Body || ""; // Message text
+    const from = req.body.From;
+    const to = req.body.To;
+    const text = req.body.Body || "";
 
     console.log("Incoming WhatsApp:", { from, to, text });
+
+    const n8nResponse = await axios.post(process.env.N8N_WEBHOOK_URL, {
+      from,
+      to,
+      text,
+    });
+
+    console.log("N8N response data:", n8nResponse.data);  // 👈 ADD THIS
+
+    const replyText =
+      (n8nResponse.data && n8nResponse.data.reply) ||
+      "Hi 👋, this is Saka360. I received your message.";
+
+    await client.messages.create({
+      from: TWILIO_WHATSAPP_NUMBER,
+      to: from,
+      body: replyText,
+    });
+
+    res.status(200).send("OK");
+  } catch (error) {
+    console.error("Error in /whatsapp/inbound:", error.message);
+    res.status(200).send("OK");
+  }
+});
 
     // 1) Send to n8n for processing
     const n8nResponse = await axios.post(N8N_WEBHOOK_URL, {
