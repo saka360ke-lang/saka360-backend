@@ -9,6 +9,7 @@ const { Pool } = require("pg");
 
 const app = express();
 
+// Twilio sends x-www-form-urlencoded by default
 app.use(bodyParser.urlencoded({ extended: false }));
 app.use(bodyParser.json());
 
@@ -56,14 +57,14 @@ async function testDb() {
 }
 testDb();
 
-// ====== HELPERS ======
+// ====== GENERIC HELPERS ======
 function parseNumber(text) {
   if (!text) return NaN;
   const cleaned = String(text).replace(/[^0-9.]/g, "");
   return parseFloat(cleaned);
 }
 
-// ----- Fuel helpers -----
+// ====== FUEL HELPERS ======
 async function getActiveFuelSession(userWhatsapp) {
   const result = await pool.query(
     `
@@ -228,7 +229,7 @@ async function buildFuelReport(userWhatsapp) {
   );
 }
 
-// ----- Service helpers -----
+// ====== SERVICE HELPERS (with notes) ======
 async function getActiveServiceSession(userWhatsapp) {
   const result = await pool.query(
     `
@@ -291,6 +292,7 @@ async function saveServiceLogFromSession(session) {
   const reminderOdometer = session.reminder_odometer
     ? Number(session.reminder_odometer)
     : null;
+  const notes = session.notes || null;
 
   await pool.query(
     `
@@ -301,9 +303,10 @@ async function saveServiceLogFromSession(session) {
       odometer_numeric,
       reminder_type,
       reminder_date_text,
-      reminder_odometer
+      reminder_odometer,
+      notes
     )
-    VALUES ($1, $2, $3, $4, $5, $6, $7)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
   `,
     [
       session.user_whatsapp,
@@ -313,13 +316,14 @@ async function saveServiceLogFromSession(session) {
       reminderType,
       reminderDateText,
       reminderOdometer,
+      notes,
     ]
   );
 
   console.log("📝 Saved service log for:", session.user_whatsapp);
 }
 
-// ----- Expense helpers -----
+// ====== EXPENSE HELPERS ======
 async function getActiveExpenseSession(userWhatsapp) {
   const result = await pool.query(
     `
@@ -404,8 +408,8 @@ app.get("/", (req, res) => {
 // ====== MAIN WHATSAPP HANDLER ======
 app.post("/whatsapp/inbound", async (req, res) => {
   try {
-    const from = req.body.From;
-    const to = req.body.To;
+    const from = req.body.From;        // "whatsapp:+2547..."
+    const to = req.body.To;            // your Twilio WA number
     const rawText = req.body.Body || "";
     const text = rawText.trim();
     const lower = text.toLowerCase();
@@ -420,7 +424,7 @@ app.post("/whatsapp/inbound", async (req, res) => {
 
     let replyText = "";
 
-    // 1) Check active sessions in priority: fuel, service, expense
+    // 1) Active sessions first
     const activeFuelSession = await getActiveFuelSession(from);
     const activeServiceSession = await getActiveServiceSession(from);
     const activeExpenseSession = await getActiveExpenseSession(from);
@@ -440,7 +444,7 @@ app.post("/whatsapp/inbound", async (req, res) => {
     } else if (lower === "expense" || lower === "expenses") {
       replyText = await startExpenseSession(from);
     } else {
-      // No session, no special command -> send to n8n
+      // 2) No session, no local command → send to n8n
       let n8nResponseData = {};
       try {
         const n8nResponse = await axios.post(N8N_WEBHOOK_URL, {
@@ -488,7 +492,6 @@ app.post("/whatsapp/inbound", async (req, res) => {
 async function handleFuelSessionStep(session, incomingText) {
   const step = session.step;
   const id = session.id;
-  const userWhatsapp = session.user_whatsapp;
 
   if (step === "ASK_TOTAL_COST") {
     const totalCost = parseNumber(incomingText);
@@ -575,7 +578,7 @@ async function handleFuelSessionStep(session, incomingText) {
   return "Something went wrong with this fuel entry. Please type *fuel* to start again.";
 }
 
-// ====== SERVICE SESSION HANDLER ======
+// ====== SERVICE SESSION HANDLER (WITH NOTES) ======
 async function handleServiceSessionStep(session, incomingText) {
   const step = session.step;
   const id = session.id;
@@ -622,6 +625,28 @@ async function handleServiceSessionStep(session, incomingText) {
 
     await updateServiceSessionStep(id, {
       odometer_numeric: odometer,
+      step: "ASK_SERVICE_NOTES",
+    });
+
+    return (
+      "Optional 📝\n" +
+      "You can add any *notes* about this service.\n\n" +
+      "Examples:\n" +
+      "• Mechanic: John 0722123456\n" +
+      "• Service center: Toyota Ngong Road\n" +
+      "• Notes: used OEM oil filter\n\n" +
+      "If you don't want to add notes, reply with *skip*."
+    );
+  }
+
+  if (step === "ASK_SERVICE_NOTES") {
+    let notes = incomingText.trim();
+    if (notes.toLowerCase() === "skip") {
+      notes = null;
+    }
+
+    await updateServiceSessionStep(id, {
+      notes,
       step: "ASK_SERVICE_REMINDER_TYPE",
     });
 
@@ -654,13 +679,19 @@ async function handleServiceSessionStep(session, incomingText) {
       const title = updatedSession.title || "Service";
       const cost = Number(updatedSession.cost_numeric);
       const odo = Number(updatedSession.odometer_numeric);
+      const notes = updatedSession.notes;
 
-      return (
+      let summary =
         "✅ Service log saved with *no reminder*.\n\n" +
         `• Service: *${title}*\n` +
         `• Cost: *${cost.toFixed(2)} KES*\n` +
-        `• Odometer: *${odo.toFixed(0)} km*`
-      );
+        `• Odometer: *${odo.toFixed(0)} km*`;
+
+      if (notes) {
+        summary += `\n• Notes: *${notes}*`;
+      }
+
+      return summary;
     }
 
     if (lower === "date") {
@@ -714,14 +745,20 @@ async function handleServiceSessionStep(session, incomingText) {
     const title = updatedSession.title || "Service";
     const cost = Number(updatedSession.cost_numeric);
     const odo = Number(updatedSession.odometer_numeric);
+    const notes = updatedSession.notes;
 
-    return (
+    let summary =
       "✅ Service log saved with *date reminder*.\n\n" +
       `• Service: *${title}*\n` +
       `• Cost: *${cost.toFixed(2)} KES*\n` +
       `• Odometer: *${odo.toFixed(0)} km*\n` +
-      `• Reminder date: *${dateText}*`
-    );
+      `• Reminder date: *${dateText}*`;
+
+    if (notes) {
+      summary += `\n• Notes: *${notes}*`;
+    }
+
+    return summary;
   }
 
   if (step === "ASK_SERVICE_REMINDER_ODOMETER") {
@@ -746,14 +783,20 @@ async function handleServiceSessionStep(session, incomingText) {
     const title = updatedSession.title || "Service";
     const cost = Number(updatedSession.cost_numeric);
     const odo = Number(updatedSession.odometer_numeric);
+    const notes = updatedSession.notes;
 
-    return (
+    let summary =
       "✅ Service log saved with *mileage reminder*.\n\n" +
       `• Service: *${title}*\n` +
       `• Cost: *${cost.toFixed(2)} KES*\n` +
       `• Odometer: *${odo.toFixed(0)} km*\n` +
-      `• Next reminder at: *${remOdo.toFixed(0)} km*`
-    );
+      `• Next reminder at: *${remOdo.toFixed(0)} km*`;
+
+    if (notes) {
+      summary += `\n• Notes: *${notes}*`;
+    }
+
+    return summary;
   }
 
   console.warn("⚠️ Unknown service session step:", step);
