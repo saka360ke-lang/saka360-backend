@@ -1,5 +1,5 @@
 // index.js
-// Saka360 Backend - WhatsApp → (Fuel logic or n8n) → DB → WhatsApp
+// Saka360 Backend - WhatsApp → (Fuel / Service / Expense or n8n) → DB → WhatsApp
 
 const express = require("express");
 const bodyParser = require("body-parser");
@@ -9,7 +9,6 @@ const { Pool } = require("pg");
 
 const app = express();
 
-// Twilio sends x-www-form-urlencoded by default
 app.use(bodyParser.urlencoded({ extended: false }));
 app.use(bodyParser.json());
 
@@ -23,7 +22,6 @@ const {
   PORT
 } = process.env;
 
-// Debug env vars (without printing secrets)
 const missing = [];
 if (!TWILIO_ACCOUNT_SID) missing.push("TWILIO_ACCOUNT_SID");
 if (!TWILIO_AUTH_TOKEN) missing.push("TWILIO_AUTH_TOKEN");
@@ -38,10 +36,9 @@ if (missing.length) {
   console.log("Using TWILIO_WHATSAPP_NUMBER:", JSON.stringify(TWILIO_WHATSAPP_NUMBER));
 }
 
-// Twilio client
 const twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 
-// ====== POSTGRES SETUP ======
+// ====== POSTGRES ======
 const pool = new Pool({
   connectionString: DATABASE_URL,
   ssl: {
@@ -59,14 +56,14 @@ async function testDb() {
 }
 testDb();
 
-// ====== SMALL HELPERS ======
-
+// ====== HELPERS ======
 function parseNumber(text) {
   if (!text) return NaN;
   const cleaned = String(text).replace(/[^0-9.]/g, "");
   return parseFloat(cleaned);
 }
 
+// ----- Fuel helpers -----
 async function getActiveFuelSession(userWhatsapp) {
   const result = await pool.query(
     `
@@ -120,9 +117,7 @@ async function updateFuelSessionStep(id, fields) {
   await pool.query(query, values);
 }
 
-// Save structured fuel log
 async function saveFuelLogFromSession(session) {
-  // Cast to Number because Postgres returns NUMERIC as string
   const totalCost = Number(session.total_cost_numeric);
   const pricePerLiter = Number(session.price_per_liter_numeric);
   const odometer = Number(session.odometer_numeric);
@@ -159,9 +154,7 @@ async function saveFuelLogFromSession(session) {
   return liters;
 }
 
-// Build simple fuel report (daily / weekly / monthly)
 async function buildFuelReport(userWhatsapp) {
-  // Total cost last 30 days
   const monthly = await pool.query(
     `
     SELECT COALESCE(SUM(total_cost_numeric), 0) AS total
@@ -172,7 +165,6 @@ async function buildFuelReport(userWhatsapp) {
     [userWhatsapp]
   );
 
-  // Last 7 days
   const weekly = await pool.query(
     `
     SELECT COALESCE(SUM(total_cost_numeric), 0) AS total
@@ -183,7 +175,6 @@ async function buildFuelReport(userWhatsapp) {
     [userWhatsapp]
   );
 
-  // Last 24 hours
   const daily = await pool.query(
     `
     SELECT COALESCE(SUM(total_cost_numeric), 0) AS total
@@ -194,7 +185,6 @@ async function buildFuelReport(userWhatsapp) {
     [userWhatsapp]
   );
 
-  // Efficiency (use last 2 logs with odometer & liters)
   const effRes = await pool.query(
     `
     SELECT odometer, liters
@@ -238,16 +228,184 @@ async function buildFuelReport(userWhatsapp) {
   );
 }
 
+// ----- Service helpers -----
+async function getActiveServiceSession(userWhatsapp) {
+  const result = await pool.query(
+    `
+    SELECT *
+    FROM service_sessions
+    WHERE user_whatsapp = $1
+      AND is_completed = FALSE
+    ORDER BY id DESC
+    LIMIT 1
+  `,
+    [userWhatsapp]
+  );
+  return result.rows[0] || null;
+}
+
+async function startServiceSession(userWhatsapp) {
+  await pool.query(
+    `
+    INSERT INTO service_sessions (user_whatsapp, step, is_completed)
+    VALUES ($1, 'ASK_SERVICE_TITLE', FALSE)
+  `,
+    [userWhatsapp]
+  );
+
+  return (
+    "🔧 Let’s log a *service*.\n" +
+    "What is the service? (e.g. Oil change, Timing belt, Turbo service)"
+  );
+}
+
+async function updateServiceSessionStep(id, fields) {
+  const sets = [];
+  const values = [];
+  let idx = 1;
+
+  for (const [key, val] of Object.entries(fields)) {
+    sets.push(`${key} = $${idx}`);
+    values.push(val);
+    idx++;
+  }
+
+  sets.push(`updated_at = NOW()`);
+
+  const query = `
+    UPDATE service_sessions
+    SET ${sets.join(", ")}
+    WHERE id = $${idx}
+  `;
+  values.push(id);
+
+  await pool.query(query, values);
+}
+
+async function saveServiceLogFromSession(session) {
+  const title = session.title || "Service";
+  const cost = Number(session.cost_numeric);
+  const odometer = Number(session.odometer_numeric);
+  const reminderType = session.reminder_type || "none";
+  const reminderDateText = session.reminder_date_text || null;
+  const reminderOdometer = session.reminder_odometer
+    ? Number(session.reminder_odometer)
+    : null;
+
+  await pool.query(
+    `
+    INSERT INTO service_logs (
+      user_whatsapp,
+      title,
+      cost_numeric,
+      odometer_numeric,
+      reminder_type,
+      reminder_date_text,
+      reminder_odometer
+    )
+    VALUES ($1, $2, $3, $4, $5, $6, $7)
+  `,
+    [
+      session.user_whatsapp,
+      title,
+      cost,
+      odometer || null,
+      reminderType,
+      reminderDateText,
+      reminderOdometer,
+    ]
+  );
+
+  console.log("📝 Saved service log for:", session.user_whatsapp);
+}
+
+// ----- Expense helpers -----
+async function getActiveExpenseSession(userWhatsapp) {
+  const result = await pool.query(
+    `
+    SELECT *
+    FROM expense_sessions
+    WHERE user_whatsapp = $1
+      AND is_completed = FALSE
+    ORDER BY id DESC
+    LIMIT 1
+  `,
+    [userWhatsapp]
+  );
+  return result.rows[0] || null;
+}
+
+async function startExpenseSession(userWhatsapp) {
+  await pool.query(
+    `
+    INSERT INTO expense_sessions (user_whatsapp, step, is_completed)
+    VALUES ($1, 'ASK_EXPENSE_TITLE', FALSE)
+  `,
+    [userWhatsapp]
+  );
+
+  return (
+    "💸 Let’s log an *expense*.\n" +
+    "What is the expense for? (e.g. Puncture, Paint job, Parts, Parking)"
+  );
+}
+
+async function updateExpenseSessionStep(id, fields) {
+  const sets = [];
+  const values = [];
+  let idx = 1;
+
+  for (const [key, val] of Object.entries(fields)) {
+    sets.push(`${key} = $${idx}`);
+    values.push(val);
+    idx++;
+  }
+
+  sets.push(`updated_at = NOW()`);
+
+  const query = `
+    UPDATE expense_sessions
+    SET ${sets.join(", ")}
+    WHERE id = $${idx}
+  `;
+  values.push(id);
+
+  await pool.query(query, values);
+}
+
+async function saveExpenseLogFromSession(session) {
+  const title = session.title || "Expense";
+  const cost = Number(session.cost_numeric);
+  const odometer = session.odometer_numeric
+    ? Number(session.odometer_numeric)
+    : null;
+
+  await pool.query(
+    `
+    INSERT INTO expense_logs (
+      user_whatsapp,
+      title,
+      cost_numeric,
+      odometer_numeric
+    )
+    VALUES ($1, $2, $3, $4)
+  `,
+    [session.user_whatsapp, title, cost, odometer]
+  );
+
+  console.log("📝 Saved expense log for:", session.user_whatsapp);
+}
+
 // ====== HEALTH CHECK ======
 app.get("/", (req, res) => {
   res.send("Saka360 backend is running ✅");
 });
 
-// ====== MAIN WHATSAPP INBOUND HANDLER ======
+// ====== MAIN WHATSAPP HANDLER ======
 app.post("/whatsapp/inbound", async (req, res) => {
   try {
-    const from = req.body.From;        // "whatsapp:+2547..."
-    const to = req.body.To;            // your Twilio WhatsApp number
+    const from = req.body.From;
+    const to = req.body.To;
     const rawText = req.body.Body || "";
     const text = rawText.trim();
     const lower = text.toLowerCase();
@@ -262,20 +420,27 @@ app.post("/whatsapp/inbound", async (req, res) => {
 
     let replyText = "";
 
-    // ====== 1) Check if user is in an active fuel session ======
-    const activeSession = await getActiveFuelSession(from);
+    // 1) Check active sessions in priority: fuel, service, expense
+    const activeFuelSession = await getActiveFuelSession(from);
+    const activeServiceSession = await getActiveServiceSession(from);
+    const activeExpenseSession = await getActiveExpenseSession(from);
 
-    if (activeSession) {
-      // Handle the next step in the fuel flow
-      replyText = await handleFuelSessionStep(activeSession, text);
+    if (activeFuelSession) {
+      replyText = await handleFuelSessionStep(activeFuelSession, text);
+    } else if (activeServiceSession) {
+      replyText = await handleServiceSessionStep(activeServiceSession, text);
+    } else if (activeExpenseSession) {
+      replyText = await handleExpenseSessionStep(activeExpenseSession, text);
     } else if (lower === "fuel") {
-      // ====== 2) Start a new fuel session ======
       replyText = await startFuelSession(from);
     } else if (lower === "fuel report") {
-      // ====== 3) Fuel report command ======
       replyText = await buildFuelReport(from);
+    } else if (lower === "service") {
+      replyText = await startServiceSession(from);
+    } else if (lower === "expense" || lower === "expenses") {
+      replyText = await startExpenseSession(from);
     } else {
-      // ====== 4) Default: send to n8n for general handling ======
+      // No session, no special command -> send to n8n
       let n8nResponseData = {};
       try {
         const n8nResponse = await axios.post(N8N_WEBHOOK_URL, {
@@ -294,12 +459,11 @@ app.post("/whatsapp/inbound", async (req, res) => {
         (n8nResponseData &&
           n8nResponseData.reply &&
           String(n8nResponseData.reply).trim()) ||
-        "Hi 👋, I’m Saka360. I received your message. Type 'fuel', 'service', 'repair' or 'report' to begin.";
+        "Hi 👋, I’m Saka360. I received your message. Type *fuel*, *service*, or *expense* to log something.";
     }
 
     console.log("💬 Replying to user with:", replyText);
 
-    // ====== SEND REPLY BACK VIA TWILIO ======
     try {
       await twilioClient.messages.create({
         from: TWILIO_WHATSAPP_NUMBER,
@@ -320,11 +484,11 @@ app.post("/whatsapp/inbound", async (req, res) => {
   }
 });
 
-// ====== FUEL SESSION STEP HANDLER ======
+// ====== FUEL SESSION HANDLER ======
 async function handleFuelSessionStep(session, incomingText) {
   const step = session.step;
-  const userWhatsapp = session.user_whatsapp;
   const id = session.id;
+  const userWhatsapp = session.user_whatsapp;
 
   if (step === "ASK_TOTAL_COST") {
     const totalCost = parseNumber(incomingText);
@@ -347,11 +511,7 @@ async function handleFuelSessionStep(session, incomingText) {
   if (step === "ASK_PRICE_PER_LITER") {
     const pricePerLiter = parseNumber(incomingText);
 
-    if (
-      !pricePerLiter ||
-      !isFinite(pricePerLiter) ||
-      pricePerLiter <= 0
-    ) {
+    if (!pricePerLiter || !isFinite(pricePerLiter) || pricePerLiter <= 0) {
       return "Please enter the *price per liter* in KES as numbers only (e.g. 200).";
     }
 
@@ -373,49 +533,307 @@ async function handleFuelSessionStep(session, incomingText) {
       return "Please enter the *odometer reading* in km as numbers only (e.g. 123456).";
     }
 
-    // Update session with odometer & mark completed
     await updateFuelSessionStep(id, {
       odometer_numeric: odometer,
       is_completed: true,
       step: "DONE",
     });
 
-    // Reload full session row (with updated fields)
     const result = await pool.query(
       "SELECT * FROM fuel_sessions WHERE id = $1",
       [id]
     );
     const updatedSession = result.rows[0];
 
-   const liters = await saveFuelLogFromSession(updatedSession);
+    const liters = await saveFuelLogFromSession(updatedSession);
 
-    // Cast values to numbers
     const totalCost = Number(updatedSession.total_cost_numeric);
     const pricePerLiter = Number(updatedSession.price_per_liter_numeric);
     const odoNum = Number(odometer);
 
-  let summary =
-    "✅ Fuel log saved.\n\n" +
-    `• Total cost: *${totalCost.toFixed(2)} KES*\n` +
-    `• Price per liter: *${pricePerLiter.toFixed(2)} KES*\n` +
-    `• Odometer: *${odoNum.toFixed(0)} km*`;
+    let summary =
+      "✅ Fuel log saved.\n\n" +
+      `• Total cost: *${totalCost.toFixed(2)} KES*\n` +
+      `• Price per liter: *${pricePerLiter.toFixed(2)} KES*\n` +
+      `• Odometer: *${odoNum.toFixed(0)} km*`;
 
-  if (liters && isFinite(liters)) {
-    const litersNum = Number(liters);
-  if (isFinite(litersNum)) {
-    summary += `\n• Liters (calculated): *${litersNum.toFixed(2)} L*`;
-  }
-}
+    if (liters && isFinite(liters)) {
+      const litersNum = Number(liters);
+      if (isFinite(litersNum)) {
+        summary += `\n• Liters (calculated): *${litersNum.toFixed(2)} L*`;
+      }
+    }
+
     summary +=
       "\n\nYou can type *fuel report* anytime to see your fuel cost summary and efficiency.";
 
     return summary;
   }
 
-  // Fallback: unknown step
   console.warn("⚠️ Unknown fuel session step:", step);
   await updateFuelSessionStep(id, { is_completed: true, step: "DONE" });
   return "Something went wrong with this fuel entry. Please type *fuel* to start again.";
+}
+
+// ====== SERVICE SESSION HANDLER ======
+async function handleServiceSessionStep(session, incomingText) {
+  const step = session.step;
+  const id = session.id;
+
+  if (step === "ASK_SERVICE_TITLE") {
+    const title = incomingText.trim();
+    if (!title) {
+      return "Please enter a short *service title* (e.g. Oil change, Timing belt, Turbo service).";
+    }
+
+    await updateServiceSessionStep(id, {
+      title,
+      step: "ASK_SERVICE_COST",
+    });
+
+    return (
+      `Service: *${title}*.\n` +
+      "What is the *service cost* in KES? (e.g. 5000)"
+    );
+  }
+
+  if (step === "ASK_SERVICE_COST") {
+    const cost = parseNumber(incomingText);
+    if (!cost || !isFinite(cost) || cost <= 0) {
+      return "Please enter the *service cost* in KES as numbers only (e.g. 5000).";
+    }
+
+    await updateServiceSessionStep(id, {
+      cost_numeric: cost,
+      step: "ASK_SERVICE_ODOMETER",
+    });
+
+    return (
+      "Got it ✅\n" +
+      "What is the *odometer reading* in km at the time of service? (e.g. 180000)"
+    );
+  }
+
+  if (step === "ASK_SERVICE_ODOMETER") {
+    const odometer = parseNumber(incomingText);
+    if (!odometer || !isFinite(odometer) || odometer <= 0) {
+      return "Please enter the *odometer reading* in km as numbers only (e.g. 180000).";
+    }
+
+    await updateServiceSessionStep(id, {
+      odometer_numeric: odometer,
+      step: "ASK_SERVICE_REMINDER_TYPE",
+    });
+
+    return (
+      "Do you want a *reminder* for this service?\n\n" +
+      "Reply with:\n" +
+      "• *date* – reminder by date\n" +
+      "• *km* – reminder by next mileage\n" +
+      "• *none* – no reminder"
+    );
+  }
+
+  if (step === "ASK_SERVICE_REMINDER_TYPE") {
+    const lower = incomingText.toLowerCase();
+
+    if (lower === "none" || lower === "no") {
+      await updateServiceSessionStep(id, {
+        reminder_type: "none",
+        is_completed: true,
+        step: "DONE",
+      });
+
+      const result = await pool.query(
+        "SELECT * FROM service_sessions WHERE id = $1",
+        [id]
+      );
+      const updatedSession = result.rows[0];
+      await saveServiceLogFromSession(updatedSession);
+
+      const title = updatedSession.title || "Service";
+      const cost = Number(updatedSession.cost_numeric);
+      const odo = Number(updatedSession.odometer_numeric);
+
+      return (
+        "✅ Service log saved with *no reminder*.\n\n" +
+        `• Service: *${title}*\n` +
+        `• Cost: *${cost.toFixed(2)} KES*\n` +
+        `• Odometer: *${odo.toFixed(0)} km*`
+      );
+    }
+
+    if (lower === "date") {
+      await updateServiceSessionStep(id, {
+        reminder_type: "date",
+        step: "ASK_SERVICE_REMINDER_DATE",
+      });
+
+      return (
+        "Okay ✅ reminder by *date*.\n" +
+        "Please enter the reminder date in format *YYYY-MM-DD* (e.g. 2025-03-10)."
+      );
+    }
+
+    if (lower === "km" || lower === "mileage") {
+      await updateServiceSessionStep(id, {
+        reminder_type: "km",
+        step: "ASK_SERVICE_REMINDER_ODOMETER",
+      });
+
+      return (
+        "Okay ✅ reminder by *next mileage*.\n" +
+        "Please enter the *odometer (km)* when you want the reminder (e.g. 200000)."
+      );
+    }
+
+    return (
+      "Please reply with *date*, *km* or *none* to set the reminder type."
+    );
+  }
+
+  if (step === "ASK_SERVICE_REMINDER_DATE") {
+    const dateText = incomingText.trim();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(dateText)) {
+      return "Please enter the date in *YYYY-MM-DD* format (e.g. 2025-03-10).";
+    }
+
+    await updateServiceSessionStep(id, {
+      reminder_date_text: dateText,
+      is_completed: true,
+      step: "DONE",
+    });
+
+    const result = await pool.query(
+      "SELECT * FROM service_sessions WHERE id = $1",
+      [id]
+    );
+    const updatedSession = result.rows[0];
+    await saveServiceLogFromSession(updatedSession);
+
+    const title = updatedSession.title || "Service";
+    const cost = Number(updatedSession.cost_numeric);
+    const odo = Number(updatedSession.odometer_numeric);
+
+    return (
+      "✅ Service log saved with *date reminder*.\n\n" +
+      `• Service: *${title}*\n` +
+      `• Cost: *${cost.toFixed(2)} KES*\n` +
+      `• Odometer: *${odo.toFixed(0)} km*\n` +
+      `• Reminder date: *${dateText}*`
+    );
+  }
+
+  if (step === "ASK_SERVICE_REMINDER_ODOMETER") {
+    const remOdo = parseNumber(incomingText);
+    if (!remOdo || !isFinite(remOdo) || remOdo <= 0) {
+      return "Please enter the *odometer (km)* as numbers only (e.g. 200000).";
+    }
+
+    await updateServiceSessionStep(id, {
+      reminder_odometer: remOdo,
+      is_completed: true,
+      step: "DONE",
+    });
+
+    const result = await pool.query(
+      "SELECT * FROM service_sessions WHERE id = $1",
+      [id]
+    );
+    const updatedSession = result.rows[0];
+    await saveServiceLogFromSession(updatedSession);
+
+    const title = updatedSession.title || "Service";
+    const cost = Number(updatedSession.cost_numeric);
+    const odo = Number(updatedSession.odometer_numeric);
+
+    return (
+      "✅ Service log saved with *mileage reminder*.\n\n" +
+      `• Service: *${title}*\n` +
+      `• Cost: *${cost.toFixed(2)} KES*\n` +
+      `• Odometer: *${odo.toFixed(0)} km*\n` +
+      `• Next reminder at: *${remOdo.toFixed(0)} km*`
+    );
+  }
+
+  console.warn("⚠️ Unknown service session step:", step);
+  await updateServiceSessionStep(id, { is_completed: true, step: "DONE" });
+  return "Something went wrong with this service entry. Please type *service* to start again.";
+}
+
+// ====== EXPENSE SESSION HANDLER ======
+async function handleExpenseSessionStep(session, incomingText) {
+  const step = session.step;
+  const id = session.id;
+
+  if (step === "ASK_EXPENSE_TITLE") {
+    const title = incomingText.trim();
+    if (!title) {
+      return "Please enter a short *expense title* (e.g. Puncture, Paint job, Parking, Parts).";
+    }
+
+    await updateExpenseSessionStep(id, {
+      title,
+      step: "ASK_EXPENSE_COST",
+    });
+
+    return (
+      `Expense: *${title}*.\n` +
+      "What is the *expense amount* in KES? (e.g. 1500)"
+    );
+  }
+
+  if (step === "ASK_EXPENSE_COST") {
+    const cost = parseNumber(incomingText);
+    if (!cost || !isFinite(cost) || cost <= 0) {
+      return "Please enter the *expense amount* in KES as numbers only (e.g. 1500).";
+    }
+
+    await updateExpenseSessionStep(id, {
+      cost_numeric: cost,
+      step: "ASK_EXPENSE_ODOMETER",
+    });
+
+    return (
+      "Got it ✅\n" +
+      "What is the *odometer reading* in km? (e.g. 180500). If you don't know, you can use the last known value."
+    );
+  }
+
+  if (step === "ASK_EXPENSE_ODOMETER") {
+    const odometer = parseNumber(incomingText);
+    if (!odometer || !isFinite(odometer) || odometer <= 0) {
+      return "Please enter the *odometer reading* in km as numbers only (e.g. 180500).";
+    }
+
+    await updateExpenseSessionStep(id, {
+      odometer_numeric: odometer,
+      is_completed: true,
+      step: "DONE",
+    });
+
+    const result = await pool.query(
+      "SELECT * FROM expense_sessions WHERE id = $1",
+      [id]
+    );
+    const updatedSession = result.rows[0];
+    await saveExpenseLogFromSession(updatedSession);
+
+    const title = updatedSession.title || "Expense";
+    const cost = Number(updatedSession.cost_numeric);
+    const odo = Number(updatedSession.odometer_numeric);
+
+    return (
+      "✅ Expense log saved.\n\n" +
+      `• Expense: *${title}*\n` +
+      `• Cost: *${cost.toFixed(2)} KES*\n` +
+      `• Odometer: *${odo.toFixed(0)} km*`
+    );
+  }
+
+  console.warn("⚠️ Unknown expense session step:", step);
+  await updateExpenseSessionStep(id, { is_completed: true, step: "DONE" });
+  return "Something went wrong with this expense entry. Please type *expense* to start again.";
 }
 
 // ====== START SERVER ======
