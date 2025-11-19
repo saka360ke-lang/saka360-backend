@@ -20,7 +20,7 @@ const {
   TWILIO_WHATSAPP_NUMBER,
   N8N_WEBHOOK_URL,
   DATABASE_URL,
-  PORT
+  PORT,
   DISABLE_TWILIO_SEND
 } = process.env;
 
