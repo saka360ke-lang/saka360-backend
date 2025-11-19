@@ -406,11 +406,6 @@ async function handleFuelSessionStep(session, incomingText) {
     summary += `\n• Liters (calculated): *${litersNum.toFixed(2)} L*`;
   }
 }
-
-summary +=
-  "\n\nYou can type *fuel report* anytime to see your fuel cost summary and efficiency.";
-
-
     summary +=
       "\n\nYou can type *fuel report* anytime to see your fuel cost summary and efficiency.";
 
