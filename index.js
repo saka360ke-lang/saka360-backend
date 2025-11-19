@@ -21,6 +21,7 @@ const {
   N8N_WEBHOOK_URL,
   DATABASE_URL,
   PORT
+  DISABLE_TWILIO_SEND
 } = process.env;
 
 const missing = [];
@@ -469,6 +470,9 @@ app.post("/whatsapp/inbound", async (req, res) => {
     console.log("💬 Replying to user with:", replyText);
 
     try {
+        if (DISABLE_TWILIO_SEND === "true") {
+        console.log("🚫 Twilio send disabled by DISABLE_TWILIO_SEND env.");
+      } else {
       await twilioClient.messages.create({
         from: TWILIO_WHATSAPP_NUMBER,
         to: from,
