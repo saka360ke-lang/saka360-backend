@@ -156,6 +156,97 @@ async function saveFuelLogFromSession(session) {
   return liters;
 }
 
+async function buildServiceReport(userWhatsapp) {
+  // totals
+  const monthly = await pool.query(
+    `
+    SELECT 
+      COALESCE(SUM(cost_numeric), 0) AS total,
+      COUNT(*) AS count
+    FROM service_logs
+    WHERE user_whatsapp = $1
+      AND created_at >= NOW() - INTERVAL '30 days'
+  `,
+    [userWhatsapp]
+  );
+
+  const weekly = await pool.query(
+    `
+    SELECT 
+      COALESCE(SUM(cost_numeric), 0) AS total,
+      COUNT(*) AS count
+    FROM service_logs
+    WHERE user_whatsapp = $1
+      AND created_at >= NOW() - INTERVAL '7 days'
+  `,
+    [userWhatsapp]
+  );
+
+  const daily = await pool.query(
+    `
+    SELECT 
+      COALESCE(SUM(cost_numeric), 0) AS total,
+      COUNT(*) AS count
+    FROM service_logs
+    WHERE user_whatsapp = $1
+      AND created_at >= NOW() - INTERVAL '1 day'
+  `,
+    [userWhatsapp]
+  );
+
+  // last 3 services
+  const lastServices = await pool.query(
+    `
+    SELECT title, cost_numeric, odometer_numeric, created_at
+    FROM service_logs
+    WHERE user_whatsapp = $1
+    ORDER BY created_at DESC
+    LIMIT 3
+  `,
+    [userWhatsapp]
+  );
+
+  const m = monthly.rows[0];
+  const w = weekly.rows[0];
+  const d = daily.rows[0];
+
+  let text =
+    "🔧 *Service Summary*\n\n" +
+    `• Last 30 days: *${Number(m.total || 0).toFixed(
+      2
+    )} KES* across *${m.count}* services\n` +
+    `• Last 7 days: *${Number(w.total || 0).toFixed(
+      2
+    )} KES* across *${w.count}* services\n` +
+    `• Last 24 hours: *${Number(d.total || 0).toFixed(
+      2
+    )} KES* across *${d.count}* services\n`;
+
+  if (lastServices.rows.length === 0) {
+    text +=
+      "\nNo service records found yet. Type *service* to log your first one.";
+    return text;
+  }
+
+  text += "\nLast few services:\n";
+
+  for (const row of lastServices.rows) {
+    const title = row.title || "Service";
+    const cost = Number(row.cost_numeric || 0).toFixed(2);
+    const odo = row.odometer_numeric
+      ? Number(row.odometer_numeric).toFixed(0) + " km"
+      : "n/a";
+    const dateStr = row.created_at
+      ? new Date(row.created_at).toISOString().slice(0, 10)
+      : "";
+
+    text += `\n• *${title}* – ${cost} KES, ${odo} on ${dateStr}`;
+  }
+
+  return text;
+}
+
+
 async function buildFuelReport(userWhatsapp) {
   const monthly = await pool.query(
     `
