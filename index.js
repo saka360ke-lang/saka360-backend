@@ -72,8 +72,11 @@ app.post("/whatsapp/inbound", async (req, res) => {
       "Hi 👋, I’m Saka360. I received your message. Type 'fuel', 'service', 'repair' or 'report' to begin.";
 
     console.log("💬 Replying to user with:", replyText);
+    
 
     // ====== SEND REPLY BACK VIA TWILIO ======
+    console.log("TWILIO_WHATSAPP_NUMBER in code:", JSON.stringify(TWILIO_WHATSAPP_NUMBER));
+
     try {
       await client.messages.create({
         from: TWILIO_WHATSAPP_NUMBER, // e.g. "whatsapp:+14155238886"
