@@ -246,6 +246,94 @@ async function buildServiceReport(userWhatsapp) {
   return text;
 }
 
+async function buildExpenseReport(userWhatsapp) {
+  const monthly = await pool.query(
+    `
+    SELECT 
+      COALESCE(SUM(cost_numeric), 0) AS total,
+      COUNT(*) AS count
+    FROM expense_logs
+    WHERE user_whatsapp = $1
+      AND created_at >= NOW() - INTERVAL '30 days'
+  `,
+    [userWhatsapp]
+  );
+
+  const weekly = await pool.query(
+    `
+    SELECT 
+      COALESCE(SUM(cost_numeric), 0) AS total,
+      COUNT(*) AS count
+    FROM expense_logs
+    WHERE user_whatsapp = $1
+      AND created_at >= NOW() - INTERVAL '7 days'
+  `,
+    [userWhatsapp]
+  );
+
+  const daily = await pool.query(
+    `
+    SELECT 
+      COALESCE(SUM(cost_numeric), 0) AS total,
+      COUNT(*) AS count
+    FROM expense_logs
+    WHERE user_whatsapp = $1
+      AND created_at >= NOW() - INTERVAL '1 day'
+  `,
+    [userWhatsapp]
+  );
+
+  const lastExpenses = await pool.query(
+    `
+    SELECT title, cost_numeric, odometer_numeric, created_at
+    FROM expense_logs
+    WHERE user_whatsapp = $1
+    ORDER BY created_at DESC
+    LIMIT 3
+  `,
+    [userWhatsapp]
+  );
+
+  const m = monthly.rows[0];
+  const w = weekly.rows[0];
+  const d = daily.rows[0];
+
+  let text =
+    "💸 *Expense Summary*\n\n" +
+    `• Last 30 days: *${Number(m.total || 0).toFixed(
+      2
+    )} KES* across *${m.count}* expenses\n` +
+    `• Last 7 days: *${Number(w.total || 0).toFixed(
+      2
+    )} KES* across *${w.count}* expenses\n` +
+    `• Last 24 hours: *${Number(d.total || 0).toFixed(
+      2
+    )} KES* across *${d.count}* expenses\n`;
+
+  if (lastExpenses.rows.length === 0) {
+    text +=
+      "\nNo expense records found yet. Type *expense* to log your first one.";
+    return text;
+  }
+
+  text += "\nLast few expenses:\n";
+
+  for (const row of lastExpenses.rows) {
+    const title = row.title || "Expense";
+    const cost = Number(row.cost_numeric || 0).toFixed(2);
+    const odo = row.odometer_numeric
+      ? Number(row.odometer_numeric).toFixed(0) + " km"
+      : "n/a";
+    const dateStr = row.created_at
+      ? new Date(row.created_at).toISOString().slice(0, 10)
+      : "";
+
+    text += `\n• *${title}* – ${cost} KES, ${odo} on ${dateStr}`;
+  }
+
+  return text;
+}
+
 
 async function buildFuelReport(userWhatsapp) {
   const monthly = await pool.query(
@@ -533,9 +621,15 @@ app.post("/whatsapp/inbound", async (req, res) => {
       replyText = await buildFuelReport(from);
     } else if (lower === "service") {
       replyText = await startServiceSession(from);
+    } else if (lower === "service report") {
+      replyText = await buildServiceReport(from);
     } else if (lower === "expense" || lower === "expenses") {
       replyText = await startExpenseSession(from);
+    } else if (lower === "expense report" || lower === "expenses report") {
+      replyText = await buildExpenseReport(from);
     } else {
+  // send to n8n...
+
       // 2) No session, no local command → send to n8n
       let n8nResponseData = {};
       try {
