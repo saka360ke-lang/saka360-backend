@@ -122,11 +122,13 @@ async function updateFuelSessionStep(id, fields) {
 
 // Save structured fuel log
 async function saveFuelLogFromSession(session) {
-  const totalCost = session.total_cost_numeric;
-  const pricePerLiter = session.price_per_liter_numeric;
-  const odometer = session.odometer_numeric;
+  // Cast to Number because Postgres returns NUMERIC as string
+  const totalCost = Number(session.total_cost_numeric);
+  const pricePerLiter = Number(session.price_per_liter_numeric);
+  const odometer = Number(session.odometer_numeric);
+
   const liters =
-    pricePerLiter && pricePerLiter > 0
+    pricePerLiter && isFinite(pricePerLiter) && pricePerLiter > 0
       ? totalCost / pricePerLiter
       : null;
 
@@ -385,20 +387,29 @@ async function handleFuelSessionStep(session, incomingText) {
     );
     const updatedSession = result.rows[0];
 
-    const liters = await saveFuelLogFromSession(updatedSession);
+   const liters = await saveFuelLogFromSession(updatedSession);
 
-    const totalCost = updatedSession.total_cost_numeric;
-    const pricePerLiter = updatedSession.price_per_liter_numeric;
+    // Cast values to numbers
+    const totalCost = Number(updatedSession.total_cost_numeric);
+    const pricePerLiter = Number(updatedSession.price_per_liter_numeric);
+    const odoNum = Number(odometer);
 
-    let summary =
-      "✅ Fuel log saved.\n\n" +
-      `• Total cost: *${totalCost.toFixed(2)} KES*\n` +
-      `• Price per liter: *${pricePerLiter.toFixed(2)} KES*\n` +
-      `• Odometer: *${odometer.toFixed(0)} km*`;
+  let summary =
+    "✅ Fuel log saved.\n\n" +
+    `• Total cost: *${totalCost.toFixed(2)} KES*\n` +
+    `• Price per liter: *${pricePerLiter.toFixed(2)} KES*\n` +
+    `• Odometer: *${odoNum.toFixed(0)} km*`;
 
-    if (liters && isFinite(liters)) {
-      summary += `\n• Liters (calculated): *${liters.toFixed(2)} L*`;
-    }
+  if (liters && isFinite(liters)) {
+    const litersNum = Number(liters);
+  if (isFinite(litersNum)) {
+    summary += `\n• Liters (calculated): *${litersNum.toFixed(2)} L*`;
+  }
+}
+
+summary +=
+  "\n\nYou can type *fuel report* anytime to see your fuel cost summary and efficiency.";
+
 
     summary +=
       "\n\nYou can type *fuel report* anytime to see your fuel cost summary and efficiency.";
