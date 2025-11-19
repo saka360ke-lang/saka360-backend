@@ -20,11 +20,10 @@ const {
   TWILIO_WHATSAPP_NUMBER,
   N8N_WEBHOOK_URL,
   DATABASE_URL,
-  PORT
+  PORT,
 } = process.env;
 
 const DISABLE_TWILIO_SEND = process.env.DISABLE_TWILIO_SEND;
-
 
 const missing = [];
 if (!TWILIO_ACCOUNT_SID) missing.push("TWILIO_ACCOUNT_SID");
@@ -37,7 +36,10 @@ if (missing.length) {
   console.warn("⚠️ Missing environment variables:", missing.join(", "));
 } else {
   console.log("✅ All required environment variables are present.");
-  console.log("Using TWILIO_WHATSAPP_NUMBER:", JSON.stringify(TWILIO_WHATSAPP_NUMBER));
+  console.log(
+    "Using TWILIO_WHATSAPP_NUMBER:",
+    JSON.stringify(TWILIO_WHATSAPP_NUMBER)
+  );
 }
 
 const twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
@@ -157,185 +159,6 @@ async function saveFuelLogFromSession(session) {
 
   return liters;
 }
-
-async function buildServiceReport(userWhatsapp) {
-  // totals
-  const monthly = await pool.query(
-    `
-    SELECT 
-      COALESCE(SUM(cost_numeric), 0) AS total,
-      COUNT(*) AS count
-    FROM service_logs
-    WHERE user_whatsapp = $1
-      AND created_at >= NOW() - INTERVAL '30 days'
-  `,
-    [userWhatsapp]
-  );
-
-  const weekly = await pool.query(
-    `
-    SELECT 
-      COALESCE(SUM(cost_numeric), 0) AS total,
-      COUNT(*) AS count
-    FROM service_logs
-    WHERE user_whatsapp = $1
-      AND created_at >= NOW() - INTERVAL '7 days'
-  `,
-    [userWhatsapp]
-  );
-
-  const daily = await pool.query(
-    `
-    SELECT 
-      COALESCE(SUM(cost_numeric), 0) AS total,
-      COUNT(*) AS count
-    FROM service_logs
-    WHERE user_whatsapp = $1
-      AND created_at >= NOW() - INTERVAL '1 day'
-  `,
-    [userWhatsapp]
-  );
-
-  // last 3 services
-  const lastServices = await pool.query(
-    `
-    SELECT title, cost_numeric, odometer_numeric, created_at
-    FROM service_logs
-    WHERE user_whatsapp = $1
-    ORDER BY created_at DESC
-    LIMIT 3
-  `,
-    [userWhatsapp]
-  );
-
-  const m = monthly.rows[0];
-  const w = weekly.rows[0];
-  const d = daily.rows[0];
-
-  let text =
-    "🔧 *Service Summary*\n\n" +
-    `• Last 30 days: *${Number(m.total || 0).toFixed(
-      2
-    )} KES* across *${m.count}* services\n` +
-    `• Last 7 days: *${Number(w.total || 0).toFixed(
-      2
-    )} KES* across *${w.count}* services\n` +
-    `• Last 24 hours: *${Number(d.total || 0).toFixed(
-      2
-    )} KES* across *${d.count}* services\n`;
-
-  if (lastServices.rows.length === 0) {
-    text +=
-      "\nNo service records found yet. Type *service* to log your first one.";
-    return text;
-  }
-
-  text += "\nLast few services:\n";
-
-  for (const row of lastServices.rows) {
-    const title = row.title || "Service";
-    const cost = Number(row.cost_numeric || 0).toFixed(2);
-    const odo = row.odometer_numeric
-      ? Number(row.odometer_numeric).toFixed(0) + " km"
-      : "n/a";
-    const dateStr = row.created_at
-      ? new Date(row.created_at).toISOString().slice(0, 10)
-      : "";
-
-    text += `\n• *${title}* – ${cost} KES, ${odo} on ${dateStr}`;
-  }
-
-  return text;
-}
-
-async function buildExpenseReport(userWhatsapp) {
-  const monthly = await pool.query(
-    `
-    SELECT 
-      COALESCE(SUM(cost_numeric), 0) AS total,
-      COUNT(*) AS count
-    FROM expense_logs
-    WHERE user_whatsapp = $1
-      AND created_at >= NOW() - INTERVAL '30 days'
-  `,
-    [userWhatsapp]
-  );
-
-  const weekly = await pool.query(
-    `
-    SELECT 
-      COALESCE(SUM(cost_numeric), 0) AS total,
-      COUNT(*) AS count
-    FROM expense_logs
-    WHERE user_whatsapp = $1
-      AND created_at >= NOW() - INTERVAL '7 days'
-  `,
-    [userWhatsapp]
-  );
-
-  const daily = await pool.query(
-    `
-    SELECT 
-      COALESCE(SUM(cost_numeric), 0) AS total,
-      COUNT(*) AS count
-    FROM expense_logs
-    WHERE user_whatsapp = $1
-      AND created_at >= NOW() - INTERVAL '1 day'
-  `,
-    [userWhatsapp]
-  );
-
-  const lastExpenses = await pool.query(
-    `
-    SELECT title, cost_numeric, odometer_numeric, created_at
-    FROM expense_logs
-    WHERE user_whatsapp = $1
-    ORDER BY created_at DESC
-    LIMIT 3
-  `,
-    [userWhatsapp]
-  );
-
-  const m = monthly.rows[0];
-  const w = weekly.rows[0];
-  const d = daily.rows[0];
-
-  let text =
-    "💸 *Expense Summary*\n\n" +
-    `• Last 30 days: *${Number(m.total || 0).toFixed(
-      2
-    )} KES* across *${m.count}* expenses\n` +
-    `• Last 7 days: *${Number(w.total || 0).toFixed(
-      2
-    )} KES* across *${w.count}* expenses\n` +
-    `• Last 24 hours: *${Number(d.total || 0).toFixed(
-      2
-    )} KES* across *${d.count}* expenses\n`;
-
-  if (lastExpenses.rows.length === 0) {
-    text +=
-      "\nNo expense records found yet. Type *expense* to log your first one.";
-    return text;
-  }
-
-  text += "\nLast few expenses:\n";
-
-  for (const row of lastExpenses.rows) {
-    const title = row.title || "Expense";
-    const cost = Number(row.cost_numeric || 0).toFixed(2);
-    const odo = row.odometer_numeric
-      ? Number(row.odometer_numeric).toFixed(0) + " km"
-      : "n/a";
-    const dateStr = row.created_at
-      ? new Date(row.created_at).toISOString().slice(0, 10)
-      : "";
-
-    text += `\n• *${title}* – ${cost} KES, ${odo} on ${dateStr}`;
-  }
-
-  return text;
-}
-
 
 async function buildFuelReport(userWhatsapp) {
   const monthly = await pool.query(
@@ -505,6 +328,94 @@ async function saveServiceLogFromSession(session) {
   console.log("📝 Saved service log for:", session.user_whatsapp);
 }
 
+async function buildServiceReport(userWhatsapp) {
+  const monthly = await pool.query(
+    `
+    SELECT 
+      COALESCE(SUM(cost_numeric), 0) AS total,
+      COUNT(*) AS count
+    FROM service_logs
+    WHERE user_whatsapp = $1
+      AND created_at >= NOW() - INTERVAL '30 days'
+  `,
+    [userWhatsapp]
+  );
+
+  const weekly = await pool.query(
+    `
+    SELECT 
+      COALESCE(SUM(cost_numeric), 0) AS total,
+      COUNT(*) AS count
+    FROM service_logs
+    WHERE user_whatsapp = $1
+      AND created_at >= NOW() - INTERVAL '7 days'
+  `,
+    [userWhatsapp]
+  );
+
+  const daily = await pool.query(
+    `
+    SELECT 
+      COALESCE(SUM(cost_numeric), 0) AS total,
+      COUNT(*) AS count
+    FROM service_logs
+    WHERE user_whatsapp = $1
+      AND created_at >= NOW() - INTERVAL '1 day'
+  `,
+    [userWhatsapp]
+  );
+
+  const lastServices = await pool.query(
+    `
+    SELECT title, cost_numeric, odometer_numeric, created_at
+    FROM service_logs
+    WHERE user_whatsapp = $1
+    ORDER BY created_at DESC
+    LIMIT 3
+  `,
+    [userWhatsapp]
+  );
+
+  const m = monthly.rows[0];
+  const w = weekly.rows[0];
+  const d = daily.rows[0];
+
+  let text =
+    "🔧 *Service Summary*\n\n" +
+    `• Last 30 days: *${Number(m.total || 0).toFixed(
+      2
+    )} KES* across *${m.count}* services\n` +
+    `• Last 7 days: *${Number(w.total || 0).toFixed(
+      2
+    )} KES* across *${w.count}* services\n` +
+    `• Last 24 hours: *${Number(d.total || 0).toFixed(
+      2
+    )} KES* across *${d.count}* services\n`;
+
+  if (lastServices.rows.length === 0) {
+    text +=
+      "\nNo service records found yet. Type *service* to log your first one.";
+    return text;
+  }
+
+  text += "\nLast few services:\n";
+
+  for (const row of lastServices.rows) {
+    const title = row.title || "Service";
+    const cost = Number(row.cost_numeric || 0).toFixed(2);
+    const odo = row.odometer_numeric
+      ? Number(row.odometer_numeric).toFixed(0) + " km"
+      : "n/a";
+    const dateStr = row.created_at
+      ? new Date(row.created_at).toISOString().slice(0, 10)
+      : "";
+
+    text += `\n• *${title}* – ${cost} KES, ${odo} on ${dateStr}`;
+  }
+
+  return text;
+}
+
 // ====== EXPENSE HELPERS ======
 async function getActiveExpenseSession(userWhatsapp) {
   const result = await pool.query(
@@ -582,6 +493,94 @@ async function saveExpenseLogFromSession(session) {
   console.log("📝 Saved expense log for:", session.user_whatsapp);
 }
 
+async function buildExpenseReport(userWhatsapp) {
+  const monthly = await pool.query(
+    `
+    SELECT 
+      COALESCE(SUM(cost_numeric), 0) AS total,
+      COUNT(*) AS count
+    FROM expense_logs
+    WHERE user_whatsapp = $1
+      AND created_at >= NOW() - INTERVAL '30 days'
+  `,
+    [userWhatsapp]
+  );
+
+  const weekly = await pool.query(
+    `
+    SELECT 
+      COALESCE(SUM(cost_numeric), 0) AS total,
+      COUNT(*) AS count
+    FROM expense_logs
+    WHERE user_whatsapp = $1
+      AND created_at >= NOW() - INTERVAL '7 days'
+  `,
+    [userWhatsapp]
+  );
+
+  const daily = await pool.query(
+    `
+    SELECT 
+      COALESCE(SUM(cost_numeric), 0) AS total,
+      COUNT(*) AS count
+    FROM expense_logs
+    WHERE user_whatsapp = $1
+      AND created_at >= NOW() - INTERVAL '1 day'
+  `,
+    [userWhatsapp]
+  );
+
+  const lastExpenses = await pool.query(
+    `
+    SELECT title, cost_numeric, odometer_numeric, created_at
+    FROM expense_logs
+    WHERE user_whatsapp = $1
+    ORDER BY created_at DESC
+    LIMIT 3
+  `,
+    [userWhatsapp]
+  );
+
+  const m = monthly.rows[0];
+  const w = weekly.rows[0];
+  const d = daily.rows[0];
+
+  let text =
+    "💸 *Expense Summary*\n\n" +
+    `• Last 30 days: *${Number(m.total || 0).toFixed(
+      2
+    )} KES* across *${m.count}* expenses\n` +
+    `• Last 7 days: *${Number(w.total || 0).toFixed(
+      2
+    )} KES* across *${w.count}* expenses\n` +
+    `• Last 24 hours: *${Number(d.total || 0).toFixed(
+      2
+    )} KES* across *${d.count}* expenses\n`;
+
+  if (lastExpenses.rows.length === 0) {
+    text +=
+      "\nNo expense records found yet. Type *expense* to log your first one.";
+    return text;
+  }
+
+  text += "\nLast few expenses:\n";
+
+  for (const row of lastExpenses.rows) {
+    const title = row.title || "Expense";
+    const cost = Number(row.cost_numeric || 0).toFixed(2);
+    const odo = row.odometer_numeric
+      ? Number(row.odometer_numeric).toFixed(0) + " km"
+      : "n/a";
+    const dateStr = row.created_at
+      ? new Date(row.created_at).toISOString().slice(0, 10)
+      : "";
+
+    text += `\n• *${title}* – ${cost} KES, ${odo} on ${dateStr}`;
+  }
+
+  return text;
+}
+
 // ====== HEALTH CHECK ======
 app.get("/", (req, res) => {
   res.send("Saka360 backend is running ✅");
@@ -590,8 +589,8 @@ app.get("/", (req, res) => {
 // ====== MAIN WHATSAPP HANDLER ======
 app.post("/whatsapp/inbound", async (req, res) => {
   try {
-    const from = req.body.From;        // "whatsapp:+2547..."
-    const to = req.body.To;            // your Twilio WA number
+    const from = req.body.From; // "whatsapp:+2547..."
+    const to = req.body.To; // your Twilio WA number
     const rawText = req.body.Body || "";
     const text = rawText.trim();
     const lower = text.toLowerCase();
@@ -630,8 +629,6 @@ app.post("/whatsapp/inbound", async (req, res) => {
     } else if (lower === "expense report" || lower === "expenses report") {
       replyText = await buildExpenseReport(from);
     } else {
-  // send to n8n...
-
       // 2) No session, no local command → send to n8n
       let n8nResponseData = {};
       try {
@@ -657,14 +654,15 @@ app.post("/whatsapp/inbound", async (req, res) => {
     console.log("💬 Replying to user with:", replyText);
 
     try {
-        if (DISABLE_TWILIO_SEND === "true") {
+      if (DISABLE_TWILIO_SEND === "true") {
         console.log("🚫 Twilio send disabled by DISABLE_TWILIO_SEND env.");
       } else {
-      await twilioClient.messages.create({
-        from: TWILIO_WHATSAPP_NUMBER,
-        to: from,
-        body: replyText,
-      });
+        await twilioClient.messages.create({
+          from: TWILIO_WHATSAPP_NUMBER,
+          to: from,
+          body: replyText,
+        });
+      }
     } catch (twilioErr) {
       console.error(
         "❌ Error sending WhatsApp message via Twilio:",
