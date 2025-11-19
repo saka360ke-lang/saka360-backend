@@ -20,9 +20,11 @@ const {
   TWILIO_WHATSAPP_NUMBER,
   N8N_WEBHOOK_URL,
   DATABASE_URL,
-  PORT,
-  DISABLE_TWILIO_SEND
+  PORT
 } = process.env;
+
+const DISABLE_TWILIO_SEND = process.env.DISABLE_TWILIO_SEND;
+
 
 const missing = [];
 if (!TWILIO_ACCOUNT_SID) missing.push("TWILIO_ACCOUNT_SID");
