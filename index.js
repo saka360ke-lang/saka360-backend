@@ -367,7 +367,7 @@ async function buildServiceReport(userWhatsapp) {
 
   const lastServices = await pool.query(
     `
-    SELECT title, cost_numeric, odometer_numeric, created_at
+    SELECT title, cost_numeric, odometer_numeric, created_at, notes
     FROM service_logs
     WHERE user_whatsapp = $1
     ORDER BY created_at DESC
@@ -409,8 +409,10 @@ async function buildServiceReport(userWhatsapp) {
     const dateStr = row.created_at
       ? new Date(row.created_at).toISOString().slice(0, 10)
       : "";
-
     text += `\n• *${title}* – ${cost} KES, ${odo} on ${dateStr}`;
+    if (row.notes) {
+      text += ` (Notes: ${row.notes})`;
+    }
   }
 
   return text;
@@ -760,30 +762,126 @@ async function handleEditLastCommand(userWhatsapp, fullText) {
   }
 
   const rest = fullText.slice(base.length).trim();
+
+  // If user just typed "edit last service" (no field/value), show summary + instructions
   if (!rest) {
     if (type === "service") {
+      const res = await pool.query(
+        `
+        SELECT *
+        FROM service_logs
+        WHERE user_whatsapp = $1
+        ORDER BY created_at DESC
+        LIMIT 1
+      `,
+        [userWhatsapp]
+      );
+
+      if (res.rows.length === 0) {
+        return "You don't have any *service* records to edit.";
+      }
+
+      const log = res.rows[0];
+      const title = log.title || "Service";
+      const cost = Number(log.cost_numeric || 0).toFixed(2);
+      const odo = log.odometer_numeric
+        ? Number(log.odometer_numeric).toFixed(0) + " km"
+        : "n/a";
+      const notes = log.notes || "none";
+
       return (
-        "Please specify what to edit.\n\nExamples:\n" +
+        "Your last *service* record:\n\n" +
+        `• Service: *${title}*\n` +
+        `• Cost: *${cost} KES*\n` +
+        `• Odometer: *${odo}*\n` +
+        `• Notes: *${notes}*\n\n` +
+        "You can edit: *cost*, *odometer*, *title*, *notes*.\n" +
+        "Examples:\n" +
         "• *edit last service cost 5000*\n" +
         "• *edit last service odometer 180000*\n" +
         "• *edit last service title Timing belt change*\n" +
         "• *edit last service notes Mechanic James 0700xxxxxx*"
       );
     }
+
     if (type === "fuel") {
+      const res = await pool.query(
+        `
+        SELECT *
+        FROM fuel_logs
+        WHERE user_whatsapp = $1
+        ORDER BY created_at DESC
+        LIMIT 1
+      `,
+        [userWhatsapp]
+      );
+
+      if (res.rows.length === 0) {
+        return "You don't have any *fuel* records to edit.";
+      }
+
+      const log = res.rows[0];
+      const total = Number(log.total_cost_numeric || 0).toFixed(2);
+      const price = log.price_per_liter_numeric
+        ? Number(log.price_per_liter_numeric).toFixed(2)
+        : "n/a";
+      const odo = log.odometer
+        ? Number(log.odometer).toFixed(0) + " km"
+        : "n/a";
+      const liters =
+        log.liters && isFinite(log.liters)
+          ? Number(log.liters).toFixed(2) + " L"
+          : "n/a";
+
       return (
-        "Please specify what to edit.\n\nExamples:\n" +
+        "Your last *fuel* record:\n\n" +
+        `• Total cost: *${total} KES*\n` +
+        `• Price per liter: *${price} KES*\n` +
+        `• Odometer: *${odo}*\n` +
+        `• Liters (calculated): *${liters}*\n\n` +
+        "You can edit: *cost* / *total*, *price*, *odometer*.\n" +
+        "Examples:\n" +
         "• *edit last fuel cost 9000*\n" +
         "• *edit last fuel price 210*\n" +
         "• *edit last fuel odometer 123456*"
       );
     }
-    return (
-      "Please specify what to edit.\n\nExamples:\n" +
-      "• *edit last expense cost 1500*\n" +
-      "• *edit last expense title Parking*\n" +
-      "• *edit last expense odometer 180500*"
-    );
+
+    if (type === "expense") {
+      const res = await pool.query(
+        `
+        SELECT *
+        FROM expense_logs
+        WHERE user_whatsapp = $1
+        ORDER BY created_at DESC
+        LIMIT 1
+      `,
+        [userWhatsapp]
+      );
+
+      if (res.rows.length === 0) {
+        return "You don't have any *expense* records to edit.";
+      }
+
+      const log = res.rows[0];
+      const title = log.title || "Expense";
+      const cost = Number(log.cost_numeric || 0).toFixed(2);
+      const odo = log.odometer_numeric
+        ? Number(log.odometer_numeric).toFixed(0) + " km"
+        : "n/a";
+
+      return (
+        "Your last *expense* record:\n\n" +
+        `• Expense: *${title}*\n` +
+        `• Cost: *${cost} KES*\n` +
+        `• Odometer: *${odo}*\n\n` +
+        "You can edit: *cost*, *odometer*, *title*.\n" +
+        "Examples:\n" +
+        "• *edit last expense cost 1500*\n" +
+        "• *edit last expense title Parking*\n" +
+        "• *edit last expense odometer 180500*"
+      );
+    }
   }
 
   const parts = rest.split(/\s+/);
@@ -794,6 +892,7 @@ async function handleEditLastCommand(userWhatsapp, fullText) {
     return "Please provide a new value after the field. Example: *edit last service cost 5000*.";
   }
 
+  // ------- SERVICE EDIT -------
   if (type === "service") {
     const res = await pool.query(
       `
@@ -857,7 +956,6 @@ async function handleEditLastCommand(userWhatsapp, fullText) {
       );
     }
 
-    // Build UPDATE query
     const setParts = [];
     const values = [];
     let idx = 1;
@@ -866,7 +964,7 @@ async function handleEditLastCommand(userWhatsapp, fullText) {
       values.push(v);
       idx++;
     }
-    setParts.push(`updated_at = NOW()`); // If you have this column
+    setParts.push(`updated_at = NOW()`);
     const query = `
       UPDATE service_logs
       SET ${setParts.join(", ")}
@@ -875,7 +973,6 @@ async function handleEditLastCommand(userWhatsapp, fullText) {
     values.push(log.id);
     await pool.query(query, values);
 
-    // Get updated row
     const refreshed = await pool.query(
       "SELECT * FROM service_logs WHERE id = $1",
       [log.id]
@@ -908,6 +1005,7 @@ async function handleEditLastCommand(userWhatsapp, fullText) {
     return summary;
   }
 
+  // ------- FUEL EDIT -------
   if (type === "fuel") {
     const res = await pool.query(
       `
@@ -970,7 +1068,6 @@ async function handleEditLastCommand(userWhatsapp, fullText) {
       );
     }
 
-    // Recalculate liters if we have both total and price
     let liters = null;
     if (price > 0 && total > 0) {
       liters = total / price;
@@ -1020,6 +1117,7 @@ async function handleEditLastCommand(userWhatsapp, fullText) {
     return summary;
   }
 
+  // ------- EXPENSE EDIT -------
   if (type === "expense") {
     const res = await pool.query(
       `
@@ -1085,7 +1183,7 @@ async function handleEditLastCommand(userWhatsapp, fullText) {
       values.push(v);
       idx++;
     }
-    setParts.push(`updated_at = NOW()`); // if column exists
+    setParts.push(`updated_at = NOW()`);
     const query = `
       UPDATE expense_logs
       SET ${setParts.join(", ")}
@@ -1154,6 +1252,25 @@ app.post("/whatsapp/inbound", async (req, res) => {
       replyText =
         "✅ I’ve cancelled your current entry. You can start again with *fuel*, *service*, or *expense*.";
     }
+    // GLOBAL COMMAND: simple "edit" helper
+    else if (lower === "edit") {
+      replyText =
+        "To edit a record, choose one of these:\n\n" +
+        "• *edit last service* – edit your last service\n" +
+        "• *edit last fuel* – edit your last fuel\n" +
+        "• *edit last expense* – edit your last expense\n\n" +
+        "After that, you can change a field, e.g.:\n" +
+        "• *edit last service cost 5000*\n" +
+        "• *edit last fuel price 210*";
+    }
+    // GLOBAL COMMAND: simple "delete" helper
+    else if (lower === "delete") {
+      replyText =
+        "To delete your last record, choose one of:\n\n" +
+        "• *delete last fuel*\n" +
+        "• *delete last service*\n" +
+        "• *delete last expense*";
+    }
     // GLOBAL COMMAND: delete last ...
     else if (lower.startsWith("delete last")) {
       replyText = await handleDeleteLastCommand(from, lower);
@@ -1161,6 +1278,15 @@ app.post("/whatsapp/inbound", async (req, res) => {
     // GLOBAL COMMAND: edit last ...
     else if (lower.startsWith("edit last")) {
       replyText = await handleEditLastCommand(from, text);
+    }
+    // REPORT COMMANDS: local guidance instead of n8n loops
+    else if (lower === "report" || lower.startsWith("report ")) {
+      replyText =
+        "I can show quick summaries for your vehicle data:\n\n" +
+        "• *fuel report* – fuel spend & efficiency\n" +
+        "• *service report* – service spend summary\n" +
+        "• *expense report* – other expenses summary\n\n" +
+        "For now, please use one of those commands.";
     } else {
       // 1) Active sessions first
       const activeFuelSession = await getActiveFuelSession(from);
