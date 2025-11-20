@@ -1,5 +1,5 @@
 // index.js
-// Saka360 Backend - WhatsApp → (Vehicles / Fuel / Service / Expense / n8n) → DB → WhatsApp
+// Saka360 Backend - WhatsApp → (Vehicles / Fuel / Service / Expense / Drivers / n8n) → DB → WhatsApp
 
 const express = require("express");
 const bodyParser = require("body-parser");
@@ -341,6 +341,447 @@ async function handleSwitchVehicleCommand(userWhatsapp, fullText) {
   );
 }
 
+// ====== DRIVER HELPERS ======
+
+// Fetch active drivers for this owner
+async function getUserDrivers(userWhatsapp) {
+  const res = await pool.query(
+    `
+    SELECT *
+    FROM drivers
+    WHERE owner_whatsapp = $1
+      AND is_active = TRUE
+    ORDER BY created_at ASC
+  `,
+    [userWhatsapp]
+  );
+  return res.rows;
+}
+
+// Format driver list (for WhatsApp display)
+function formatDriversList(drivers, withIndices = true) {
+  if (!drivers || drivers.length === 0) {
+    return "You don't have any drivers yet.";
+  }
+
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+
+  let text = "";
+  drivers.forEach((d, index) => {
+    const idx = index + 1;
+    const name = d.full_name || "Driver";
+    const lic = d.license_number || "n/a";
+    const expDate = d.license_expiry_date
+      ? new Date(d.license_expiry_date)
+      : null;
+
+    let statusIcon = "✅";
+    let statusText = "";
+
+    if (expDate) {
+      expDate.setHours(0, 0, 0, 0);
+      const diffDays = Math.round(
+        (expDate.getTime() - today.getTime()) / (1000 * 60 * 60 * 24)
+      );
+
+      if (diffDays < 0) {
+        statusIcon = "❌";
+        statusText = `expired ${Math.abs(diffDays)} day(s) ago`;
+      } else if (diffDays <= 30) {
+        statusIcon = "⚠️";
+        statusText = `expires in ${diffDays} day(s)`;
+      } else {
+        statusIcon = "✅";
+        statusText = `valid, ~${diffDays} day(s) left`;
+      }
+    } else {
+      statusIcon = "⚠️";
+      statusText = "no expiry date set";
+    }
+
+    const expStr = d.license_expiry_date
+      ? String(d.license_expiry_date).slice(0, 10)
+      : "n/a";
+
+    const baseLine = `*${name}* – Lic: *${lic}* (exp: ${expStr}) ${statusIcon} ${statusText}`;
+
+    if (withIndices) {
+      text += `\n${idx}. ${baseLine}`;
+    } else {
+      text += `\n• ${baseLine}`;
+    }
+  });
+
+  return text.trim();
+}
+
+/**
+ * ADD DRIVER
+ *
+ * Usage:
+ *   1) "add driver" → show instructions
+ *   2) "add driver John Doe | 0712345678 | DL12345 | 2026-01-01"
+ *
+ * Fields (pipe/comma separated):
+ *   name | phone (optional) | license number | expiry (YYYY-MM-DD)
+ */
+async function handleAddDriverCommand(userWhatsapp, fullText) {
+  const base = "add driver";
+  const lower = fullText.toLowerCase().trim();
+
+  if (lower === base) {
+    return (
+      "Let's add a driver to your Saka360 account 👨‍✈️\n\n" +
+      "Please send the details in *one line* using this format:\n" +
+      "*add driver Full Name | 07XXXXXXXX | LICENSE_NO | YYYY-MM-DD*\n\n" +
+      "Examples:\n" +
+      "*add driver John Doe | 0712345678 | DL12345 | 2026-01-01*\n" +
+      "*add driver Jane | DL99999 | 2025-12-31* (no phone)"
+    );
+  }
+
+  const detailsRaw = fullText.slice(base.length).trim();
+  if (!detailsRaw) {
+    return (
+      "Please include the driver details after *add driver*.\n\n" +
+      "Format:\n" +
+      "*add driver Full Name | 07XXXXXXXX | LICENSE_NO | YYYY-MM-DD*"
+    );
+  }
+
+  // Split by "|" (preferred), fall back to ","
+  let parts = detailsRaw.split("|");
+  if (parts.length === 1) {
+    parts = detailsRaw.split(",");
+  }
+  parts = parts.map((p) => p.trim()).filter(Boolean);
+
+  if (parts.length < 3) {
+    return (
+      "I need at least: *Name, Licence number, Licence expiry date*.\n\n" +
+      "Format:\n" +
+      "*add driver Full Name | 07XXXXXXXX | LICENSE_NO | YYYY-MM-DD*\n\n" +
+      "If you don't want to add phone, you can do:\n" +
+      "*add driver Full Name | LICENSE_NO | YYYY-MM-DD*"
+    );
+  }
+
+  let fullName;
+  let phone = null;
+  let licenseNumber;
+  let expiryText;
+
+  if (parts.length === 3) {
+    // name | license | expiry
+    fullName = parts[0];
+    licenseNumber = parts[1];
+    expiryText = parts[2];
+  } else {
+    // name | phone | license | expiry
+    fullName = parts[0];
+    phone = parts[1];
+    licenseNumber = parts[2];
+    expiryText = parts[3];
+  }
+
+  fullName = fullName || "";
+  licenseNumber = licenseNumber || "";
+
+  if (!fullName) {
+    return "Please provide the driver's *full name* as the first item.";
+  }
+  if (!licenseNumber) {
+    return "Please provide a valid *licence number*.";
+  }
+
+  expiryText = expiryText || "";
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(expiryText)) {
+    return "Please provide the *licence expiry date* in *YYYY-MM-DD* format (e.g. 2026-01-01).";
+  }
+
+  const expiryDate = new Date(expiryText);
+  if (isNaN(expiryDate.getTime())) {
+    return "That expiry date doesn't look valid. Please use *YYYY-MM-DD* format.";
+  }
+
+  // Check if this licence already exists for this owner → update instead of duplicate
+  const existing = await pool.query(
+    `
+    SELECT id
+    FROM drivers
+    WHERE owner_whatsapp = $1
+      AND license_number = $2
+      AND is_active = TRUE
+    LIMIT 1
+  `,
+    [userWhatsapp, licenseNumber]
+  );
+
+  let driverRow;
+  let actionText = "";
+
+  if (existing.rows.length > 0) {
+    // Update existing driver (like an edit)
+    const driverId = existing.rows[0].id;
+    const resUpdate = await pool.query(
+      `
+      UPDATE drivers
+      SET full_name = $1,
+          driver_whatsapp = $2,
+          license_expiry_date = $3,
+          updated_at = NOW()
+      WHERE id = $4
+      RETURNING *
+    `,
+      [fullName, phone || null, expiryText, driverId]
+    );
+    driverRow = resUpdate.rows[0];
+    actionText = "updated";
+  } else {
+    // Insert new driver
+    const resInsert = await pool.query(
+      `
+      INSERT INTO drivers (
+        owner_whatsapp,
+        full_name,
+        driver_whatsapp,
+        license_number,
+        license_expiry_date,
+        is_active
+      )
+      VALUES ($1, $2, $3, $4, $5, TRUE)
+      RETURNING *
+    `,
+      [userWhatsapp, fullName, phone || null, licenseNumber, expiryText]
+    );
+    driverRow = resInsert.rows[0];
+    actionText = "added";
+  }
+
+  const name = driverRow.full_name;
+  const lic = driverRow.license_number;
+  const exp = String(driverRow.license_expiry_date).slice(0, 10);
+  const phoneText = driverRow.driver_whatsapp || "not set";
+
+  return (
+    `✅ Driver *${name}* ${actionText}.\n\n` +
+    `• Phone: *${phoneText}*\n` +
+    `• Licence: *${lic}*\n` +
+    `• Expiry: *${exp}*\n\n` +
+    "You can see all drivers with *my drivers* and assign one with *assign driver 1* (for example)."
+  );
+}
+
+// List drivers
+async function handleMyDriversCommand(userWhatsapp) {
+  const drivers = await getUserDrivers(userWhatsapp);
+  if (drivers.length === 0) {
+    return (
+      "You don't have any drivers yet.\n\n" +
+      "Add one with:\n" +
+      "*add driver John Doe | 0712345678 | DL12345 | 2026-01-01*"
+    );
+  }
+
+  let text = "👨‍✈️ *Your drivers*:\n\n";
+  text += formatDriversList(drivers, true);
+  text +=
+    "\n\nTo assign a driver to your *current vehicle*, reply with e.g. *assign driver 1*.";
+
+  return text;
+}
+
+// Assign driver to CURRENT vehicle
+// Usage: "assign driver 1"
+async function handleAssignDriverCommand(userWhatsapp, fullText) {
+  const match = fullText.match(/assign\s+driver\s+(\d+)/i);
+  if (!match) {
+    return (
+      "To assign a driver, first see your drivers with *my drivers*.\n\n" +
+      "Then reply with e.g. *assign driver 1* to assign driver 1 to your *current vehicle*."
+    );
+  }
+
+  const index = parseInt(match[1], 10);
+  if (!index || index < 1) {
+    return "I couldn't understand that driver number. Please use a positive number like *1* or *2*.";
+  }
+
+  // Ensure we have a current vehicle
+  const vRes = await ensureCurrentVehicle(userWhatsapp);
+  if (vRes.status === "NO_VEHICLES") {
+    return (
+      "You don't have any vehicles yet.\n\n" +
+      "Add one with: *add vehicle KDA 123A*"
+    );
+  } else if (vRes.status === "NEED_SET_CURRENT") {
+    const listText = formatVehiclesList(vRes.list, true);
+    return (
+      "You have multiple vehicles. Please choose which one you want to set a driver for.\n\n" +
+      listText +
+      "\n\nReply with e.g. *switch to 1*, then send *assign driver 1* again."
+    );
+  }
+
+  const vehicle = vRes.vehicle;
+
+  // Get drivers
+  const drivers = await getUserDrivers(userWhatsapp);
+  if (drivers.length === 0) {
+    return (
+      "You don't have any drivers yet.\n\n" +
+      "Add one with:\n" +
+      "*add driver John Doe | 0712345678 | DL12345 | 2026-01-01*"
+    );
+  }
+
+  if (index > drivers.length) {
+    return (
+      `You only have *${drivers.length}* driver(s).\n\n` +
+      "See them with *my drivers* and choose a valid number."
+    );
+  }
+
+  const chosen = drivers[index - 1];
+
+  await pool.query(
+    `
+    UPDATE vehicles
+    SET driver_id = $1,
+        updated_at = NOW()
+    WHERE id = $2
+  `,
+    [chosen.id, vehicle.id]
+  );
+
+  const name = chosen.full_name || "Driver";
+  const lic = chosen.license_number || "n/a";
+  const exp = chosen.license_expiry_date
+    ? String(chosen.license_expiry_date).slice(0, 10)
+    : "n/a";
+
+  return (
+    "✅ Driver assigned.\n\n" +
+    `Vehicle: *${vehicle.registration}*\n` +
+    `Driver: *${name}*\n` +
+    `Licence: *${lic}* (exp: ${exp})\n\n` +
+    "You can change driver any time with another *assign driver X*."
+  );
+}
+
+// Driver licence compliance / report
+async function buildDriverComplianceReport(userWhatsapp) {
+  const res = await pool.query(
+    `
+    SELECT id, full_name, license_number, license_expiry_date, driver_whatsapp, is_active
+    FROM drivers
+    WHERE owner_whatsapp = $1
+      AND is_active = TRUE
+    ORDER BY license_expiry_date ASC
+  `,
+    [userWhatsapp]
+  );
+
+  const drivers = res.rows;
+  if (drivers.length === 0) {
+    return (
+      "You don't have any drivers yet.\n\n" +
+      "Add one with:\n" +
+      "*add driver John Doe | 0712345678 | DL12345 | 2026-01-01*"
+    );
+  }
+
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+
+  const expired = [];
+  const expiring = [];
+  const ok = [];
+
+  for (const d of drivers) {
+    if (!d.license_expiry_date) {
+      expired.push({ driver: d, diffDays: null });
+      continue;
+    }
+    const expDate = new Date(d.license_expiry_date);
+    expDate.setHours(0, 0, 0, 0);
+
+    const diffDays = Math.round(
+      (expDate.getTime() - today.getTime()) / (1000 * 60 * 60 * 24)
+    );
+
+    if (diffDays < 0) {
+      expired.push({ driver: d, diffDays });
+    } else if (diffDays <= 30) {
+      expiring.push({ driver: d, diffDays });
+    } else {
+      ok.push({ driver: d, diffDays });
+    }
+  }
+
+  let text = "🚦 *Driver licence compliance overview*\n";
+
+  // Expired
+  if (expired.length > 0) {
+    text += "\n❌ *Expired licences*:\n";
+    for (const item of expired) {
+      const d = item.driver;
+      const name = d.full_name || "Driver";
+      const lic = d.license_number || "n/a";
+      const exp = d.license_expiry_date
+        ? String(d.license_expiry_date).slice(0, 10)
+        : "n/a";
+      const days = item.diffDays !== null ? Math.abs(item.diffDays) : "?";
+      const phone = d.driver_whatsapp || "no phone on file";
+      text += `\n• *${name}* – Lic: *${lic}*, exp: ${exp} (expired ${days} day(s) ago) – ${phone}`;
+    }
+  } else {
+    text += "\n❌ *Expired licences*: none 🎉";
+  }
+
+  // Expiring soon
+  if (expiring.length > 0) {
+    text += "\n\n⚠️ *Expiring in next 30 days*:\n";
+    for (const item of expiring) {
+      const d = item.driver;
+      const name = d.full_name || "Driver";
+      const lic = d.license_number || "n/a";
+      const exp = d.license_expiry_date
+        ? String(d.license_expiry_date).slice(0, 10)
+        : "n/a";
+      const days = item.diffDays;
+      const phone = d.driver_whatsapp || "no phone on file";
+      text += `\n• *${name}* – Lic: *${lic}*, exp: ${exp} (in ${days} day(s)) – ${phone}`;
+    }
+  } else {
+    text += "\n\n⚠️ *Expiring soon (30 days)*: none.";
+  }
+
+  // OK
+  if (ok.length > 0) {
+    text += "\n\n✅ *Valid (>30 days left)*:\n";
+    for (const item of ok) {
+      const d = item.driver;
+      const name = d.full_name || "Driver";
+      const lic = d.license_number || "n/a";
+      const exp = d.license_expiry_date
+        ? String(d.license_expiry_date).slice(0, 10)
+        : "n/a";
+      const days = item.diffDays;
+      const phone = d.driver_whatsapp || "no phone on file";
+      text += `\n• *${name}* – Lic: *${lic}*, exp: ${exp} (~${days} day(s) left) – ${phone}`;
+    }
+  } else {
+    text += "\n\n✅ *Valid licences*: none yet.";
+  }
+
+  text +=
+    "\n\nYou can update or add drivers with *add driver ...* and assign them with *assign driver X*.";
+
+  return text;
+}
+
 // ====== FUEL HELPERS ======
 async function getActiveFuelSession(userWhatsapp) {
   const result = await pool.query(
@@ -457,7 +898,7 @@ async function saveFuelLogFromSession(session) {
   return liters;
 }
 
-// NEW: per-vehicle / all-vehicles fuel report
+// per-vehicle / all-vehicles fuel report
 async function buildFuelReport(userWhatsapp, options = {}) {
   const { vehicleId = null, vehicleLabel = null, allVehicles = false } = options;
 
@@ -675,7 +1116,7 @@ async function saveServiceLogFromSession(session) {
   console.log("📝 Saved service log for:", session.user_whatsapp);
 }
 
-// NEW: per-vehicle / all-vehicles service report
+// per-vehicle / all-vehicles service report
 async function buildServiceReport(userWhatsapp, options = {}) {
   const { vehicleId = null, vehicleLabel = null, allVehicles = false } = options;
 
@@ -888,7 +1329,7 @@ async function saveExpenseLogFromSession(session) {
   console.log("📝 Saved expense log for:", session.user_whatsapp);
 }
 
-// NEW: per-vehicle / all-vehicles expense report
+// per-vehicle / all-vehicles expense report
 async function buildExpenseReport(userWhatsapp, options = {}) {
   const { vehicleId = null, vehicleLabel = null, allVehicles = false } = options;
 
@@ -1675,6 +2116,14 @@ app.post("/whatsapp/inbound", async (req, res) => {
     } else if (lower.startsWith("switch")) {
       replyText = await handleSwitchVehicleCommand(from, text);
     }
+    // DRIVER COMMANDS
+    else if (lower.startsWith("add driver")) {
+      replyText = await handleAddDriverCommand(from, text);
+    } else if (lower === "my drivers" || lower === "drivers") {
+      replyText = await handleMyDriversCommand(from);
+    } else if (lower.startsWith("assign driver")) {
+      replyText = await handleAssignDriverCommand(from, text);
+    }
     // GLOBAL COMMAND: simple "edit" helper
     else if (lower === "edit") {
       replyText =
@@ -1705,13 +2154,14 @@ app.post("/whatsapp/inbound", async (req, res) => {
     // REPORT COMMANDS: high-level guidance
     else if (lower === "report" || lower.startsWith("report ")) {
       replyText =
-        "I can show quick summaries for your vehicle data:\n\n" +
-        "• *fuel report* – fuel spend & efficiency\n" +
-        "• *fuel report all* – all vehicles\n" +
-        "• *service report* – service spend\n" +
-        "• *service report all* – all vehicles\n" +
-        "• *expense report* – other expenses\n" +
-        "• *expense report all* – all vehicles\n\n" +
+        "I can show quick summaries for your data:\n\n" +
+        "• *fuel report* – fuel spend & efficiency (current vehicle)\n" +
+        "• *fuel report all* – fuel summary across all vehicles\n" +
+        "• *service report* – service spend (current vehicle)\n" +
+        "• *service report all* – service summary across all vehicles\n" +
+        "• *expense report* – other expenses (current vehicle)\n" +
+        "• *expense report all* – expenses across all vehicles\n" +
+        "• *driver report* – driver licence compliance\n\n" +
         "Please choose one of those.";
     } else {
       // 1) Active sessions first
@@ -1812,6 +2262,13 @@ app.post("/whatsapp/inbound", async (req, res) => {
             });
           }
         }
+      } else if (
+        lower === "driver report" ||
+        lower === "drivers report" ||
+        lower === "driver compliance" ||
+        lower === "compliance"
+      ) {
+        replyText = await buildDriverComplianceReport(from);
       } else {
         // 2) No session, no local command → send to n8n
         let n8nResponseData = {};
