@@ -457,48 +457,65 @@ async function saveFuelLogFromSession(session) {
   return liters;
 }
 
-async function buildFuelReport(userWhatsapp) {
+// NEW: per-vehicle / all-vehicles fuel report
+async function buildFuelReport(userWhatsapp, options = {}) {
+  const { vehicleId = null, vehicleLabel = null, allVehicles = false } = options;
+
+  let title = "⛽ *Fuel Summary*";
+  let where = "user_whatsapp = $1";
+  const params = [userWhatsapp];
+
+  if (!allVehicles && vehicleId) {
+    title = `⛽ *Fuel Summary* – ${vehicleLabel || "this vehicle"}`;
+    where += " AND vehicle_id = $2";
+    params.push(vehicleId);
+  } else if (!allVehicles) {
+    title = "⛽ *Fuel Summary* (all vehicles)";
+  } else {
+    title = "⛽ *Fuel Summary* (all vehicles)";
+  }
+
   const monthly = await pool.query(
     `
     SELECT COALESCE(SUM(total_cost_numeric), 0) AS total
     FROM fuel_logs
-    WHERE user_whatsapp = $1
+    WHERE ${where}
       AND created_at >= NOW() - INTERVAL '30 days'
   `,
-    [userWhatsapp]
+    params
   );
 
   const weekly = await pool.query(
     `
     SELECT COALESCE(SUM(total_cost_numeric), 0) AS total
     FROM fuel_logs
-    WHERE user_whatsapp = $1
+    WHERE ${where}
       AND created_at >= NOW() - INTERVAL '7 days'
   `,
-    [userWhatsapp]
+    params
   );
 
   const daily = await pool.query(
     `
     SELECT COALESCE(SUM(total_cost_numeric), 0) AS total
     FROM fuel_logs
-    WHERE user_whatsapp = $1
+    WHERE ${where}
       AND created_at >= NOW() - INTERVAL '1 day'
   `,
-    [userWhatsapp]
+    params
   );
 
   const effRes = await pool.query(
     `
     SELECT odometer, liters
     FROM fuel_logs
-    WHERE user_whatsapp = $1
+    WHERE ${where}
       AND odometer IS NOT NULL
       AND liters IS NOT NULL
     ORDER BY created_at DESC
     LIMIT 2
   `,
-    [userWhatsapp]
+    params
   );
 
   const monthTotal = Number(monthly.rows[0].total || 0);
@@ -522,13 +539,20 @@ async function buildFuelReport(userWhatsapp) {
     }
   }
 
+  let footer = "";
+  if (allVehicles) {
+    footer = "\n\n(Showing *all vehicles*.)";
+  } else if (vehicleLabel) {
+    footer = `\n\n(Showing vehicle *${vehicleLabel}*.)`;
+  }
+
   return (
-    "⛽ *Fuel Summary* (all vehicles)\n\n" +
+    `${title}\n\n` +
     `• Last 30 days: *${monthTotal.toFixed(2)} KES*\n` +
     `• Last 7 days: *${weekTotal.toFixed(2)} KES*\n` +
     `• Last 24 hours: *${dayTotal.toFixed(2)} KES*\n\n` +
     efficiencyText +
-    "\n\n(Later we can tighten this per-vehicle, e.g. by reg)"
+    footer
   );
 }
 
@@ -651,17 +675,34 @@ async function saveServiceLogFromSession(session) {
   console.log("📝 Saved service log for:", session.user_whatsapp);
 }
 
-async function buildServiceReport(userWhatsapp) {
+// NEW: per-vehicle / all-vehicles service report
+async function buildServiceReport(userWhatsapp, options = {}) {
+  const { vehicleId = null, vehicleLabel = null, allVehicles = false } = options;
+
+  let title = "🔧 *Service Summary*";
+  let where = "user_whatsapp = $1";
+  const params = [userWhatsapp];
+
+  if (!allVehicles && vehicleId) {
+    title = `🔧 *Service Summary* – ${vehicleLabel || "this vehicle"}`;
+    where += " AND vehicle_id = $2";
+    params.push(vehicleId);
+  } else if (!allVehicles) {
+    title = "🔧 *Service Summary* (all vehicles)";
+  } else {
+    title = "🔧 *Service Summary* (all vehicles)";
+  }
+
   const monthly = await pool.query(
     `
     SELECT 
       COALESCE(SUM(cost_numeric), 0) AS total,
       COUNT(*) AS count
     FROM service_logs
-    WHERE user_whatsapp = $1
+    WHERE ${where}
       AND created_at >= NOW() - INTERVAL '30 days'
   `,
-    [userWhatsapp]
+    params
   );
 
   const weekly = await pool.query(
@@ -670,10 +711,10 @@ async function buildServiceReport(userWhatsapp) {
       COALESCE(SUM(cost_numeric), 0) AS total,
       COUNT(*) AS count
     FROM service_logs
-    WHERE user_whatsapp = $1
+    WHERE ${where}
       AND created_at >= NOW() - INTERVAL '7 days'
   `,
-    [userWhatsapp]
+    params
   );
 
   const daily = await pool.query(
@@ -682,21 +723,21 @@ async function buildServiceReport(userWhatsapp) {
       COALESCE(SUM(cost_numeric), 0) AS total,
       COUNT(*) AS count
     FROM service_logs
-    WHERE user_whatsapp = $1
+    WHERE ${where}
       AND created_at >= NOW() - INTERVAL '1 day'
   `,
-    [userWhatsapp]
+    params
   );
 
   const lastServices = await pool.query(
     `
     SELECT title, cost_numeric, odometer_numeric, created_at, notes
     FROM service_logs
-    WHERE user_whatsapp = $1
+    WHERE ${where}
     ORDER BY created_at DESC
     LIMIT 3
   `,
-    [userWhatsapp]
+    params
   );
 
   const m = monthly.rows[0];
@@ -704,7 +745,7 @@ async function buildServiceReport(userWhatsapp) {
   const d = daily.rows[0];
 
   let text =
-    "🔧 *Service Summary* (all vehicles)\n\n" +
+    `${title}\n\n` +
     `• Last 30 days: *${Number(m.total || 0).toFixed(
       2
     )} KES* across *${m.count}* services\n` +
@@ -718,24 +759,29 @@ async function buildServiceReport(userWhatsapp) {
   if (lastServices.rows.length === 0) {
     text +=
       "\nNo service records found yet. Type *service* to log your first one.";
-    return text;
+  } else {
+    text += "\nLast few services:\n";
+
+    for (const row of lastServices.rows) {
+      const titleRow = row.title || "Service";
+      const cost = Number(row.cost_numeric || 0).toFixed(2);
+      const odo = row.odometer_numeric
+        ? Number(row.odometer_numeric).toFixed(0) + " km"
+        : "n/a";
+      const dateStr = row.created_at
+        ? new Date(row.created_at).toISOString().slice(0, 10)
+        : "";
+      text += `\n• *${titleRow}* – ${cost} KES, ${odo} on ${dateStr}`;
+      if (row.notes) {
+        text += ` (Notes: ${row.notes})`;
+      }
+    }
   }
 
-  text += "\nLast few services:\n";
-
-  for (const row of lastServices.rows) {
-    const title = row.title || "Service";
-    const cost = Number(row.cost_numeric || 0).toFixed(2);
-    const odo = row.odometer_numeric
-      ? Number(row.odometer_numeric).toFixed(0) + " km"
-      : "n/a";
-    const dateStr = row.created_at
-      ? new Date(row.created_at).toISOString().slice(0, 10)
-      : "";
-    text += `\n• *${title}* – ${cost} KES, ${odo} on ${dateStr}`;
-    if (row.notes) {
-      text += ` (Notes: ${row.notes})`;
-    }
+  if (allVehicles) {
+    text += "\n\n(Showing *all vehicles*.)";
+  } else if (vehicleLabel) {
+    text += `\n\n(Showing vehicle *${vehicleLabel}*.)`;
   }
 
   return text;
@@ -842,17 +888,34 @@ async function saveExpenseLogFromSession(session) {
   console.log("📝 Saved expense log for:", session.user_whatsapp);
 }
 
-async function buildExpenseReport(userWhatsapp) {
+// NEW: per-vehicle / all-vehicles expense report
+async function buildExpenseReport(userWhatsapp, options = {}) {
+  const { vehicleId = null, vehicleLabel = null, allVehicles = false } = options;
+
+  let title = "💸 *Expense Summary*";
+  let where = "user_whatsapp = $1";
+  const params = [userWhatsapp];
+
+  if (!allVehicles && vehicleId) {
+    title = `💸 *Expense Summary* – ${vehicleLabel || "this vehicle"}`;
+    where += " AND vehicle_id = $2";
+    params.push(vehicleId);
+  } else if (!allVehicles) {
+    title = "💸 *Expense Summary* (all vehicles)";
+  } else {
+    title = "💸 *Expense Summary* (all vehicles)";
+  }
+
   const monthly = await pool.query(
     `
     SELECT 
       COALESCE(SUM(cost_numeric), 0) AS total,
       COUNT(*) AS count
     FROM expense_logs
-    WHERE user_whatsapp = $1
+    WHERE ${where}
       AND created_at >= NOW() - INTERVAL '30 days'
   `,
-    [userWhatsapp]
+    params
   );
 
   const weekly = await pool.query(
@@ -861,10 +924,10 @@ async function buildExpenseReport(userWhatsapp) {
       COALESCE(SUM(cost_numeric), 0) AS total,
       COUNT(*) AS count
     FROM expense_logs
-    WHERE user_whatsapp = $1
+    WHERE ${where}
       AND created_at >= NOW() - INTERVAL '7 days'
   `,
-    [userWhatsapp]
+    params
   );
 
   const daily = await pool.query(
@@ -873,21 +936,21 @@ async function buildExpenseReport(userWhatsapp) {
       COALESCE(SUM(cost_numeric), 0) AS total,
       COUNT(*) AS count
     FROM expense_logs
-    WHERE user_whatsapp = $1
+    WHERE ${where}
       AND created_at >= NOW() - INTERVAL '1 day'
   `,
-    [userWhatsapp]
+    params
   );
 
   const lastExpenses = await pool.query(
     `
     SELECT title, cost_numeric, odometer_numeric, created_at
     FROM expense_logs
-    WHERE user_whatsapp = $1
+    WHERE ${where}
     ORDER BY created_at DESC
     LIMIT 3
   `,
-    [userWhatsapp]
+    params
   );
 
   const m = monthly.rows[0];
@@ -895,7 +958,7 @@ async function buildExpenseReport(userWhatsapp) {
   const d = daily.rows[0];
 
   let text =
-    "💸 *Expense Summary* (all vehicles)\n\n" +
+    `${title}\n\n` +
     `• Last 30 days: *${Number(m.total || 0).toFixed(
       2
     )} KES* across *${m.count}* expenses\n` +
@@ -909,22 +972,27 @@ async function buildExpenseReport(userWhatsapp) {
   if (lastExpenses.rows.length === 0) {
     text +=
       "\nNo expense records found yet. Type *expense* to log your first one.";
-    return text;
+  } else {
+    text += "\nLast few expenses:\n";
+
+    for (const row of lastExpenses.rows) {
+      const titleRow = row.title || "Expense";
+      const cost = Number(row.cost_numeric || 0).toFixed(2);
+      const odo = row.odometer_numeric
+        ? Number(row.odometer_numeric).toFixed(0) + " km"
+        : "n/a";
+      const dateStr = row.created_at
+        ? new Date(row.created_at).toISOString().slice(0, 10)
+        : "";
+
+      text += `\n• *${titleRow}* – ${cost} KES, ${odo} on ${dateStr}`;
+    }
   }
 
-  text += "\nLast few expenses:\n";
-
-  for (const row of lastExpenses.rows) {
-    const title = row.title || "Expense";
-    const cost = Number(row.cost_numeric || 0).toFixed(2);
-    const odo = row.odometer_numeric
-      ? Number(row.odometer_numeric).toFixed(0) + " km"
-      : "n/a";
-    const dateStr = row.created_at
-      ? new Date(row.created_at).toISOString().slice(0, 10)
-      : "";
-
-    text += `\n• *${title}* – ${cost} KES, ${odo} on ${dateStr}`;
+  if (allVehicles) {
+    text += "\n\n(Showing *all vehicles*.)";
+  } else if (vehicleLabel) {
+    text += `\n\n(Showing vehicle *${vehicleLabel}*.)`;
   }
 
   return text;
@@ -964,7 +1032,6 @@ async function cancelAllSessionsForUser(userWhatsapp) {
 }
 
 // ====== DELETE LAST RECORD ======
-// (unchanged logic – using all-vehicle logs)
 async function handleDeleteLastCommand(userWhatsapp, lower) {
   let type = null;
   if (lower.includes("service")) type = "service";
@@ -1085,7 +1152,6 @@ async function handleDeleteLastCommand(userWhatsapp, lower) {
 }
 
 // ====== EDIT LAST RECORD ======
-// (same logic as before, not repeated comments to keep file manageable)
 async function handleEditLastCommand(userWhatsapp, fullText) {
   const lower = fullText.toLowerCase().trim();
 
@@ -1348,7 +1414,7 @@ async function handleEditLastCommand(userWhatsapp, fullText) {
     }
 
     if (changedFieldText) {
-      summary += `\n\nChanged: *${changedFieldText}* from *${oldValueText}* to *${newValueText}*.`;
+      summary += `\n\nChanged: *${changedFieldText}* from *${oldValueText}* to *${newValueText}*.\n`;
     }
 
     return summary;
@@ -1460,7 +1526,7 @@ async function handleEditLastCommand(userWhatsapp, fullText) {
       `• Liters (calculated): *${litersStr}*`;
 
     if (changedFieldText) {
-      summary += `\n\nChanged: *${changedFieldText}* from *${oldValueText}* to *${newValueText}*.`;
+      summary += `\n\nChanged: *${changedFieldText}* from *${oldValueText}* to *${newValueText}*.\n`;
     }
 
     return summary;
@@ -1562,7 +1628,7 @@ async function handleEditLastCommand(userWhatsapp, fullText) {
       }*`;
 
     if (changedFieldText) {
-      summary += `\n\nChanged: *${changedFieldText}* from *${oldValueText}* to *${newValueText}*.`;
+      summary += `\n\nChanged: *${changedFieldText}* from *${oldValueText}* to *${newValueText}*.\n`;
     }
 
     return summary;
@@ -1636,14 +1702,17 @@ app.post("/whatsapp/inbound", async (req, res) => {
     else if (lower.startsWith("edit last")) {
       replyText = await handleEditLastCommand(from, text);
     }
-    // REPORT COMMANDS: local guidance instead of n8n loops
+    // REPORT COMMANDS: high-level guidance
     else if (lower === "report" || lower.startsWith("report ")) {
       replyText =
         "I can show quick summaries for your vehicle data:\n\n" +
         "• *fuel report* – fuel spend & efficiency\n" +
-        "• *service report* – service spend summary\n" +
-        "• *expense report* – other expenses summary\n\n" +
-        "For now, please use one of those commands.";
+        "• *fuel report all* – all vehicles\n" +
+        "• *service report* – service spend\n" +
+        "• *service report all* – all vehicles\n" +
+        "• *expense report* – other expenses\n" +
+        "• *expense report all* – all vehicles\n\n" +
+        "Please choose one of those.";
     } else {
       // 1) Active sessions first
       const activeFuelSession = await getActiveFuelSession(from);
@@ -1658,16 +1727,91 @@ app.post("/whatsapp/inbound", async (req, res) => {
         replyText = await handleExpenseSessionStep(activeExpenseSession, text);
       } else if (lower === "fuel") {
         replyText = await startFuelSession(from);
-      } else if (lower === "fuel report") {
-        replyText = await buildFuelReport(from);
+      } else if (lower === "fuel report" || lower.startsWith("fuel report")) {
+        // fuel report / fuel report all
+        const wantsAll = lower.includes("all");
+        if (wantsAll) {
+          replyText = await buildFuelReport(from, { allVehicles: true });
+        } else {
+          const vRes = await ensureCurrentVehicle(from);
+          if (vRes.status === "NO_VEHICLES") {
+            replyText =
+              "You don't have any vehicles yet.\n\n" +
+              "Add one with: *add vehicle KDA 123A*";
+          } else if (vRes.status === "NEED_SET_CURRENT") {
+            const listText = formatVehiclesList(vRes.list, true);
+            replyText =
+              "You have multiple vehicles. Please choose which one you want the report for.\n\n" +
+              listText +
+              "\n\nReply with e.g. *switch to 1*, then send *fuel report* again.";
+          } else {
+            const vehicle = vRes.vehicle;
+            replyText = await buildFuelReport(from, {
+              vehicleId: vehicle.id,
+              vehicleLabel: vehicle.registration,
+            });
+          }
+        }
       } else if (lower === "service") {
         replyText = await startServiceSession(from);
-      } else if (lower === "service report") {
-        replyText = await buildServiceReport(from);
+      } else if (
+        lower === "service report" ||
+        lower.startsWith("service report")
+      ) {
+        const wantsAll = lower.includes("all");
+        if (wantsAll) {
+          replyText = await buildServiceReport(from, { allVehicles: true });
+        } else {
+          const vRes = await ensureCurrentVehicle(from);
+          if (vRes.status === "NO_VEHICLES") {
+            replyText =
+              "You don't have any vehicles yet.\n\n" +
+              "Add one with: *add vehicle KDA 123A*";
+          } else if (vRes.status === "NEED_SET_CURRENT") {
+            const listText = formatVehiclesList(vRes.list, true);
+            replyText =
+              "You have multiple vehicles. Please choose which one you want the report for.\n\n" +
+              listText +
+              "\n\nReply with e.g. *switch to 1*, then send *service report* again.";
+          } else {
+            const vehicle = vRes.vehicle;
+            replyText = await buildServiceReport(from, {
+              vehicleId: vehicle.id,
+              vehicleLabel: vehicle.registration,
+            });
+          }
+        }
       } else if (lower === "expense" || lower === "expenses") {
         replyText = await startExpenseSession(from);
-      } else if (lower === "expense report" || lower === "expenses report") {
-        replyText = await buildExpenseReport(from);
+      } else if (
+        lower === "expense report" ||
+        lower === "expenses report" ||
+        lower.startsWith("expense report") ||
+        lower.startsWith("expenses report")
+      ) {
+        const wantsAll = lower.includes("all");
+        if (wantsAll) {
+          replyText = await buildExpenseReport(from, { allVehicles: true });
+        } else {
+          const vRes = await ensureCurrentVehicle(from);
+          if (vRes.status === "NO_VEHICLES") {
+            replyText =
+              "You don't have any vehicles yet.\n\n" +
+              "Add one with: *add vehicle KDA 123A*";
+          } else if (vRes.status === "NEED_SET_CURRENT") {
+            const listText = formatVehiclesList(vRes.list, true);
+            replyText =
+              "You have multiple vehicles. Please choose which one you want the report for.\n\n" +
+              listText +
+              "\n\nReply with e.g. *switch to 1*, then send *expense report* again.";
+          } else {
+            const vehicle = vRes.vehicle;
+            replyText = await buildExpenseReport(from, {
+              vehicleId: vehicle.id,
+              vehicleLabel: vehicle.registration,
+            });
+          }
+        }
       } else {
         // 2) No session, no local command → send to n8n
         let n8nResponseData = {};
@@ -1981,11 +2125,8 @@ async function handleServiceSessionStep(session, incomingText) {
 
   if (step === "ASK_SERVICE_REMINDER_DATE") {
     const dateText = incomingText.trim();
-    if (!/^\d{4}-\d{2}-\d2$/.test(dateText) && !/^\d{4}-\d{2}-\d{2}$/.test(dateText)) {
-      // second regex is the correct one; first is just a soft guard for partial matches
-      if (!/^\d{4}-\d{2}-\d{2}$/.test(dateText)) {
-        return "Please enter the date in *YYYY-MM-DD* format (e.g. 2025-03-10).";
-      }
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(dateText)) {
+      return "Please enter the date in *YYYY-MM-DD* format (e.g. 2025-03-10).";
     }
 
     await updateServiceSessionStep(id, {
