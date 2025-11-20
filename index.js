@@ -581,6 +581,549 @@ async function buildExpenseReport(userWhatsapp) {
   return text;
 }
 
+// ====== GLOBAL SESSION CANCEL ======
+async function cancelAllSessionsForUser(userWhatsapp) {
+  await pool.query(
+    `
+    UPDATE fuel_sessions
+    SET is_completed = TRUE
+    WHERE user_whatsapp = $1
+      AND is_completed = FALSE
+  `,
+    [userWhatsapp]
+  );
+
+  await pool.query(
+    `
+    UPDATE service_sessions
+    SET is_completed = TRUE
+    WHERE user_whatsapp = $1
+      AND is_completed = FALSE
+  `,
+    [userWhatsapp]
+  );
+
+  await pool.query(
+    `
+    UPDATE expense_sessions
+    SET is_completed = TRUE
+    WHERE user_whatsapp = $1
+      AND is_completed = FALSE
+  `,
+    [userWhatsapp]
+  );
+}
+
+// ====== DELETE LAST RECORD ======
+async function handleDeleteLastCommand(userWhatsapp, lower) {
+  let type = null;
+  if (lower.includes("service")) type = "service";
+  else if (lower.includes("fuel")) type = "fuel";
+  else if (lower.includes("expense")) type = "expense";
+
+  if (!type) {
+    return (
+      "Please specify what to delete:\n" +
+      "• *delete last fuel*\n" +
+      "• *delete last service*\n" +
+      "• *delete last expense*"
+    );
+  }
+
+  if (type === "service") {
+    const res = await pool.query(
+      `
+      SELECT id, title, cost_numeric, odometer_numeric
+      FROM service_logs
+      WHERE user_whatsapp = $1
+      ORDER BY created_at DESC
+      LIMIT 1
+    `,
+      [userWhatsapp]
+    );
+
+    if (res.rows.length === 0) {
+      return "You don't have any *service* records to delete.";
+    }
+
+    const row = res.rows[0];
+    await pool.query(`DELETE FROM service_logs WHERE id = $1`, [row.id]);
+
+    const title = row.title || "Service";
+    const cost = Number(row.cost_numeric || 0).toFixed(2);
+    const odo = row.odometer_numeric
+      ? Number(row.odometer_numeric).toFixed(0) + " km"
+      : "n/a";
+
+    return (
+      "✅ Deleted your last *service* record:\n\n" +
+      `• Service: *${title}*\n` +
+      `• Cost: *${cost} KES*\n` +
+      `• Odometer: *${odo}*`
+    );
+  }
+
+  if (type === "fuel") {
+    const res = await pool.query(
+      `
+      SELECT id, total_cost_numeric, price_per_liter_numeric, odometer
+      FROM fuel_logs
+      WHERE user_whatsapp = $1
+      ORDER BY created_at DESC
+      LIMIT 1
+    `,
+      [userWhatsapp]
+    );
+
+    if (res.rows.length === 0) {
+      return "You don't have any *fuel* records to delete.";
+    }
+
+    const row = res.rows[0];
+    await pool.query(`DELETE FROM fuel_logs WHERE id = $1`, [row.id]);
+
+    const total = Number(row.total_cost_numeric || 0).toFixed(2);
+    const price = row.price_per_liter_numeric
+      ? Number(row.price_per_liter_numeric).toFixed(2)
+      : "n/a";
+    const odo = row.odometer
+      ? Number(row.odometer).toFixed(0) + " km"
+      : "n/a";
+
+    return (
+      "✅ Deleted your last *fuel* record:\n\n" +
+      `• Total cost: *${total} KES*\n` +
+      `• Price per liter: *${price} KES*\n` +
+      `• Odometer: *${odo}*`
+    );
+  }
+
+  if (type === "expense") {
+    const res = await pool.query(
+      `
+      SELECT id, title, cost_numeric, odometer_numeric
+      FROM expense_logs
+      WHERE user_whatsapp = $1
+      ORDER BY created_at DESC
+      LIMIT 1
+    `,
+      [userWhatsapp]
+    );
+
+    if (res.rows.length === 0) {
+      return "You don't have any *expense* records to delete.";
+    }
+
+    const row = res.rows[0];
+    await pool.query(`DELETE FROM expense_logs WHERE id = $1`, [row.id]);
+
+    const title = row.title || "Expense";
+    const cost = Number(row.cost_numeric || 0).toFixed(2);
+    const odo = row.odometer_numeric
+      ? Number(row.odometer_numeric).toFixed(0) + " km"
+      : "n/a";
+
+    return (
+      "✅ Deleted your last *expense* record:\n\n" +
+      `• Expense: *${title}*\n` +
+      `• Cost: *${cost} KES*\n` +
+      `• Odometer: *${odo}*`
+    );
+  }
+
+  return "I couldn't detect what to delete. Please use *delete last fuel*, *delete last service*, or *delete last expense*.";
+}
+
+// ====== EDIT LAST RECORD ======
+async function handleEditLastCommand(userWhatsapp, fullText) {
+  const lower = fullText.toLowerCase().trim();
+
+  let type = null;
+  let base = null;
+
+  if (lower.startsWith("edit last service")) {
+    type = "service";
+    base = "edit last service";
+  } else if (lower.startsWith("edit last fuel")) {
+    type = "fuel";
+    base = "edit last fuel";
+  } else if (lower.startsWith("edit last expense")) {
+    type = "expense";
+    base = "edit last expense";
+  } else {
+    return (
+      "To edit, please use:\n" +
+      "• *edit last service cost 5000*\n" +
+      "• *edit last fuel price 210*\n" +
+      "• *edit last expense odometer 180500*"
+    );
+  }
+
+  const rest = fullText.slice(base.length).trim();
+  if (!rest) {
+    if (type === "service") {
+      return (
+        "Please specify what to edit.\n\nExamples:\n" +
+        "• *edit last service cost 5000*\n" +
+        "• *edit last service odometer 180000*\n" +
+        "• *edit last service title Timing belt change*\n" +
+        "• *edit last service notes Mechanic James 0700xxxxxx*"
+      );
+    }
+    if (type === "fuel") {
+      return (
+        "Please specify what to edit.\n\nExamples:\n" +
+        "• *edit last fuel cost 9000*\n" +
+        "• *edit last fuel price 210*\n" +
+        "• *edit last fuel odometer 123456*"
+      );
+    }
+    return (
+      "Please specify what to edit.\n\nExamples:\n" +
+      "• *edit last expense cost 1500*\n" +
+      "• *edit last expense title Parking*\n" +
+      "• *edit last expense odometer 180500*"
+    );
+  }
+
+  const parts = rest.split(/\s+/);
+  const fieldWord = parts[0].toLowerCase();
+  const newValueRaw = parts.slice(1).join(" ").trim();
+
+  if (!newValueRaw) {
+    return "Please provide a new value after the field. Example: *edit last service cost 5000*.";
+  }
+
+  if (type === "service") {
+    const res = await pool.query(
+      `
+      SELECT *
+      FROM service_logs
+      WHERE user_whatsapp = $1
+      ORDER BY created_at DESC
+      LIMIT 1
+    `,
+      [userWhatsapp]
+    );
+
+    if (res.rows.length === 0) {
+      return "You don't have any *service* records to edit.";
+    }
+
+    const log = res.rows[0];
+    let updates = {};
+    let changedFieldText = "";
+    let newValueText = "";
+    let oldValueText = "";
+
+    if (fieldWord === "cost") {
+      const cost = parseNumber(newValueRaw);
+      if (!cost || !isFinite(cost) || cost <= 0) {
+        return "Please provide a valid cost in KES (numbers only).";
+      }
+      updates.cost_numeric = cost;
+      changedFieldText = "Cost";
+      newValueText = `${cost.toFixed(2)} KES`;
+      const old = Number(log.cost_numeric || 0);
+      oldValueText = `${old.toFixed(2)} KES`;
+    } else if (["odometer", "km", "mileage"].includes(fieldWord)) {
+      const odo = parseNumber(newValueRaw);
+      if (!odo || !isFinite(odo) || odo <= 0) {
+        return "Please provide a valid odometer in km (numbers only).";
+      }
+      updates.odometer_numeric = odo;
+      changedFieldText = "Odometer";
+      newValueText = `${odo.toFixed(0)} km`;
+      const old = Number(log.odometer_numeric || 0);
+      oldValueText = `${old.toFixed(0)} km`;
+    } else if (fieldWord === "title" || fieldWord === "service") {
+      updates.title = newValueRaw;
+      changedFieldText = "Service title";
+      newValueText = newValueRaw;
+      oldValueText = log.title || "";
+    } else if (fieldWord === "notes") {
+      updates.notes = newValueRaw;
+      changedFieldText = "Notes";
+      newValueText = newValueRaw;
+      oldValueText = log.notes || "";
+    } else {
+      return (
+        "You can edit the following for the last *service*:\n" +
+        "• *cost*\n" +
+        "• *odometer* / *km* / *mileage*\n" +
+        "• *title*\n" +
+        "• *notes*\n\n" +
+        "Example: *edit last service cost 5000*"
+      );
+    }
+
+    // Build UPDATE query
+    const setParts = [];
+    const values = [];
+    let idx = 1;
+    for (const [k, v] of Object.entries(updates)) {
+      setParts.push(`${k} = $${idx}`);
+      values.push(v);
+      idx++;
+    }
+    setParts.push(`updated_at = NOW()`); // If you have this column
+    const query = `
+      UPDATE service_logs
+      SET ${setParts.join(", ")}
+      WHERE id = $${idx}
+    `;
+    values.push(log.id);
+    await pool.query(query, values);
+
+    // Get updated row
+    const refreshed = await pool.query(
+      "SELECT * FROM service_logs WHERE id = $1",
+      [log.id]
+    );
+    const updated = refreshed.rows[0];
+
+    const title = updated.title || "Service";
+    const costNum = Number(updated.cost_numeric || 0);
+    const odoNum = updated.odometer_numeric
+      ? Number(updated.odometer_numeric)
+      : null;
+    const notes = updated.notes || null;
+
+    let summary =
+      "✅ Updated your last *service* record.\n\n" +
+      `• Service: *${title}*\n` +
+      `• Cost: *${costNum.toFixed(2)} KES*\n` +
+      `• Odometer: *${
+        odoNum ? odoNum.toFixed(0) + " km" : "n/a"
+      }*`;
+
+    if (notes) {
+      summary += `\n• Notes: *${notes}*`;
+    }
+
+    if (changedFieldText) {
+      summary += `\n\nChanged: *${changedFieldText}* from *${oldValueText}* to *${newValueText}*.`;
+    }
+
+    return summary;
+  }
+
+  if (type === "fuel") {
+    const res = await pool.query(
+      `
+      SELECT *
+      FROM fuel_logs
+      WHERE user_whatsapp = $1
+      ORDER BY created_at DESC
+      LIMIT 1
+    `,
+      [userWhatsapp]
+    );
+
+    if (res.rows.length === 0) {
+      return "You don't have any *fuel* records to edit.";
+    }
+
+    const log = res.rows[0];
+    let total = Number(log.total_cost_numeric || 0);
+    let price = Number(log.price_per_liter_numeric || 0);
+    let odo = log.odometer ? Number(log.odometer) : null;
+
+    let changedFieldText = "";
+    let newValueText = "";
+    let oldValueText = "";
+
+    if (["cost", "total", "amount"].includes(fieldWord)) {
+      const newTotal = parseNumber(newValueRaw);
+      if (!newTotal || !isFinite(newTotal) || newTotal <= 0) {
+        return "Please provide a valid total fuel cost in KES (numbers only).";
+      }
+      oldValueText = `${total.toFixed(2)} KES`;
+      total = newTotal;
+      changedFieldText = "Total cost";
+      newValueText = `${total.toFixed(2)} KES`;
+    } else if (["price", "liter", "perliter", "per_liter"].includes(fieldWord)) {
+      const newPrice = parseNumber(newValueRaw);
+      if (!newPrice || !isFinite(newPrice) || newPrice <= 0) {
+        return "Please provide a valid price per liter in KES (numbers only).";
+      }
+      oldValueText = `${price.toFixed(2)} KES`;
+      price = newPrice;
+      changedFieldText = "Price per liter";
+      newValueText = `${price.toFixed(2)} KES`;
+    } else if (["odometer", "km", "mileage"].includes(fieldWord)) {
+      const newOdo = parseNumber(newValueRaw);
+      if (!newOdo || !isFinite(newOdo) || newOdo <= 0) {
+        return "Please provide a valid odometer in km (numbers only).";
+      }
+      oldValueText = odo ? `${odo.toFixed(0)} km` : "n/a";
+      odo = newOdo;
+      changedFieldText = "Odometer";
+      newValueText = `${odo.toFixed(0)} km`;
+    } else {
+      return (
+        "You can edit the following for the last *fuel* record:\n" +
+        "• *cost* / *total* / *amount*\n" +
+        "• *price* (per liter)\n" +
+        "• *odometer* / *km* / *mileage*\n\n" +
+        "Example: *edit last fuel cost 9000*"
+      );
+    }
+
+    // Recalculate liters if we have both total and price
+    let liters = null;
+    if (price > 0 && total > 0) {
+      liters = total / price;
+    }
+
+    await pool.query(
+      `
+      UPDATE fuel_logs
+      SET total_cost_numeric = $1,
+          price_per_liter_numeric = $2,
+          liters = $3,
+          odometer = $4
+      WHERE id = $5
+    `,
+      [total, price, liters, odo, log.id]
+    );
+
+    const refreshed = await pool.query(
+      "SELECT * FROM fuel_logs WHERE id = $1",
+      [log.id]
+    );
+    const updated = refreshed.rows[0];
+
+    const totalStr = Number(updated.total_cost_numeric || 0).toFixed(2);
+    const priceStr = updated.price_per_liter_numeric
+      ? Number(updated.price_per_liter_numeric).toFixed(2)
+      : "n/a";
+    const odoStr = updated.odometer
+      ? Number(updated.odometer).toFixed(0) + " km"
+      : "n/a";
+    const litersStr =
+      updated.liters && isFinite(updated.liters)
+        ? Number(updated.liters).toFixed(2) + " L"
+        : "n/a";
+
+    let summary =
+      "✅ Updated your last *fuel* record.\n\n" +
+      `• Total cost: *${totalStr} KES*\n` +
+      `• Price per liter: *${priceStr} KES*\n` +
+      `• Odometer: *${odoStr}*\n` +
+      `• Liters (calculated): *${litersStr}*`;
+
+    if (changedFieldText) {
+      summary += `\n\nChanged: *${changedFieldText}* from *${oldValueText}* to *${newValueText}*.`;
+    }
+
+    return summary;
+  }
+
+  if (type === "expense") {
+    const res = await pool.query(
+      `
+      SELECT *
+      FROM expense_logs
+      WHERE user_whatsapp = $1
+      ORDER BY created_at DESC
+      LIMIT 1
+    `,
+      [userWhatsapp]
+    );
+
+    if (res.rows.length === 0) {
+      return "You don't have any *expense* records to edit.";
+    }
+
+    const log = res.rows[0];
+    let updates = {};
+    let changedFieldText = "";
+    let newValueText = "";
+    let oldValueText = "";
+
+    if (fieldWord === "cost" || fieldWord === "amount") {
+      const cost = parseNumber(newValueRaw);
+      if (!cost || !isFinite(cost) || cost <= 0) {
+        return "Please provide a valid expense amount in KES (numbers only).";
+      }
+      updates.cost_numeric = cost;
+      changedFieldText = "Cost";
+      newValueText = `${cost.toFixed(2)} KES`;
+      const old = Number(log.cost_numeric || 0);
+      oldValueText = `${old.toFixed(2)} KES`;
+    } else if (["odometer", "km", "mileage"].includes(fieldWord)) {
+      const odo = parseNumber(newValueRaw);
+      if (!odo || !isFinite(odo) || odo <= 0) {
+        return "Please provide a valid odometer in km (numbers only).";
+      }
+      updates.odometer_numeric = odo;
+      changedFieldText = "Odometer";
+      newValueText = `${odo.toFixed(0)} km`;
+      const old = Number(log.odometer_numeric || 0);
+      oldValueText = `${old.toFixed(0)} km`;
+    } else if (fieldWord === "title" || fieldWord === "expense") {
+      updates.title = newValueRaw;
+      changedFieldText = "Expense title";
+      newValueText = newValueRaw;
+      oldValueText = log.title || "";
+    } else {
+      return (
+        "You can edit the following for the last *expense* record:\n" +
+        "• *cost* / *amount*\n" +
+        "• *odometer* / *km* / *mileage*\n" +
+        "• *title*\n\n" +
+        "Example: *edit last expense cost 1500*"
+      );
+    }
+
+    const setParts = [];
+    const values = [];
+    let idx = 1;
+    for (const [k, v] of Object.entries(updates)) {
+      setParts.push(`${k} = $${idx}`);
+      values.push(v);
+      idx++;
+    }
+    setParts.push(`updated_at = NOW()`); // if column exists
+    const query = `
+      UPDATE expense_logs
+      SET ${setParts.join(", ")}
+      WHERE id = $${idx}
+    `;
+    values.push(log.id);
+    await pool.query(query, values);
+
+    const refreshed = await pool.query(
+      "SELECT * FROM expense_logs WHERE id = $1",
+      [log.id]
+    );
+    const updated = refreshed.rows[0];
+
+    const title = updated.title || "Expense";
+    const costNum = Number(updated.cost_numeric || 0);
+    const odoNum = updated.odometer_numeric
+      ? Number(updated.odometer_numeric)
+      : null;
+
+    let summary =
+      "✅ Updated your last *expense* record.\n\n" +
+      `• Expense: *${title}*\n` +
+      `• Cost: *${costNum.toFixed(2)} KES*\n` +
+      `• Odometer: *${
+        odoNum ? odoNum.toFixed(0) + " km" : "n/a"
+      }*`;
+
+    if (changedFieldText) {
+      summary += `\n\nChanged: *${changedFieldText}* from *${oldValueText}* to *${newValueText}*.`;
+    }
+
+    return summary;
+  }
+
+  return "I couldn't detect what to edit. Please use *edit last service ...*, *edit last fuel ...*, or *edit last expense ...*.";
+}
+
 // ====== HEALTH CHECK ======
 app.get("/", (req, res) => {
   res.send("Saka360 backend is running ✅");
@@ -605,50 +1148,65 @@ app.post("/whatsapp/inbound", async (req, res) => {
 
     let replyText = "";
 
-    // 1) Active sessions first
-    const activeFuelSession = await getActiveFuelSession(from);
-    const activeServiceSession = await getActiveServiceSession(from);
-    const activeExpenseSession = await getActiveExpenseSession(from);
-
-    if (activeFuelSession) {
-      replyText = await handleFuelSessionStep(activeFuelSession, text);
-    } else if (activeServiceSession) {
-      replyText = await handleServiceSessionStep(activeServiceSession, text);
-    } else if (activeExpenseSession) {
-      replyText = await handleExpenseSessionStep(activeExpenseSession, text);
-    } else if (lower === "fuel") {
-      replyText = await startFuelSession(from);
-    } else if (lower === "fuel report") {
-      replyText = await buildFuelReport(from);
-    } else if (lower === "service") {
-      replyText = await startServiceSession(from);
-    } else if (lower === "service report") {
-      replyText = await buildServiceReport(from);
-    } else if (lower === "expense" || lower === "expenses") {
-      replyText = await startExpenseSession(from);
-    } else if (lower === "expense report" || lower === "expenses report") {
-      replyText = await buildExpenseReport(from);
-    } else {
-      // 2) No session, no local command → send to n8n
-      let n8nResponseData = {};
-      try {
-        const n8nResponse = await axios.post(N8N_WEBHOOK_URL, {
-          from,
-          to,
-          text,
-        });
-
-        n8nResponseData = n8nResponse.data || {};
-        console.log("🔁 N8N response data:", n8nResponseData);
-      } catch (err) {
-        console.error("❌ Error calling n8n webhook:", err.message);
-      }
-
+    // GLOBAL COMMANDS: cancel / stop / reset
+    if (["cancel", "stop", "reset"].includes(lower)) {
+      await cancelAllSessionsForUser(from);
       replyText =
-        (n8nResponseData &&
-          n8nResponseData.reply &&
-          String(n8nResponseData.reply).trim()) ||
-        "Hi 👋, I’m Saka360. I received your message. Type *fuel*, *service*, or *expense* to log something.";
+        "✅ I’ve cancelled your current entry. You can start again with *fuel*, *service*, or *expense*.";
+    }
+    // GLOBAL COMMAND: delete last ...
+    else if (lower.startsWith("delete last")) {
+      replyText = await handleDeleteLastCommand(from, lower);
+    }
+    // GLOBAL COMMAND: edit last ...
+    else if (lower.startsWith("edit last")) {
+      replyText = await handleEditLastCommand(from, text);
+    } else {
+      // 1) Active sessions first
+      const activeFuelSession = await getActiveFuelSession(from);
+      const activeServiceSession = await getActiveServiceSession(from);
+      const activeExpenseSession = await getActiveExpenseSession(from);
+
+      if (activeFuelSession) {
+        replyText = await handleFuelSessionStep(activeFuelSession, text);
+      } else if (activeServiceSession) {
+        replyText = await handleServiceSessionStep(activeServiceSession, text);
+      } else if (activeExpenseSession) {
+        replyText = await handleExpenseSessionStep(activeExpenseSession, text);
+      } else if (lower === "fuel") {
+        replyText = await startFuelSession(from);
+      } else if (lower === "fuel report") {
+        replyText = await buildFuelReport(from);
+      } else if (lower === "service") {
+        replyText = await startServiceSession(from);
+      } else if (lower === "service report") {
+        replyText = await buildServiceReport(from);
+      } else if (lower === "expense" || lower === "expenses") {
+        replyText = await startExpenseSession(from);
+      } else if (lower === "expense report" || lower === "expenses report") {
+        replyText = await buildExpenseReport(from);
+      } else {
+        // 2) No session, no local command → send to n8n
+        let n8nResponseData = {};
+        try {
+          const n8nResponse = await axios.post(N8N_WEBHOOK_URL, {
+            from,
+            to,
+            text,
+          });
+
+          n8nResponseData = n8nResponse.data || {};
+          console.log("🔁 N8N response data:", n8nResponseData);
+        } catch (err) {
+          console.error("❌ Error calling n8n webhook:", err.message);
+        }
+
+        replyText =
+          (n8nResponseData &&
+            n8nResponseData.reply &&
+            String(n8nResponseData.reply).trim()) ||
+          "Hi 👋, I’m Saka360. I received your message. Type *fuel*, *service*, or *expense* to log something.";
+      }
     }
 
     console.log("💬 Replying to user with:", replyText);
