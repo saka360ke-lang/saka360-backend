@@ -1,5 +1,5 @@
 // index.js
-// Saka360 Backend - WhatsApp → (Fuel / Service / Expense or n8n) → DB → WhatsApp
+// Saka360 Backend - WhatsApp → (Vehicles / Fuel / Service / Expense / n8n) → DB → WhatsApp
 
 const express = require("express");
 const bodyParser = require("body-parser");
@@ -69,6 +69,278 @@ function parseNumber(text) {
   return parseFloat(cleaned);
 }
 
+// ====== VEHICLE HELPERS ======
+
+async function getUserVehicles(userWhatsapp) {
+  const res = await pool.query(
+    `
+    SELECT *
+    FROM vehicles
+    WHERE owner_whatsapp = $1
+      AND is_active = TRUE
+    ORDER BY created_at ASC
+  `,
+    [userWhatsapp]
+  );
+  return res.rows;
+}
+
+async function getCurrentVehicle(userWhatsapp) {
+  const res = await pool.query(
+    `
+    SELECT *
+    FROM vehicles
+    WHERE owner_whatsapp = $1
+      AND is_active = TRUE
+      AND is_default = TRUE
+    ORDER BY created_at ASC
+    LIMIT 1
+  `,
+    [userWhatsapp]
+  );
+  return res.rows[0] || null;
+}
+
+/**
+ * Ensure we have a current vehicle for this user.
+ * Returns:
+ *  { status: "NO_VEHICLES" }
+ *  { status: "NEED_SET_CURRENT", list: [vehicles...] }
+ *  { status: "OK", vehicle, list }
+ */
+async function ensureCurrentVehicle(userWhatsapp) {
+  const vehicles = await getUserVehicles(userWhatsapp);
+
+  if (vehicles.length === 0) {
+    return { status: "NO_VEHICLES" };
+  }
+
+  const current = vehicles.find((v) => v.is_default);
+  if (current) {
+    return { status: "OK", vehicle: current, list: vehicles };
+  }
+
+  // No default yet
+  if (vehicles.length === 1) {
+    // autoselect single vehicle
+    const only = vehicles[0];
+    await pool.query(
+      `UPDATE vehicles SET is_default = TRUE WHERE id = $1`,
+      [only.id]
+    );
+    only.is_default = true;
+    return { status: "OK", vehicle: only, list: [only] };
+  }
+
+  // Multiple vehicles, user must choose
+  return { status: "NEED_SET_CURRENT", list: vehicles };
+}
+
+function formatVehiclesList(vehicles, withIndices = true) {
+  if (!vehicles || vehicles.length === 0) {
+    return "You don't have any vehicles yet.";
+  }
+
+  let text = "";
+  vehicles.forEach((v, index) => {
+    const idx = index + 1;
+    const reg = v.registration;
+    const nick = v.nickname ? ` (${v.nickname})` : "";
+    const mark = v.is_default ? " ✅ (current)" : "";
+    if (withIndices) {
+      text += `\n${idx}. *${reg}*${nick}${mark}`;
+    } else {
+      text += `\n• *${reg}*${nick}${mark}`;
+    }
+  });
+
+  return text.trim();
+}
+
+async function handleAddVehicleCommand(userWhatsapp, fullText) {
+  const base = "add vehicle";
+  const lower = fullText.toLowerCase();
+
+  if (lower === base) {
+    return (
+      "Let's add a vehicle to your Saka360 account 🚗\n\n" +
+      "Please send your vehicle registration in this format:\n" +
+      "*add vehicle KDA 123A*\n\n" +
+      "Example: *add vehicle KCY 456B*"
+    );
+  }
+
+  const regRaw = fullText.slice(base.length).trim();
+  if (!regRaw) {
+    return (
+      "Please include the registration after *add vehicle*.\n\n" +
+      "Example: *add vehicle KDA 123A*"
+    );
+  }
+
+  const registration = regRaw.toUpperCase();
+
+  // Check if vehicle already exists for this user
+  const existing = await pool.query(
+    `
+    SELECT *
+    FROM vehicles
+    WHERE owner_whatsapp = $1
+      AND registration = $2
+      AND is_active = TRUE
+  `,
+    [userWhatsapp, registration]
+  );
+
+  if (existing.rows.length > 0) {
+    const v = existing.rows[0];
+    // If not default, make it default
+    if (!v.is_default) {
+      await pool.query(
+        `
+        UPDATE vehicles
+        SET is_default = TRUE
+        WHERE id = $1
+      `,
+        [v.id]
+      );
+      await pool.query(
+        `
+        UPDATE vehicles
+        SET is_default = FALSE
+        WHERE owner_whatsapp = $1
+          AND id <> $2
+      `,
+        [userWhatsapp, v.id]
+      );
+    }
+    return (
+      `This vehicle *${registration}* is already on your account.\n` +
+      "I’ve set it as your *current vehicle*.\n\n" +
+      "You can now log with *fuel*, *service* or *expense*."
+    );
+  }
+
+  // Insert new vehicle
+  const inserted = await pool.query(
+    `
+    INSERT INTO vehicles (owner_whatsapp, registration, is_default, is_active)
+    VALUES ($1, $2, FALSE, TRUE)
+    RETURNING *
+  `,
+    [userWhatsapp, registration]
+  );
+
+  const newVehicle = inserted.rows[0];
+
+  // If this is the first vehicle, set as default
+  const allVehicles = await getUserVehicles(userWhatsapp);
+  if (allVehicles.length === 1) {
+    await pool.query(
+      `UPDATE vehicles SET is_default = TRUE WHERE id = $1`,
+      [newVehicle.id]
+    );
+    newVehicle.is_default = true;
+    return (
+      `✅ Vehicle *${registration}* added and set as your *current vehicle*.\n\n` +
+      "You can now log:\n" +
+      "• *fuel* – log fuel\n" +
+      "• *service* – log service\n" +
+      "• *expense* – log other vehicle expenses"
+    );
+  }
+
+  // Multiple vehicles now; don't force as default
+  return (
+    `✅ Vehicle *${registration}* added.\n\n` +
+    "To use it as your active vehicle, list your vehicles with *my vehicles* " +
+    "then send e.g. *switch to 2*."
+  );
+}
+
+async function handleMyVehiclesCommand(userWhatsapp) {
+  const vehicles = await getUserVehicles(userWhatsapp);
+  if (vehicles.length === 0) {
+    return (
+      "You don't have any vehicles yet.\n\n" +
+      "Add one with:\n" +
+      "*add vehicle KDA 123A*"
+    );
+  }
+
+  let text = "🚗 *Your vehicles*:\n\n";
+  text += formatVehiclesList(vehicles, true);
+  text +=
+    "\n\nTo change your current vehicle, reply with e.g. *switch to 1* or *switch to 2*.";
+
+  return text;
+}
+
+async function handleSwitchVehicleCommand(userWhatsapp, fullText) {
+  const lower = fullText.toLowerCase().trim();
+  let rest = "";
+
+  if (lower.startsWith("switch to")) {
+    rest = fullText.slice("switch to".length).trim();
+  } else if (lower.startsWith("switch")) {
+    rest = fullText.slice("switch".length).trim();
+  } else {
+    return (
+      "To switch your current vehicle, use:\n" +
+      "*switch to 1* or *switch to 2*\n\n" +
+      "First, see your list with *my vehicles*."
+    );
+  }
+
+  const match = rest.match(/(\d+)/);
+  if (!match) {
+    return (
+      "Please include the vehicle number to switch to.\n\n" +
+      "Example: *switch to 1*\n" +
+      "You can see the list with *my vehicles*."
+    );
+  }
+
+  const index = parseInt(match[1], 10);
+  if (!index || index < 1) {
+    return "I couldn't understand that number. Please use a positive number like *1* or *2*.";
+  }
+
+  const vehicles = await getUserVehicles(userWhatsapp);
+  if (vehicles.length === 0) {
+    return (
+      "You don't have any vehicles yet.\n\n" +
+      "Add one with: *add vehicle KDA 123A*"
+    );
+  }
+
+  if (index > vehicles.length) {
+    return (
+      `You only have *${vehicles.length}* vehicle(s).\n\n` +
+      "See them with *my vehicles* and choose a valid number."
+    );
+  }
+
+  const chosen = vehicles[index - 1];
+
+  // Set chosen as default, unset others
+  await pool.query(
+    `
+    UPDATE vehicles
+    SET is_default = (id = $1)
+    WHERE owner_whatsapp = $2
+      AND is_active = TRUE
+  `,
+    [chosen.id, userWhatsapp]
+  );
+
+  const reg = chosen.registration;
+  return (
+    `✅ Okay, I’ll use *${reg}* as your *current vehicle*.\n\n` +
+    "You can now log with *fuel*, *service*, or *expense*."
+  );
+}
+
 // ====== FUEL HELPERS ======
 async function getActiveFuelSession(userWhatsapp) {
   const result = await pool.query(
@@ -86,16 +358,38 @@ async function getActiveFuelSession(userWhatsapp) {
 }
 
 async function startFuelSession(userWhatsapp) {
+  const vRes = await ensureCurrentVehicle(userWhatsapp);
+
+  if (vRes.status === "NO_VEHICLES") {
+    return (
+      "You don't have any vehicles yet.\n\n" +
+      "Add one first with:\n" +
+      "*add vehicle KDA 123A*\n\n" +
+      "Then type *fuel* again to log fuel."
+    );
+  }
+
+  if (vRes.status === "NEED_SET_CURRENT") {
+    const listText = formatVehiclesList(vRes.list, true);
+    return (
+      "You have multiple vehicles. Please choose which one you want to log for.\n\n" +
+      listText +
+      "\n\nReply with e.g. *switch to 1* or *switch to 2*, then type *fuel* again."
+    );
+  }
+
+  const vehicle = vRes.vehicle;
+
   await pool.query(
     `
-    INSERT INTO fuel_sessions (user_whatsapp, step, is_completed)
-    VALUES ($1, 'ASK_TOTAL_COST', FALSE)
+    INSERT INTO fuel_sessions (user_whatsapp, step, is_completed, vehicle_id)
+    VALUES ($1, 'ASK_TOTAL_COST', FALSE, $2)
   `,
-    [userWhatsapp]
+    [userWhatsapp, vehicle.id]
   );
 
   return (
-    "⛽ Let’s log fuel.\n" +
+    `⛽ Let’s log fuel for *${vehicle.registration}*.\n` +
     "Please enter the *total fuel cost* in KES (numbers only, e.g. 8000)."
   );
 }
@@ -127,6 +421,7 @@ async function saveFuelLogFromSession(session) {
   const totalCost = Number(session.total_cost_numeric);
   const pricePerLiter = Number(session.price_per_liter_numeric);
   const odometer = Number(session.odometer_numeric);
+  const vehicleId = session.vehicle_id || null;
 
   const liters =
     pricePerLiter && isFinite(pricePerLiter) && pricePerLiter > 0
@@ -141,9 +436,10 @@ async function saveFuelLogFromSession(session) {
       total_cost_numeric,
       price_per_liter_numeric,
       liters,
-      odometer
+      odometer,
+      vehicle_id
     )
-    VALUES ($1, $2, $3, $4, $5, $6)
+    VALUES ($1, $2, $3, $4, $5, $6, $7)
   `,
     [
       session.user_whatsapp,
@@ -152,6 +448,7 @@ async function saveFuelLogFromSession(session) {
       pricePerLiter,
       liters,
       odometer,
+      vehicleId,
     ]
   );
 
@@ -226,11 +523,12 @@ async function buildFuelReport(userWhatsapp) {
   }
 
   return (
-    "⛽ *Fuel Summary*\n\n" +
+    "⛽ *Fuel Summary* (all vehicles)\n\n" +
     `• Last 30 days: *${monthTotal.toFixed(2)} KES*\n` +
     `• Last 7 days: *${weekTotal.toFixed(2)} KES*\n` +
     `• Last 24 hours: *${dayTotal.toFixed(2)} KES*\n\n` +
-    efficiencyText
+    efficiencyText +
+    "\n\n(Later we can tighten this per-vehicle, e.g. by reg)"
   );
 }
 
@@ -251,16 +549,38 @@ async function getActiveServiceSession(userWhatsapp) {
 }
 
 async function startServiceSession(userWhatsapp) {
+  const vRes = await ensureCurrentVehicle(userWhatsapp);
+
+  if (vRes.status === "NO_VEHICLES") {
+    return (
+      "You don't have any vehicles yet.\n\n" +
+      "Add one first with:\n" +
+      "*add vehicle KDA 123A*\n\n" +
+      "Then type *service* again."
+    );
+  }
+
+  if (vRes.status === "NEED_SET_CURRENT") {
+    const listText = formatVehiclesList(vRes.list, true);
+    return (
+      "You have multiple vehicles. Please choose which one you want to log service for.\n\n" +
+      listText +
+      "\n\nReply with e.g. *switch to 1* or *switch to 2*, then type *service* again."
+    );
+  }
+
+  const vehicle = vRes.vehicle;
+
   await pool.query(
     `
-    INSERT INTO service_sessions (user_whatsapp, step, is_completed)
-    VALUES ($1, 'ASK_SERVICE_TITLE', FALSE)
+    INSERT INTO service_sessions (user_whatsapp, step, is_completed, vehicle_id)
+    VALUES ($1, 'ASK_SERVICE_TITLE', FALSE, $2)
   `,
-    [userWhatsapp]
+    [userWhatsapp, vehicle.id]
   );
 
   return (
-    "🔧 Let’s log a *service*.\n" +
+    `🔧 Let’s log a *service* for *${vehicle.registration}*.\n` +
     "What is the service? (e.g. Oil change, Timing belt, Turbo service)"
   );
 }
@@ -298,6 +618,7 @@ async function saveServiceLogFromSession(session) {
     ? Number(session.reminder_odometer)
     : null;
   const notes = session.notes || null;
+  const vehicleId = session.vehicle_id || null;
 
   await pool.query(
     `
@@ -309,9 +630,10 @@ async function saveServiceLogFromSession(session) {
       reminder_type,
       reminder_date_text,
       reminder_odometer,
-      notes
+      notes,
+      vehicle_id
     )
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
   `,
     [
       session.user_whatsapp,
@@ -322,6 +644,7 @@ async function saveServiceLogFromSession(session) {
       reminderDateText,
       reminderOdometer,
       notes,
+      vehicleId,
     ]
   );
 
@@ -381,7 +704,7 @@ async function buildServiceReport(userWhatsapp) {
   const d = daily.rows[0];
 
   let text =
-    "🔧 *Service Summary*\n\n" +
+    "🔧 *Service Summary* (all vehicles)\n\n" +
     `• Last 30 days: *${Number(m.total || 0).toFixed(
       2
     )} KES* across *${m.count}* services\n` +
@@ -435,16 +758,38 @@ async function getActiveExpenseSession(userWhatsapp) {
 }
 
 async function startExpenseSession(userWhatsapp) {
+  const vRes = await ensureCurrentVehicle(userWhatsapp);
+
+  if (vRes.status === "NO_VEHICLES") {
+    return (
+      "You don't have any vehicles yet.\n\n" +
+      "Add one first with:\n" +
+      "*add vehicle KDA 123A*\n\n" +
+      "Then type *expense* again."
+    );
+  }
+
+  if (vRes.status === "NEED_SET_CURRENT") {
+    const listText = formatVehiclesList(vRes.list, true);
+    return (
+      "You have multiple vehicles. Please choose which one you want to log expenses for.\n\n" +
+      listText +
+      "\n\nReply with e.g. *switch to 1* or *switch to 2*, then type *expense* again."
+    );
+  }
+
+  const vehicle = vRes.vehicle;
+
   await pool.query(
     `
-    INSERT INTO expense_sessions (user_whatsapp, step, is_completed)
-    VALUES ($1, 'ASK_EXPENSE_TITLE', FALSE)
+    INSERT INTO expense_sessions (user_whatsapp, step, is_completed, vehicle_id)
+    VALUES ($1, 'ASK_EXPENSE_TITLE', FALSE, $2)
   `,
-    [userWhatsapp]
+    [userWhatsapp, vehicle.id]
   );
 
   return (
-    "💸 Let’s log an *expense*.\n" +
+    `💸 Let’s log an *expense* for *${vehicle.registration}*.\n` +
     "What is the expense for? (e.g. Puncture, Paint job, Parts, Parking)"
   );
 }
@@ -478,6 +823,7 @@ async function saveExpenseLogFromSession(session) {
   const odometer = session.odometer_numeric
     ? Number(session.odometer_numeric)
     : null;
+  const vehicleId = session.vehicle_id || null;
 
   await pool.query(
     `
@@ -485,11 +831,12 @@ async function saveExpenseLogFromSession(session) {
       user_whatsapp,
       title,
       cost_numeric,
-      odometer_numeric
+      odometer_numeric,
+      vehicle_id
     )
-    VALUES ($1, $2, $3, $4)
+    VALUES ($1, $2, $3, $4, $5)
   `,
-    [session.user_whatsapp, title, cost, odometer]
+    [session.user_whatsapp, title, cost, odometer, vehicleId]
   );
 
   console.log("📝 Saved expense log for:", session.user_whatsapp);
@@ -548,7 +895,7 @@ async function buildExpenseReport(userWhatsapp) {
   const d = daily.rows[0];
 
   let text =
-    "💸 *Expense Summary*\n\n" +
+    "💸 *Expense Summary* (all vehicles)\n\n" +
     `• Last 30 days: *${Number(m.total || 0).toFixed(
       2
     )} KES* across *${m.count}* expenses\n` +
@@ -617,6 +964,7 @@ async function cancelAllSessionsForUser(userWhatsapp) {
 }
 
 // ====== DELETE LAST RECORD ======
+// (unchanged logic – using all-vehicle logs)
 async function handleDeleteLastCommand(userWhatsapp, lower) {
   let type = null;
   if (lower.includes("service")) type = "service";
@@ -737,6 +1085,7 @@ async function handleDeleteLastCommand(userWhatsapp, lower) {
 }
 
 // ====== EDIT LAST RECORD ======
+// (same logic as before, not repeated comments to keep file manageable)
 async function handleEditLastCommand(userWhatsapp, fullText) {
   const lower = fullText.toLowerCase().trim();
 
@@ -1252,6 +1601,14 @@ app.post("/whatsapp/inbound", async (req, res) => {
       replyText =
         "✅ I’ve cancelled your current entry. You can start again with *fuel*, *service*, or *expense*.";
     }
+    // VEHICLE COMMANDS
+    else if (lower.startsWith("add vehicle")) {
+      replyText = await handleAddVehicleCommand(from, text);
+    } else if (lower === "my vehicles") {
+      replyText = await handleMyVehiclesCommand(from);
+    } else if (lower.startsWith("switch")) {
+      replyText = await handleSwitchVehicleCommand(from, text);
+    }
     // GLOBAL COMMAND: simple "edit" helper
     else if (lower === "edit") {
       replyText =
@@ -1427,8 +1784,21 @@ async function handleFuelSessionStep(session, incomingText) {
     const pricePerLiter = Number(updatedSession.price_per_liter_numeric);
     const odoNum = Number(odometer);
 
+    // Get vehicle registration if possible
+    let vehicleText = "";
+    if (updatedSession.vehicle_id) {
+      const vRes = await pool.query(
+        "SELECT registration FROM vehicles WHERE id = $1",
+        [updatedSession.vehicle_id]
+      );
+      if (vRes.rows.length > 0) {
+        vehicleText = `Vehicle: *${vRes.rows[0].registration}*\n`;
+      }
+    }
+
     let summary =
       "✅ Fuel log saved.\n\n" +
+      (vehicleText ? vehicleText : "") +
       `• Total cost: *${totalCost.toFixed(2)} KES*\n` +
       `• Price per liter: *${pricePerLiter.toFixed(2)} KES*\n` +
       `• Odometer: *${odoNum.toFixed(0)} km*`;
@@ -1554,8 +1924,21 @@ async function handleServiceSessionStep(session, incomingText) {
       const odo = Number(updatedSession.odometer_numeric);
       const notes = updatedSession.notes;
 
+      // vehicle text
+      let vehicleText = "";
+      if (updatedSession.vehicle_id) {
+        const vRes = await pool.query(
+          "SELECT registration FROM vehicles WHERE id = $1",
+          [updatedSession.vehicle_id]
+        );
+        if (vRes.rows.length > 0) {
+          vehicleText = `Vehicle: *${vRes.rows[0].registration}*\n`;
+        }
+      }
+
       let summary =
         "✅ Service log saved with *no reminder*.\n\n" +
+        (vehicleText ? vehicleText : "") +
         `• Service: *${title}*\n` +
         `• Cost: *${cost.toFixed(2)} KES*\n` +
         `• Odometer: *${odo.toFixed(0)} km*`;
@@ -1598,8 +1981,11 @@ async function handleServiceSessionStep(session, incomingText) {
 
   if (step === "ASK_SERVICE_REMINDER_DATE") {
     const dateText = incomingText.trim();
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(dateText)) {
-      return "Please enter the date in *YYYY-MM-DD* format (e.g. 2025-03-10).";
+    if (!/^\d{4}-\d{2}-\d2$/.test(dateText) && !/^\d{4}-\d{2}-\d{2}$/.test(dateText)) {
+      // second regex is the correct one; first is just a soft guard for partial matches
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(dateText)) {
+        return "Please enter the date in *YYYY-MM-DD* format (e.g. 2025-03-10).";
+      }
     }
 
     await updateServiceSessionStep(id, {
@@ -1620,8 +2006,20 @@ async function handleServiceSessionStep(session, incomingText) {
     const odo = Number(updatedSession.odometer_numeric);
     const notes = updatedSession.notes;
 
+    let vehicleText = "";
+    if (updatedSession.vehicle_id) {
+      const vRes = await pool.query(
+        "SELECT registration FROM vehicles WHERE id = $1",
+        [updatedSession.vehicle_id]
+      );
+      if (vRes.rows.length > 0) {
+        vehicleText = `Vehicle: *${vRes.rows[0].registration}*\n`;
+      }
+    }
+
     let summary =
       "✅ Service log saved with *date reminder*.\n\n" +
+      (vehicleText ? vehicleText : "") +
       `• Service: *${title}*\n` +
       `• Cost: *${cost.toFixed(2)} KES*\n` +
       `• Odometer: *${odo.toFixed(0)} km*\n` +
@@ -1658,8 +2056,20 @@ async function handleServiceSessionStep(session, incomingText) {
     const odo = Number(updatedSession.odometer_numeric);
     const notes = updatedSession.notes;
 
+    let vehicleText = "";
+    if (updatedSession.vehicle_id) {
+      const vRes = await pool.query(
+        "SELECT registration FROM vehicles WHERE id = $1",
+        [updatedSession.vehicle_id]
+      );
+      if (vRes.rows.length > 0) {
+        vehicleText = `Vehicle: *${vRes.rows[0].registration}*\n`;
+      }
+    }
+
     let summary =
       "✅ Service log saved with *mileage reminder*.\n\n" +
+      (vehicleText ? vehicleText : "") +
       `• Service: *${title}*\n` +
       `• Cost: *${cost.toFixed(2)} KES*\n` +
       `• Odometer: *${odo.toFixed(0)} km*\n` +
@@ -1739,8 +2149,20 @@ async function handleExpenseSessionStep(session, incomingText) {
     const cost = Number(updatedSession.cost_numeric);
     const odo = Number(updatedSession.odometer_numeric);
 
+    let vehicleText = "";
+    if (updatedSession.vehicle_id) {
+      const vRes = await pool.query(
+        "SELECT registration FROM vehicles WHERE id = $1",
+        [updatedSession.vehicle_id]
+      );
+      if (vRes.rows.length > 0) {
+        vehicleText = `Vehicle: *${vRes.rows[0].registration}*\n`;
+      }
+    }
+
     return (
       "✅ Expense log saved.\n\n" +
+      (vehicleText ? vehicleText : "") +
       `• Expense: *${title}*\n` +
       `• Cost: *${cost.toFixed(2)} KES*\n` +
       `• Odometer: *${odo.toFixed(0)} km*`
