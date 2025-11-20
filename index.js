@@ -371,7 +371,7 @@ function formatDriversList(drivers, withIndices = true) {
   drivers.forEach((d, index) => {
     const idx = index + 1;
     const name = d.full_name || "Driver";
-    const lic = d.license_number || "n/a";
+    const licType = d.license_type || "n/a";
     const expDate = d.license_expiry_date
       ? new Date(d.license_expiry_date)
       : null;
@@ -387,24 +387,24 @@ function formatDriversList(drivers, withIndices = true) {
 
       if (diffDays < 0) {
         statusIcon = "❌";
-        statusText = `expired ${Math.abs(diffDays)} day(s) ago`;
+        statusText = `licence expired ${Math.abs(diffDays)} day(s) ago`;
       } else if (diffDays <= 30) {
         statusIcon = "⚠️";
-        statusText = `expires in ${diffDays} day(s)`;
+        statusText = `licence expires in ${diffDays} day(s)`;
       } else {
         statusIcon = "✅";
-        statusText = `valid, ~${diffDays} day(s) left`;
+        statusText = `licence valid, ~${diffDays} day(s) left`;
       }
     } else {
       statusIcon = "⚠️";
-      statusText = "no expiry date set";
+      statusText = "no licence expiry date set";
     }
 
     const expStr = d.license_expiry_date
       ? String(d.license_expiry_date).slice(0, 10)
       : "n/a";
 
-    const baseLine = `*${name}* – Lic: *${lic}* (exp: ${expStr}) ${statusIcon} ${statusText}`;
+    const baseLine = `*${name}* – Type: *${licType}* (exp: ${expStr}) ${statusIcon} ${statusText}`;
 
     if (withIndices) {
       text += `\n${idx}. ${baseLine}`;
@@ -421,10 +421,15 @@ function formatDriversList(drivers, withIndices = true) {
  *
  * Usage:
  *   1) "add driver" → show instructions
- *   2) "add driver John Doe | 0712345678 | DL12345 | 2026-01-01"
+ *   2) "add driver John Doe | 0712345678 | main licence | 2026-01-01"
  *
  * Fields (pipe/comma separated):
- *   name | phone (optional) | license number | expiry (YYYY-MM-DD)
+ *   name | phone (optional) | licence type | expiry (YYYY-MM-DD)
+ *
+ * Examples of licence types:
+ *   - main licence
+ *   - psv licence
+ *   - tsv licence
  */
 async function handleAddDriverCommand(userWhatsapp, fullText) {
   const base = "add driver";
@@ -434,10 +439,11 @@ async function handleAddDriverCommand(userWhatsapp, fullText) {
     return (
       "Let's add a driver to your Saka360 account 👨‍✈️\n\n" +
       "Please send the details in *one line* using this format:\n" +
-      "*add driver Full Name | 07XXXXXXXX | LICENSE_NO | YYYY-MM-DD*\n\n" +
+      "*add driver Full Name | 07XXXXXXXX | licence type | YYYY-MM-DD*\n\n" +
       "Examples:\n" +
-      "*add driver John Doe | 0712345678 | DL12345 | 2026-01-01*\n" +
-      "*add driver Jane | DL99999 | 2025-12-31* (no phone)"
+      "*add driver John Doe | 0712345678 | main licence | 2026-01-01*\n" +
+      "*add driver Jane | psv licence | 2025-12-31* (no phone)\n\n" +
+      "Licence types can be things like *main licence*, *psv licence*, *tsv licence*, etc."
     );
   }
 
@@ -446,7 +452,7 @@ async function handleAddDriverCommand(userWhatsapp, fullText) {
     return (
       "Please include the driver details after *add driver*.\n\n" +
       "Format:\n" +
-      "*add driver Full Name | 07XXXXXXXX | LICENSE_NO | YYYY-MM-DD*"
+      "*add driver Full Name | 07XXXXXXXX | licence type | YYYY-MM-DD*"
     );
   }
 
@@ -459,40 +465,40 @@ async function handleAddDriverCommand(userWhatsapp, fullText) {
 
   if (parts.length < 3) {
     return (
-      "I need at least: *Name, Licence number, Licence expiry date*.\n\n" +
+      "I need at least: *Name, Licence type, Licence expiry date*.\n\n" +
       "Format:\n" +
-      "*add driver Full Name | 07XXXXXXXX | LICENSE_NO | YYYY-MM-DD*\n\n" +
+      "*add driver Full Name | 07XXXXXXXX | licence type | YYYY-MM-DD*\n\n" +
       "If you don't want to add phone, you can do:\n" +
-      "*add driver Full Name | LICENSE_NO | YYYY-MM-DD*"
+      "*add driver Full Name | licence type | YYYY-MM-DD*"
     );
   }
 
   let fullName;
   let phone = null;
-  let licenseNumber;
+  let licenseType;
   let expiryText;
 
   if (parts.length === 3) {
-    // name | license | expiry
+    // name | licence type | expiry
     fullName = parts[0];
-    licenseNumber = parts[1];
+    licenseType = parts[1];
     expiryText = parts[2];
   } else {
-    // name | phone | license | expiry
+    // name | phone | licence type | expiry
     fullName = parts[0];
     phone = parts[1];
-    licenseNumber = parts[2];
+    licenseType = parts[2];
     expiryText = parts[3];
   }
 
   fullName = fullName || "";
-  licenseNumber = licenseNumber || "";
+  licenseType = licenseType || "";
 
   if (!fullName) {
     return "Please provide the driver's *full name* as the first item.";
   }
-  if (!licenseNumber) {
-    return "Please provide a valid *licence number*.";
+  if (!licenseType) {
+    return "Please provide the *licence type* (e.g. main licence, psv licence, tsv licence).";
   }
 
   expiryText = expiryText || "";
@@ -505,17 +511,18 @@ async function handleAddDriverCommand(userWhatsapp, fullText) {
     return "That expiry date doesn't look valid. Please use *YYYY-MM-DD* format.";
   }
 
-  // Check if this licence already exists for this owner → update instead of duplicate
+  // Check if this driver (by name + licence type) already exists for this owner → update instead of duplicate
   const existing = await pool.query(
     `
     SELECT id
     FROM drivers
     WHERE owner_whatsapp = $1
-      AND license_number = $2
+      AND full_name = $2
+      AND license_type = $3
       AND is_active = TRUE
     LIMIT 1
   `,
-    [userWhatsapp, licenseNumber]
+    [userWhatsapp, fullName, licenseType]
   );
 
   let driverRow;
@@ -529,12 +536,13 @@ async function handleAddDriverCommand(userWhatsapp, fullText) {
       UPDATE drivers
       SET full_name = $1,
           driver_whatsapp = $2,
-          license_expiry_date = $3,
+          license_type = $3,
+          license_expiry_date = $4,
           updated_at = NOW()
-      WHERE id = $4
+      WHERE id = $5
       RETURNING *
     `,
-      [fullName, phone || null, expiryText, driverId]
+      [fullName, phone || null, licenseType, expiryText, driverId]
     );
     driverRow = resUpdate.rows[0];
     actionText = "updated";
@@ -546,28 +554,28 @@ async function handleAddDriverCommand(userWhatsapp, fullText) {
         owner_whatsapp,
         full_name,
         driver_whatsapp,
-        license_number,
+        license_type,
         license_expiry_date,
         is_active
       )
       VALUES ($1, $2, $3, $4, $5, TRUE)
       RETURNING *
     `,
-      [userWhatsapp, fullName, phone || null, licenseNumber, expiryText]
+      [userWhatsapp, fullName, phone || null, licenseType, expiryText]
     );
     driverRow = resInsert.rows[0];
     actionText = "added";
   }
 
   const name = driverRow.full_name;
-  const lic = driverRow.license_number;
+  const licType = driverRow.license_type || "n/a";
   const exp = String(driverRow.license_expiry_date).slice(0, 10);
   const phoneText = driverRow.driver_whatsapp || "not set";
 
   return (
     `✅ Driver *${name}* ${actionText}.\n\n` +
     `• Phone: *${phoneText}*\n` +
-    `• Licence: *${lic}*\n` +
+    `• Licence type: *${licType}*\n` +
     `• Expiry: *${exp}*\n\n` +
     "You can see all drivers with *my drivers* and assign one with *assign driver 1* (for example)."
   );
@@ -580,7 +588,7 @@ async function handleMyDriversCommand(userWhatsapp) {
     return (
       "You don't have any drivers yet.\n\n" +
       "Add one with:\n" +
-      "*add driver John Doe | 0712345678 | DL12345 | 2026-01-01*"
+      "*add driver John Doe | 0712345678 | main licence | 2026-01-01*"
     );
   }
 
@@ -632,7 +640,7 @@ async function handleAssignDriverCommand(userWhatsapp, fullText) {
     return (
       "You don't have any drivers yet.\n\n" +
       "Add one with:\n" +
-      "*add driver John Doe | 0712345678 | DL12345 | 2026-01-01*"
+      "*add driver John Doe | 0712345678 | main licence | 2026-01-01*"
     );
   }
 
@@ -656,7 +664,7 @@ async function handleAssignDriverCommand(userWhatsapp, fullText) {
   );
 
   const name = chosen.full_name || "Driver";
-  const lic = chosen.license_number || "n/a";
+  const licType = chosen.license_type || "n/a";
   const exp = chosen.license_expiry_date
     ? String(chosen.license_expiry_date).slice(0, 10)
     : "n/a";
@@ -665,7 +673,7 @@ async function handleAssignDriverCommand(userWhatsapp, fullText) {
     "✅ Driver assigned.\n\n" +
     `Vehicle: *${vehicle.registration}*\n` +
     `Driver: *${name}*\n` +
-    `Licence: *${lic}* (exp: ${exp})\n\n` +
+    `Licence type: *${licType}* (exp: ${exp})\n\n` +
     "You can change driver any time with another *assign driver X*."
   );
 }
@@ -674,7 +682,7 @@ async function handleAssignDriverCommand(userWhatsapp, fullText) {
 async function buildDriverComplianceReport(userWhatsapp) {
   const res = await pool.query(
     `
-    SELECT id, full_name, license_number, license_expiry_date, driver_whatsapp, is_active
+    SELECT id, full_name, license_type, license_expiry_date, driver_whatsapp, is_active
     FROM drivers
     WHERE owner_whatsapp = $1
       AND is_active = TRUE
@@ -688,7 +696,7 @@ async function buildDriverComplianceReport(userWhatsapp) {
     return (
       "You don't have any drivers yet.\n\n" +
       "Add one with:\n" +
-      "*add driver John Doe | 0712345678 | DL12345 | 2026-01-01*"
+      "*add driver John Doe | 0712345678 | main licence | 2026-01-01*"
     );
   }
 
@@ -728,13 +736,13 @@ async function buildDriverComplianceReport(userWhatsapp) {
     for (const item of expired) {
       const d = item.driver;
       const name = d.full_name || "Driver";
-      const lic = d.license_number || "n/a";
+      const licType = d.license_type || "n/a";
       const exp = d.license_expiry_date
         ? String(d.license_expiry_date).slice(0, 10)
         : "n/a";
       const days = item.diffDays !== null ? Math.abs(item.diffDays) : "?";
       const phone = d.driver_whatsapp || "no phone on file";
-      text += `\n• *${name}* – Lic: *${lic}*, exp: ${exp} (expired ${days} day(s) ago) – ${phone}`;
+      text += `\n• *${name}* – Type: *${licType}*, exp: ${exp} (expired ${days} day(s) ago) – ${phone}`;
     }
   } else {
     text += "\n❌ *Expired licences*: none 🎉";
@@ -746,13 +754,13 @@ async function buildDriverComplianceReport(userWhatsapp) {
     for (const item of expiring) {
       const d = item.driver;
       const name = d.full_name || "Driver";
-      const lic = d.license_number || "n/a";
+      const licType = d.license_type || "n/a";
       const exp = d.license_expiry_date
         ? String(d.license_expiry_date).slice(0, 10)
         : "n/a";
       const days = item.diffDays;
       const phone = d.driver_whatsapp || "no phone on file";
-      text += `\n• *${name}* – Lic: *${lic}*, exp: ${exp} (in ${days} day(s)) – ${phone}`;
+      text += `\n• *${name}* – Type: *${licType}*, exp: ${exp} (in ${days} day(s)) – ${phone}`;
     }
   } else {
     text += "\n\n⚠️ *Expiring soon (30 days)*: none.";
@@ -764,13 +772,13 @@ async function buildDriverComplianceReport(userWhatsapp) {
     for (const item of ok) {
       const d = item.driver;
       const name = d.full_name || "Driver";
-      const lic = d.license_number || "n/a";
+      const licType = d.license_type || "n/a";
       const exp = d.license_expiry_date
         ? String(d.license_expiry_date).slice(0, 10)
         : "n/a";
       const days = item.diffDays;
       const phone = d.driver_whatsapp || "no phone on file";
-      text += `\n• *${name}* – Lic: *${lic}*, exp: ${exp} (~${days} day(s) left) – ${phone}`;
+      text += `\n• *${name}* – Type: *${licType}*, exp: ${exp} (~${days} day(s) left) – ${phone}`;
     }
   } else {
     text += "\n\n✅ *Valid licences*: none yet.";
@@ -2107,6 +2115,13 @@ app.post("/whatsapp/inbound", async (req, res) => {
       await cancelAllSessionsForUser(from);
       replyText =
         "✅ I’ve cancelled your current entry. You can start again with *fuel*, *service*, or *expense*.";
+    }
+    // QUICK "add" helper (so just sending "add" doesn't jump to n8n)
+    else if (lower === "add") {
+      replyText =
+        "What would you like to add?\n\n" +
+        "• *add vehicle KDA 123A*\n" +
+        "• *add driver John Doe | 0712345678 | main licence | 2026-01-01*";
     }
     // VEHICLE COMMANDS
     else if (lower.startsWith("add vehicle")) {
