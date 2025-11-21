@@ -69,6 +69,37 @@ function parseNumber(text) {
   return parseFloat(cleaned);
 }
 
+// Default non-null licence number to satisfy NOT NULL constraint
+const DEFAULT_LICENSE_NUMBER = "N/A";
+
+// Build main help/start/menu text
+function buildHelpMessage() {
+  return (
+    "Hi 👋, I’m *Saka360*, your WhatsApp vehicle logbook.\n\n" +
+    "Here’s what I can help you with:\n\n" +
+    "🚗 *Vehicles*\n" +
+    "• *add vehicle KDA 123A* – add a vehicle\n" +
+    "• *my vehicles* – list vehicles & current one\n" +
+    "• *switch to 1* – change current vehicle\n\n" +
+    "👨‍✈️ *Drivers*\n" +
+    "• *add driver John Doe | 0712345678* – invite a driver\n" +
+    "• *my drivers* – list drivers\n" +
+    "• *assign driver 1* – assign a driver to your current vehicle\n" +
+    "• *driver report* – driver licence compliance overview\n\n" +
+    "⛽ *Fuel / Service / Expenses*\n" +
+    "• *fuel* – log fuel\n" +
+    "• *service* – log service (+ reminders)\n" +
+    "• *expense* – log other vehicle costs\n" +
+    "• *fuel report*, *service report*, *expense report* – quick summaries\n" +
+    "• add *all* to see all vehicles, e.g. *fuel report all*\n\n" +
+    "✏️ *Edit / Delete / Cancel*\n" +
+    "• *edit last fuel/service/expense* – fix last entry\n" +
+    "• *delete last fuel/service/expense* – remove last entry\n" +
+    "• *cancel* – cancel current entry\n\n" +
+    "Anytime you’re stuck, type *help* or *start* to see this menu again."
+  );
+}
+
 // ====== VEHICLE HELPERS ======
 
 async function getUserVehicles(userWhatsapp) {
@@ -521,11 +552,12 @@ async function handleAddDriverCommand(ownerWhatsapp, fullText) {
       `
       UPDATE drivers
       SET full_name = $1,
+          license_number = COALESCE(license_number, $2),
           updated_at = NOW()
-      WHERE id = $2
+      WHERE id = $3
       RETURNING *
     `,
-      [fullName, driverId]
+      [fullName, DEFAULT_LICENSE_NUMBER, driverId]
     );
     driverRow = resUpdate.rows[0];
   } else {
@@ -535,14 +567,15 @@ async function handleAddDriverCommand(ownerWhatsapp, fullText) {
         owner_whatsapp,
         full_name,
         driver_whatsapp,
+        license_number,
         license_type,
         license_expiry_date,
         is_active
       )
-      VALUES ($1, $2, $3, NULL, NULL, TRUE)
+      VALUES ($1, $2, $3, $4, NULL, NULL, TRUE)
       RETURNING *
     `,
-      [ownerWhatsapp, fullName, driverWhatsapp]
+      [ownerWhatsapp, fullName, driverWhatsapp, DEFAULT_LICENSE_NUMBER]
     );
     driverRow = resInsert.rows[0];
   }
@@ -764,7 +797,7 @@ async function handleDriverLicenceCommand(driverWhatsapp, fullText) {
           body:
             "✅ *Driver compliance update*\n\n" +
             `Driver: *${name}*\n` +
-            `Main DL expiry: *${expiryText}*\n\n` +
+            `Main DL expiry: *${expiryText}*\n\n" +
             "This driver is now *Main DL compliant* and can be allowed to log *fuel*, *service* and *expenses* for vehicles you assign.",
         });
       }
@@ -2313,8 +2346,12 @@ app.post("/whatsapp/inbound", async (req, res) => {
 
     let replyText = "";
 
+    // HELP / START / MENU
+    if (lower === "start" || lower === "help" || lower === "menu") {
+      replyText = buildHelpMessage();
+    }
     // GLOBAL COMMANDS: cancel / stop / reset
-    if (["cancel", "stop", "reset"].includes(lower)) {
+    else if (["cancel", "stop", "reset"].includes(lower)) {
       await cancelAllSessionsForUser(from);
       replyText =
         "✅ I’ve cancelled your current entry. You can start again with *fuel*, *service*, or *expense*.";
@@ -2518,7 +2555,7 @@ app.post("/whatsapp/inbound", async (req, res) => {
           (n8nResponseData &&
             n8nResponseData.reply &&
             String(n8nResponseData.reply).trim()) ||
-          "Hi 👋, I’m Saka360. I received your message. Type *fuel*, *service*, *expense*, or *add* to get started.";
+          "Hi 👋, I’m Saka360. I received your message. Type *start* or *help* to see what I can do, or try *fuel*, *service*, *expense*, or *add*.";
       }
     }
 
