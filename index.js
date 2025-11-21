@@ -809,9 +809,13 @@ async function handleDriverLicenceCommand(driverWhatsapp, fullText) {
     }
   }
 
-  return (
-    `✅ Thanks ${name}.\n\n` +
-    `Your *Main Driving Licence* expiry has been set to *${expiryText}*.\n\n` +
+      return (
+    "✅ Thanks " +
+    name +
+    ".\n\n" +
+    "Your *Main Driving Licence* expiry has been set to *" +
+    expiryText +
+    "*.\n\n" +
     "You are now *licence compliant* on Saka360.\n" +
     "Your fleet owner can assign vehicles to you for logging *fuel*, *service* and *expenses*."
   );
