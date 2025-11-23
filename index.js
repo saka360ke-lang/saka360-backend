@@ -69,37 +69,6 @@ function parseNumber(text) {
   return parseFloat(cleaned);
 }
 
-// Default non-null licence number to satisfy NOT NULL constraint
-const DEFAULT_LICENSE_NUMBER = "N/A";
-
-// Build main help/start/menu text
-function buildHelpMessage() {
-  return (
-    "Hi 👋, I’m *Saka360*, your WhatsApp vehicle logbook.\n\n" +
-    "Here’s what I can help you with:\n\n" +
-    "🚗 *Vehicles*\n" +
-    "• *add vehicle KDA 123A* – add a vehicle\n" +
-    "• *my vehicles* – list vehicles & current one\n" +
-    "• *switch to 1* – change current vehicle\n\n" +
-    "👨‍✈️ *Drivers*\n" +
-    "• *add driver John Doe | 0712345678* – invite a driver\n" +
-    "• *my drivers* – list drivers\n" +
-    "• *assign driver 1* – assign a driver to your current vehicle\n" +
-    "• *driver report* – driver licence compliance overview\n\n" +
-    "⛽ *Fuel / Service / Expenses*\n" +
-    "• *fuel* – log fuel\n" +
-    "• *service* – log service (+ reminders)\n" +
-    "• *expense* – log other vehicle costs\n" +
-    "• *fuel report*, *service report*, *expense report* – quick summaries\n" +
-    "• add *all* to see all vehicles, e.g. *fuel report all*\n\n" +
-    "✏️ *Edit / Delete / Cancel*\n" +
-    "• *edit last fuel/service/expense* – fix last entry\n" +
-    "• *delete last fuel/service/expense* – remove last entry\n" +
-    "• *cancel* – cancel current entry\n\n" +
-    "Anytime you’re stuck, type *help* or *start* to see this menu again."
-  );
-}
-
 // ====== VEHICLE HELPERS ======
 
 async function getUserVehicles(userWhatsapp) {
@@ -552,30 +521,30 @@ async function handleAddDriverCommand(ownerWhatsapp, fullText) {
       `
       UPDATE drivers
       SET full_name = $1,
-          license_number = COALESCE(license_number, $2),
           updated_at = NOW()
-      WHERE id = $3
+      WHERE id = $2
       RETURNING *
     `,
-      [fullName, DEFAULT_LICENSE_NUMBER, driverId]
+      [fullName, driverId]
     );
     driverRow = resUpdate.rows[0];
   } else {
+    // NOTE: license_number is NOT NULL in DB, so we set a placeholder "PENDING"
     const resInsert = await pool.query(
       `
       INSERT INTO drivers (
         owner_whatsapp,
         full_name,
         driver_whatsapp,
-        license_number,
         license_type,
+        license_number,
         license_expiry_date,
         is_active
       )
-      VALUES ($1, $2, $3, $4, NULL, NULL, TRUE)
+      VALUES ($1, $2, $3, NULL, 'PENDING', NULL, TRUE)
       RETURNING *
     `,
-      [ownerWhatsapp, fullName, driverWhatsapp, DEFAULT_LICENSE_NUMBER]
+      [ownerWhatsapp, fullName, driverWhatsapp]
     );
     driverRow = resInsert.rows[0];
   }
@@ -797,7 +766,7 @@ async function handleDriverLicenceCommand(driverWhatsapp, fullText) {
           body:
             "✅ *Driver compliance update*\n\n" +
             `Driver: *${name}*\n` +
-            `Main DL expiry: *${expiryText}*\n\n" +
+            `Main DL expiry: *${expiryText}*\n\n` +
             "This driver is now *Main DL compliant* and can be allowed to log *fuel*, *service* and *expenses* for vehicles you assign.",
         });
       }
@@ -809,13 +778,9 @@ async function handleDriverLicenceCommand(driverWhatsapp, fullText) {
     }
   }
 
-      return (
-    "✅ Thanks " +
-    name +
-    ".\n\n" +
-    "Your *Main Driving Licence* expiry has been set to *" +
-    expiryText +
-    "*.\n\n" +
+  return (
+    `✅ Thanks ${name}.\n\n` +
+    `Your *Main Driving Licence* expiry has been set to *${expiryText}*.\n\n` +
     "You are now *licence compliant* on Saka360.\n" +
     "Your fleet owner can assign vehicles to you for logging *fuel*, *service* and *expenses*."
   );
@@ -1029,7 +994,6 @@ async function buildDriverComplianceReport(userWhatsapp) {
 
   return text;
 }
-
 // ====== FUEL HELPERS ======
 async function getActiveFuelSession(userWhatsapp) {
   const result = await pool.query(
@@ -2331,6 +2295,46 @@ app.get("/", (req, res) => {
   res.send("Saka360 backend is running ✅");
 });
 
+// ====== N8N / CHATGPT REPLY HELPER ======
+async function buildReplyViaN8n({ from, to, text, botContext, fallbackText }) {
+  let replyFromN8n = null;
+
+  try {
+    const n8nResponse = await axios.post(N8N_WEBHOOK_URL, {
+      from,
+      to,
+      text,
+      botContext: botContext || null,
+      fallbackText: fallbackText || null,
+    });
+
+    const data = n8nResponse.data || {};
+    console.log("🔁 N8N response data:", data);
+
+    if (data.reply && typeof data.reply === "string") {
+      const trimmed = data.reply.trim();
+      if (trimmed) {
+        replyFromN8n = trimmed;
+      }
+    }
+  } catch (err) {
+    console.error("❌ Error calling n8n webhook:", err.message);
+  }
+
+  if (replyFromN8n) {
+    return replyFromN8n;
+  }
+
+  if (fallbackText && fallbackText.trim()) {
+    return fallbackText.trim();
+  }
+
+  return (
+    "Hi 👋, I’m Saka360. I received your message.\n" +
+    "Type *fuel*, *service*, *expense*, or *add* to get started."
+  );
+}
+
 // ====== MAIN WHATSAPP HANDLER ======
 app.post("/whatsapp/inbound", async (req, res) => {
   try {
@@ -2348,25 +2352,58 @@ app.post("/whatsapp/inbound", async (req, res) => {
       return;
     }
 
-    let replyText = "";
+    let botContext = null;
+    let fallbackText = "";
 
-    // HELP / START / MENU
-    if (lower === "start" || lower === "help" || lower === "menu") {
-      replyText = buildHelpMessage();
-    }
     // GLOBAL COMMANDS: cancel / stop / reset
-    else if (["cancel", "stop", "reset"].includes(lower)) {
+    if (["cancel", "stop", "reset"].includes(lower)) {
       await cancelAllSessionsForUser(from);
-      replyText =
+      botContext = { type: "session_cancelled" };
+      fallbackText =
         "✅ I’ve cancelled your current entry. You can start again with *fuel*, *service*, or *expense*.";
+    }
+    // START command
+    else if (lower === "start") {
+      botContext = { type: "start" };
+      fallbackText =
+        "Welcome to *Saka360* 👋\n\n" +
+        "I help you track fuel, service, expenses and driver compliance for your vehicles.\n\n" +
+        "Quick commands:\n" +
+        "• *fuel* – log fuel\n" +
+        "• *service* – log service\n" +
+        "• *expense* – log other costs\n" +
+        "• *add vehicle* – register a vehicle\n" +
+        "• *add driver* – invite a driver\n" +
+        "• *report* – see fuel/service/expense & driver reports\n\n" +
+        "You can type *help* anytime to see this again.";
+    }
+    // HELP command
+    else if (lower === "help") {
+      botContext = { type: "help" };
+      fallbackText =
+        "Here are some things you can do with *Saka360* 👇\n\n" +
+        "• *fuel* – log fuel for your current vehicle\n" +
+        "• *service* – log a service (with reminders)\n" +
+        "• *expense* – log other vehicle expenses\n" +
+        "• *add vehicle* – add a new vehicle\n" +
+        "• *my vehicles* – list and switch vehicles\n" +
+        "• *add driver* – invite a driver\n" +
+        "• *my drivers* – list drivers\n" +
+        "• *assign driver 1* – assign driver 1 to current vehicle\n" +
+        "• *report* – see fuel/service/expense & driver reports\n" +
+        "• *cancel* – cancel the current entry flow\n\n" +
+        "You can also type *start* to see the intro again.";
     }
     // DRIVER: accept invitation
     else if (lower === "accept") {
-      replyText = await handleDriverAccept(from);
+      const msg = await handleDriverAccept(from);
+      botContext = { type: "driver_accept" };
+      fallbackText = msg;
     }
     // QUICK "add" helper – menu of things you can add
     else if (lower === "add") {
-      replyText =
+      botContext = { type: "add_menu" };
+      fallbackText =
         "What would you like to add? ✏️\n\n" +
         "1. *Vehicle* – register a new vehicle\n" +
         "2. *Driver* – invite a driver to log for your vehicles\n\n" +
@@ -2376,27 +2413,42 @@ app.post("/whatsapp/inbound", async (req, res) => {
     }
     // VEHICLE COMMANDS
     else if (lower.startsWith("add vehicle")) {
-      replyText = await handleAddVehicleCommand(from, text);
+      const msg = await handleAddVehicleCommand(from, text);
+      botContext = { type: "add_vehicle" };
+      fallbackText = msg;
     } else if (lower === "my vehicles") {
-      replyText = await handleMyVehiclesCommand(from);
+      const msg = await handleMyVehiclesCommand(from);
+      botContext = { type: "my_vehicles" };
+      fallbackText = msg;
     } else if (lower.startsWith("switch")) {
-      replyText = await handleSwitchVehicleCommand(from, text);
+      const msg = await handleSwitchVehicleCommand(from, text);
+      botContext = { type: "switch_vehicle" };
+      fallbackText = msg;
     }
     // DRIVER COMMANDS
     else if (lower.startsWith("add driver")) {
-      replyText = await handleAddDriverCommand(from, text);
+      const msg = await handleAddDriverCommand(from, text);
+      botContext = { type: "add_driver" };
+      fallbackText = msg;
     } else if (lower === "my drivers" || lower === "drivers") {
-      replyText = await handleMyDriversCommand(from);
+      const msg = await handleMyDriversCommand(from);
+      botContext = { type: "my_drivers" };
+      fallbackText = msg;
     } else if (lower.startsWith("assign driver")) {
-      replyText = await handleAssignDriverCommand(from, text);
+      const msg = await handleAssignDriverCommand(from, text);
+      botContext = { type: "assign_driver" };
+      fallbackText = msg;
     }
     // DRIVER LICENCE COMMAND
     else if (lower.startsWith("dl ")) {
-      replyText = await handleDriverLicenceCommand(from, text);
+      const msg = await handleDriverLicenceCommand(from, text);
+      botContext = { type: "driver_dl_update" };
+      fallbackText = msg;
     }
     // GLOBAL COMMAND: simple "edit" helper
     else if (lower === "edit") {
-      replyText =
+      botContext = { type: "edit_help" };
+      fallbackText =
         "To edit a record, choose one of these:\n\n" +
         "• *edit last service* – edit your last service\n" +
         "• *edit last fuel* – edit your last fuel\n" +
@@ -2407,7 +2459,8 @@ app.post("/whatsapp/inbound", async (req, res) => {
     }
     // GLOBAL COMMAND: simple "delete" helper
     else if (lower === "delete") {
-      replyText =
+      botContext = { type: "delete_help" };
+      fallbackText =
         "To delete your last record, choose one of:\n\n" +
         "• *delete last fuel*\n" +
         "• *delete last service*\n" +
@@ -2415,15 +2468,20 @@ app.post("/whatsapp/inbound", async (req, res) => {
     }
     // GLOBAL COMMAND: delete last ...
     else if (lower.startsWith("delete last")) {
-      replyText = await handleDeleteLastCommand(from, lower);
+      const msg = await handleDeleteLastCommand(from, lower);
+      botContext = { type: "delete_last" };
+      fallbackText = msg;
     }
     // GLOBAL COMMAND: edit last ...
     else if (lower.startsWith("edit last")) {
-      replyText = await handleEditLastCommand(from, text);
+      const msg = await handleEditLastCommand(from, text);
+      botContext = { type: "edit_last" };
+      fallbackText = msg;
     }
     // REPORT COMMANDS: high-level guidance
     else if (lower === "report" || lower.startsWith("report ")) {
-      replyText =
+      botContext = { type: "report_menu" };
+      fallbackText =
         "I can show quick summaries for your data:\n\n" +
         "• *fuel report* – fuel spend & efficiency (current vehicle)\n" +
         "• *fuel report all* – fuel summary across all vehicles\n" +
@@ -2440,69 +2498,97 @@ app.post("/whatsapp/inbound", async (req, res) => {
       const activeExpenseSession = await getActiveExpenseSession(from);
 
       if (activeFuelSession) {
-        replyText = await handleFuelSessionStep(activeFuelSession, text);
+        const msg = await handleFuelSessionStep(activeFuelSession, text);
+        botContext = { type: "fuel_session_step", step: activeFuelSession.step };
+        fallbackText = msg;
       } else if (activeServiceSession) {
-        replyText = await handleServiceSessionStep(activeServiceSession, text);
+        const msg = await handleServiceSessionStep(activeServiceSession, text);
+        botContext = {
+          type: "service_session_step",
+          step: activeServiceSession.step,
+        };
+        fallbackText = msg;
       } else if (activeExpenseSession) {
-        replyText = await handleExpenseSessionStep(activeExpenseSession, text);
+        const msg = await handleExpenseSessionStep(activeExpenseSession, text);
+        botContext = {
+          type: "expense_session_step",
+          step: activeExpenseSession.step,
+        };
+        fallbackText = msg;
       } else if (lower === "fuel") {
-        replyText = await startFuelSession(from);
+        const msg = await startFuelSession(from);
+        botContext = { type: "fuel_start" };
+        fallbackText = msg;
       } else if (lower === "fuel report" || lower.startsWith("fuel report")) {
-        // fuel report / fuel report all
         const wantsAll = lower.includes("all");
+        botContext = { type: "fuel_report", scope: wantsAll ? "all" : "current" };
+
         if (wantsAll) {
-          replyText = await buildFuelReport(from, { allVehicles: true });
+          const msg = await buildFuelReport(from, { allVehicles: true });
+          fallbackText = msg;
         } else {
           const vRes = await ensureCurrentVehicle(from);
           if (vRes.status === "NO_VEHICLES") {
-            replyText =
+            fallbackText =
               "You don't have any vehicles yet.\n\n" +
               "Add one with: *add vehicle KDA 123A*";
           } else if (vRes.status === "NEED_SET_CURRENT") {
             const listText = formatVehiclesList(vRes.list, true);
-            replyText =
+            fallbackText =
               "You have multiple vehicles. Please choose which one you want the report for.\n\n" +
               listText +
               "\n\nReply with e.g. *switch to 1*, then send *fuel report* again.";
           } else {
             const vehicle = vRes.vehicle;
-            replyText = await buildFuelReport(from, {
+            const msg = await buildFuelReport(from, {
               vehicleId: vehicle.id,
               vehicleLabel: vehicle.registration,
             });
+            fallbackText = msg;
           }
         }
       } else if (lower === "service") {
-        replyText = await startServiceSession(from);
+        const msg = await startServiceSession(from);
+        botContext = { type: "service_start" };
+        fallbackText = msg;
       } else if (
         lower === "service report" ||
         lower.startsWith("service report")
       ) {
         const wantsAll = lower.includes("all");
+        botContext = {
+          type: "service_report",
+          scope: wantsAll ? "all" : "current",
+        };
+
         if (wantsAll) {
-          replyText = await buildServiceReport(from, { allVehicles: true });
+          const msg = await buildServiceReport(from, { allVehicles: true });
+          fallbackText = msg;
         } else {
           const vRes = await ensureCurrentVehicle(from);
           if (vRes.status === "NO_VEHICLES") {
-            replyText =
+            fallbackText =
               "You don't have any vehicles yet.\n\n" +
               "Add one with: *add vehicle KDA 123A*";
           } else if (vRes.status === "NEED_SET_CURRENT") {
             const listText = formatVehiclesList(vRes.list, true);
-            replyText =
+            fallbackText =
               "You have multiple vehicles. Please choose which one you want the report for.\n\n" +
               listText +
               "\n\nReply with e.g. *switch to 1*, then send *service report* again.";
           } else {
             const vehicle = vRes.vehicle;
-            replyText = await buildServiceReport(from, {
+            const msg = await buildServiceReport(from, {
               vehicleId: vehicle.id,
               vehicleLabel: vehicle.registration,
             });
+            fallbackText = msg;
           }
         }
       } else if (lower === "expense" || lower === "expenses") {
-        replyText = await startExpenseSession(from);
+        const msg = await startExpenseSession(from);
+        botContext = { type: "expense_start" };
+        fallbackText = msg;
       } else if (
         lower === "expense report" ||
         lower === "expenses report" ||
@@ -2510,26 +2596,33 @@ app.post("/whatsapp/inbound", async (req, res) => {
         lower.startsWith("expenses report")
       ) {
         const wantsAll = lower.includes("all");
+        botContext = {
+          type: "expense_report",
+          scope: wantsAll ? "all" : "current",
+        };
+
         if (wantsAll) {
-          replyText = await buildExpenseReport(from, { allVehicles: true });
+          const msg = await buildExpenseReport(from, { allVehicles: true });
+          fallbackText = msg;
         } else {
           const vRes = await ensureCurrentVehicle(from);
           if (vRes.status === "NO_VEHICLES") {
-            replyText =
+            fallbackText =
               "You don't have any vehicles yet.\n\n" +
               "Add one with: *add vehicle KDA 123A*";
           } else if (vRes.status === "NEED_SET_CURRENT") {
             const listText = formatVehiclesList(vRes.list, true);
-            replyText =
+            fallbackText =
               "You have multiple vehicles. Please choose which one you want the report for.\n\n" +
               listText +
               "\n\nReply with e.g. *switch to 1*, then send *expense report* again.";
           } else {
             const vehicle = vRes.vehicle;
-            replyText = await buildExpenseReport(from, {
+            const msg = await buildExpenseReport(from, {
               vehicleId: vehicle.id,
               vehicleLabel: vehicle.registration,
             });
+            fallbackText = msg;
           }
         }
       } else if (
@@ -2538,30 +2631,31 @@ app.post("/whatsapp/inbound", async (req, res) => {
         lower === "driver compliance" ||
         lower === "compliance"
       ) {
-        replyText = await buildDriverComplianceReport(from);
+        const msg = await buildDriverComplianceReport(from);
+        botContext = { type: "driver_report" };
+        fallbackText = msg;
       } else {
-        // 2) No session, no local command → send to n8n
-        let n8nResponseData = {};
-        try {
-          const n8nResponse = await axios.post(N8N_WEBHOOK_URL, {
-            from,
-            to,
-            text,
-          });
-
-          n8nResponseData = n8nResponse.data || {};
-          console.log("🔁 N8N response data:", n8nResponseData);
-        } catch (err) {
-          console.error("❌ Error calling n8n webhook:", err.message);
-        }
-
-        replyText =
-          (n8nResponseData &&
-            n8nResponseData.reply &&
-            String(n8nResponseData.reply).trim()) ||
-          "Hi 👋, I’m Saka360. I received your message. Type *start* or *help* to see what I can do, or try *fuel*, *service*, *expense*, or *add*.";
+        // Unknown command / free text → let n8n/ChatGPT handle it
+        botContext = { type: "unknown_message" };
+        fallbackText =
+          "Hi 👋, I’m Saka360. I received your message.\n" +
+          "You can type *start* or *help* to see what I can do.";
       }
     }
+
+    if (!fallbackText) {
+      fallbackText =
+        "Hi 👋, I’m Saka360. I received your message.\n" +
+        "Type *fuel*, *service*, *expense*, or *add* to get started.";
+    }
+
+    const replyText = await buildReplyViaN8n({
+      from,
+      to,
+      text,
+      botContext,
+      fallbackText,
+    });
 
     console.log("💬 Replying to user with:", replyText);
 
@@ -2588,7 +2682,6 @@ app.post("/whatsapp/inbound", async (req, res) => {
     res.status(200).send("OK");
   }
 });
-
 // ====== FUEL SESSION HANDLER ======
 async function handleFuelSessionStep(session, incomingText) {
   const step = session.step;
