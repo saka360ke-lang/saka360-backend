@@ -1,9 +1,9 @@
 {
   "name": "saka360-backend",
   "version": "1.0.0",
-  "main": "index.js",
+  "main": "index.cjs",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.cjs"
   },
   "dependencies": {
     "axios": "^1.13.2",
