@@ -552,7 +552,7 @@ async function handleAddDriverCommand(ownerWhatsapp, fullText) {
     driverRow = resInsert.rows[0];
   }
 
-  // Notify driver on WhatsApp to accept
+    // Notify driver on WhatsApp to accept
   try {
     if (DISABLE_TWILIO_SEND === "true") {
       console.log("🚫 Twilio send disabled, would invite driver:", {
@@ -561,12 +561,13 @@ async function handleAddDriverCommand(ownerWhatsapp, fullText) {
         ownerWhatsapp,
       });
     } else {
-      await sendWhatsApp(driverWhatsapp,
+      await sendWhatsApp(
+        driverWhatsapp,
         `Hi ${fullName} 👋\n\n` +
           `You’ve been added as a driver in *Saka360* by *${ownerWhatsapp}*.\n\n` +
           "To accept and complete your driving licence compliance, reply here with:\n" +
           "*accept*\n\n" +
-          "After you add your *Main Driving Licence* expiry date, you’ll be allowed to log *fuel*, *service* and *expenses* for vehicles assigned to you.`
+          "After you add your *Main Driving Licence* expiry date, you’ll be allowed to log *fuel*, *service* and *expenses* for vehicles assigned to you."
       );
     }
   } catch (err) {
