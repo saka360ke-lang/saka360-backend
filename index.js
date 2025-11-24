@@ -269,15 +269,23 @@ app.post("/whatsapp/inbound", async (req, res) => {
           console.log("🤖 Raw n8n AI response:", aiRes.status, aiRes.data);
 
           const data = aiRes.data || {};
-          if (typeof data.reply === "string" && data.reply.trim() !== "") {
-            reply = data.reply.trim();
-          } else if (typeof data.text === "string" && data.text.trim() !== "") {
-            // fallback if your Respond node sends { "text": "..." } instead of { "reply": "..." }
-            reply = data.text.trim();
-          } else {
-            console.warn("⚠️ n8n AI response has no 'reply' or 'text' string. Using generic reply.");
+          let data = aiRes.data;
+
+        // If n8n returned a string instead of an object, try to parse it
+        if (typeof data === "string") {
+          try {
+            data = JSON.parse(data);
+          } catch (e) {
+            console.error("❌ Could not parse AI JSON:", e.message, "RAW:", data);
             reply = "Hi 👋 I’m Saka360. How can I help?";
           }
+        }
+
+        //detection
+        if (typeof data.reply === "string" && data.reply.trim() !== "") {
+        reply = data.reply.trim();
+        } 
+
         } catch (err) {
           console.error("❌ AI/N8N error:", err.message);
           if (err.response) {
