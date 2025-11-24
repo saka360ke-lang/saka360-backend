@@ -1115,7 +1115,7 @@ async function callN8nAi(from, text) {
 
     const data = aiRes.data;
 
-    // 1) If n8n already returns a real JSON object
+    // 1) If axios already parsed JSON for us
     if (data && typeof data === "object") {
       if (typeof data.reply === "string" && data.reply.trim().length > 0) {
         return data.reply.trim();
@@ -1123,52 +1123,28 @@ async function callN8nAi(from, text) {
       if (typeof data.text === "string" && data.text.trim().length > 0) {
         return data.text.trim();
       }
+      console.warn("⚠️ n8n AI object had no 'reply' or 'text' string.");
+      return null;
     }
 
-    // 2) If n8n returns a STRING (most likely your case)
+    // 2) If n8n returned a STRING (which is what your logs show)
     if (typeof data === "string") {
       const str = data.trim();
       if (!str) return null;
 
-      // 2a) Try to parse as JSON first (if it's valid JSON)
-      if (str.startsWith("{")) {
-        try {
-          const parsed = JSON.parse(str);
-          if (parsed && typeof parsed === "object") {
-            if (
-              typeof parsed.reply === "string" &&
-              parsed.reply.trim().length > 0
-            ) {
-              return parsed.reply.trim();
-            }
-            if (
-              typeof parsed.text === "string" &&
-              parsed.text.trim().length > 0
-            ) {
-              return parsed.text.trim();
-            }
-          }
-        } catch (e) {
-          console.warn("⚠️ Could not JSON.parse n8n AI string:", e.message);
-          // fall through to regex / raw handling
-        }
-
-        // 2b) If JSON.parse fails (because of bad newlines etc),
-        // try to extract "reply": "...." manually with regex
-        const match = str.match(
-          /"reply"\s*:\s*"([\s\S]*)"[\s\r\n]*\}$/
-        );
-        if (match && match[1]) {
-          return match[1].trim();
-        }
+      // Try to pull `"reply": "...."` out with a regex that tolerates newlines
+      // between the opening quote and the final closing quote.
+      const match = str.match(/"reply"\s*:\s*"([\s\S]*)"[\s\r\n]*\}$/);
+      if (match && match[1]) {
+        return match[1].trim();
       }
 
-      // 2c) Fallback: just return the string itself
+      // Fallback: just send the whole string
       return str;
     }
 
     console.warn(
-      "⚠️ n8n AI response had no usable 'reply' or 'text' string. Returning null."
+      "⚠️ n8n AI response had no usable 'reply'/'text' string. Returning null."
     );
     return null;
   } catch (err) {
