@@ -2295,8 +2295,6 @@ app.get("/", (req, res) => {
   res.send("Saka360 backend is running ✅");
 });
 
-// ====== N8N / CHATGPT REPLY HELPER ======
-async function buildReplyViaN8n({ from, to, text, botContext, fallbackText }) {
           // 2) No session, no local command → send to n8n (AI)
         let n8nResponseData;
         let aiReply = "";
