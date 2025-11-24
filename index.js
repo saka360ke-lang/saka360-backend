@@ -245,12 +245,52 @@ app.post("/whatsapp/inbound", async (req, res) => {
   }
 
   // If still no reply → send to N8N
-  if (!reply) {
-    const n8nReply = await callN8N(from, to, text);
+      // 2) Otherwise: send to AI via n8n
+    if (!reply) {
+      if (!N8N_WEBHOOK_URL) {
+        console.warn("⚠️ N8N_WEBHOOK_URL is NOT set. Skipping AI and using generic reply.");
+        reply = "Hi 👋 I’m Saka360. How can I help?";
+      } else {
+        try {
+          console.log("🤖 Calling n8n AI webhook:", N8N_WEBHOOK_URL);
+          console.log("🤖 Payload to n8n:", { from, text });
 
-    if (n8nReply) reply = n8nReply;
-    else reply = "Hi 👋 I’m Saka360. How can I help?";
-  }
+          const aiRes = await axios.post(
+            N8N_WEBHOOK_URL,
+            {
+              from,
+              text,
+            },
+            {
+              timeout: 8000,
+            }
+          );
+
+          console.log("🤖 Raw n8n AI response:", aiRes.status, aiRes.data);
+
+          const data = aiRes.data || {};
+          if (typeof data.reply === "string" && data.reply.trim() !== "") {
+            reply = data.reply.trim();
+          } else if (typeof data.text === "string" && data.text.trim() !== "") {
+            // fallback if your Respond node sends { "text": "..." } instead of { "reply": "..." }
+            reply = data.text.trim();
+          } else {
+            console.warn("⚠️ n8n AI response has no 'reply' or 'text' string. Using generic reply.");
+            reply = "Hi 👋 I’m Saka360. How can I help?";
+          }
+        } catch (err) {
+          console.error("❌ AI/N8N error:", err.message);
+          if (err.response) {
+            console.error("❌ AI/N8N error status:", err.response.status);
+            console.error("❌ AI/N8N error data:", err.response.data);
+          }
+          reply = "Hi 👋 I’m Saka360. How can I help?";
+        }
+      }
+    }
+
+    console.log("💬 Sending reply:", reply);
+
 
   console.log("💬 Reply:", reply);
   await sendWA(from, reply);
