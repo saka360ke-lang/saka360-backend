@@ -2297,43 +2297,50 @@ app.get("/", (req, res) => {
 
 // ====== N8N / CHATGPT REPLY HELPER ======
 async function buildReplyViaN8n({ from, to, text, botContext, fallbackText }) {
-  let replyFromN8n = null;
+          // 2) No session, no local command → send to n8n (AI)
+        let n8nResponseData;
+        let aiReply = "";
 
-  try {
-    const n8nResponse = await axios.post(N8N_WEBHOOK_URL, {
-      from,
-      to,
-      text,
-      botContext: botContext || null,
-      fallbackText: fallbackText || null,
-    });
+        try {
+          const n8nResponse = await axios.post(N8N_WEBHOOK_URL, {
+            from,
+            to,
+            text,
+          });
 
-    const data = n8nResponse.data || {};
-    console.log("🔁 N8N response data:", data);
+          n8nResponseData = n8nResponse.data;
+          console.log("🔁 N8N response data:", n8nResponseData);
 
-    if (data.reply && typeof data.reply === "string") {
-      const trimmed = data.reply.trim();
-      if (trimmed) {
-        replyFromN8n = trimmed;
-      }
-    }
-  } catch (err) {
-    console.error("❌ Error calling n8n webhook:", err.message);
-  }
+          // CASE 1: n8n returns plain text
+          if (typeof n8nResponseData === "string") {
+            aiReply = n8nResponseData.trim();
+          }
+          // CASE 2: n8n returns { reply: "..." }
+          else if (
+            n8nResponseData &&
+            typeof n8nResponseData.reply === "string"
+          ) {
+            aiReply = n8nResponseData.reply.trim();
+          }
+          // CASE 3: n8n returns { text: "..." }
+          else if (
+            n8nResponseData &&
+            typeof n8nResponseData.text === "string"
+          ) {
+            aiReply = n8nResponseData.text.trim();
+          }
+        } catch (err) {
+          console.error("❌ Error calling n8n webhook:", err.message);
+        }
 
-  if (replyFromN8n) {
-    return replyFromN8n;
-  }
+        // If AI gave us something, use it, otherwise fallback
+        if (aiReply) {
+          replyText = aiReply;
+        } else {
+          replyText =
+            "Hi 👋, I’m Saka360. I received your message. Type *fuel*, *service*, *expense*, or *add* to get started.";
+        }
 
-  if (fallbackText && fallbackText.trim()) {
-    return fallbackText.trim();
-  }
-
-  return (
-    "Hi 👋, I’m Saka360. I received your message.\n" +
-    "Type *fuel*, *service*, *expense*, or *add* to get started."
-  );
-}
 
 // ====== MAIN WHATSAPP HANDLER ======
 app.post("/whatsapp/inbound", async (req, res) => {
