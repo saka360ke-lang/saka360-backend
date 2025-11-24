@@ -246,28 +246,50 @@ app.post("/whatsapp/inbound", async (req, res) => {
 
   // If still no reply → send to N8N
       // 2) Otherwise: send to AI via n8n
-    if (!reply) {
-      if (!N8N_WEBHOOK_URL) {
-        console.warn("⚠️ N8N_WEBHOOK_URL is NOT set. Skipping AI and using generic reply.");
-        reply = "Hi 👋 I’m Saka360. How can I help?";
-      } else {
+    // 2) Otherwise: send to AI via n8n
+if (!reply) {
+  if (!N8N_WEBHOOK_URL) {
+    console.warn("⚠️ N8N_WEBHOOK_URL is NOT set. Skipping AI.");
+    reply = "Hi 👋 I’m Saka360. How can I help?";
+  } else {
+    try {
+      console.log("🤖 Calling n8n AI webhook:", N8N_WEBHOOK_URL);
+      console.log("🤖 Payload to n8n:", { from, text });
+
+      const aiRes = await axios.post(
+        N8N_WEBHOOK_URL,
+        { from, text },
+        { timeout: 8000 }
+      );
+
+      console.log("🤖 Raw n8n AI response:", aiRes.status, aiRes.data);
+
+      // FIX: n8n returns a STRING, convert to an object
+      let data = aiRes.data;
+      if (typeof data === "string") {
         try {
-          console.log("🤖 Calling n8n AI webhook:", N8N_WEBHOOK_URL);
-          console.log("🤖 Payload to n8n:", { from, text });
+          data = JSON.parse(data);
+        } catch (e) {
+          console.error("❌ Could not parse AI JSON:", e.message);
+          console.error("RAW n8n:", data);
+          reply = "Hi 👋 I’m Saka360. How can I help?";
+        }
+      }
 
-          const aiRes = await axios.post(
-            N8N_WEBHOOK_URL,
-            {
-              from,
-              text,
-            },
-            {
-              timeout: 8000,
-            }
-          );
-
-          console.log("🤖 Raw n8n AI response:", aiRes.status, aiRes.data);
-
+      if (data && typeof data.reply === "string" && data.reply.trim() !== "") {
+        reply = data.reply.trim();
+      } else if (data && typeof data.text === "string" && data.text.trim() !== "") {
+        reply = data.text.trim();
+      } else {
+        console.warn("⚠️ AI response missing reply field. Using fallback.");
+        reply = "Hi 👋 I’m Saka360. How can I help?";
+      }
+    } catch (err) {
+      console.error("❌ AI/N8N error:", err.message);
+      reply = "Hi 👋 I’m Saka360. How can I help?";
+    }
+  }
+}
           const data = aiRes.data || {};
           let data = aiRes.data;
 
