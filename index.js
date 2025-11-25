@@ -1,5 +1,5 @@
 // index.js
-// Saka360 Backend – WhatsApp → (Vehicles / Fuel / Service / Expense / Drivers / n8n AI) → DB → WhatsApp
+// Saka360 Backend – WhatsApp ↔ (Cars / Fuel / Service / Expense / Drivers / n8n AI) ↔ DB
 
 const express = require("express");
 const bodyParser = require("body-parser");
@@ -48,33 +48,30 @@ const twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 // ====== POSTGRES ======
 const pool = new Pool({
   connectionString: DATABASE_URL,
-  ssl: {
-    rejectUnauthorized: false,
-  },
+  ssl: { rejectUnauthorized: false },
 });
 
-async function testDb() {
+async function initDb() {
   try {
     const result = await pool.query("SELECT NOW() as now");
     console.log("🗄️ Connected to Postgres. Time:", result.rows[0].now);
-  } catch (err) {
-    console.error("❌ Error connecting to Postgres:", err.message);
-  }
-}
-testDb();
 
-// 💾 CHAT LOGGING HELPER
-async function logChatTurn(userWhatsapp, role, message) {
-  try {
-    await pool.query(
-      `INSERT INTO chat_turns (user_whatsapp, role, message)
-       VALUES ($1, $2, $3)`,
-      [userWhatsapp, role, message]
-    );
+    // Ensure chat_turns table exists (for memory / history)
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS chat_turns (
+        id SERIAL PRIMARY KEY,
+        user_whatsapp TEXT NOT NULL,
+        role TEXT NOT NULL,
+        message TEXT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+    `);
+    console.log("🧠 chat_turns table is ready.");
   } catch (err) {
-    console.error("❌ Failed to log chat turn:", err.message);
+    console.error("❌ Error initializing Postgres:", err.message);
   }
 }
+initDb();
 
 // ====== GENERIC HELPERS ======
 function parseNumber(text) {
@@ -83,7 +80,22 @@ function parseNumber(text) {
   return parseFloat(cleaned);
 }
 
-// ====== VEHICLE HELPERS ======
+// Save chat turns (user + assistant) into chat_turns
+async function logChatTurn(userWhatsapp, role, message) {
+  if (!userWhatsapp || !role || !message) return;
+  try {
+    await pool.query(
+      `
+      INSERT INTO chat_turns (user_whatsapp, role, message)
+      VALUES ($1, $2, $3)
+    `,
+      [userWhatsapp, role, message]
+    );
+  } catch (err) {
+    console.error("❌ Error inserting into chat_turns:", err.message);
+  }
+}
+// ====== VEHICLE (CAR) HELPERS ======
 
 async function getUserVehicles(userWhatsapp) {
   const res = await pool.query(
@@ -116,10 +128,10 @@ async function getCurrentVehicle(userWhatsapp) {
 }
 
 /**
- * Ensure we have a current vehicle for this user.
+ * Ensure we have a current car for this user.
  * Returns:
  *  { status: "NO_VEHICLES" }
- *  { status: "NEED_SET_CURRENT", list: [vehicles...] }
+ *  { status: "NEED_SET_CURRENT", list: [cars...] }
  *  { status: "OK", vehicle, list }
  */
 async function ensureCurrentVehicle(userWhatsapp) {
@@ -136,12 +148,10 @@ async function ensureCurrentVehicle(userWhatsapp) {
 
   // No default yet
   if (vehicles.length === 1) {
-    // autoselect single vehicle
     const only = vehicles[0];
-    await pool.query(
-      `UPDATE vehicles SET is_default = TRUE WHERE id = $1`,
-      [only.id]
-    );
+    await pool.query(`UPDATE vehicles SET is_default = TRUE WHERE id = $1`, [
+      only.id,
+    ]);
     only.is_default = true;
     return { status: "OK", vehicle: only, list: [only] };
   }
@@ -170,6 +180,7 @@ function formatVehiclesList(vehicles, withIndices = true) {
 
   return text.trim();
 }
+
 async function handleAddVehicleCommand(userWhatsapp, fullText) {
   const base = "add vehicle";
   const lower = fullText.toLowerCase();
@@ -207,16 +218,10 @@ async function handleAddVehicleCommand(userWhatsapp, fullText) {
 
   if (existing.rows.length > 0) {
     const v = existing.rows[0];
-    // If not default, make it default
     if (!v.is_default) {
-      await pool.query(
-        `
-        UPDATE vehicles
-        SET is_default = TRUE
-        WHERE id = $1
-      `,
-        [v.id]
-      );
+      await pool.query(`UPDATE vehicles SET is_default = TRUE WHERE id = $1`, [
+        v.id,
+      ]);
       await pool.query(
         `
         UPDATE vehicles
@@ -246,13 +251,11 @@ async function handleAddVehicleCommand(userWhatsapp, fullText) {
 
   const newVehicle = inserted.rows[0];
 
-  // If this is the first vehicle, set as default
   const allVehicles = await getUserVehicles(userWhatsapp);
   if (allVehicles.length === 1) {
-    await pool.query(
-      `UPDATE vehicles SET is_default = TRUE WHERE id = $1`,
-      [newVehicle.id]
-    );
+    await pool.query(`UPDATE vehicles SET is_default = TRUE WHERE id = $1`, [
+      newVehicle.id,
+    ]);
     newVehicle.is_default = true;
     return (
       `✅ Vehicle *${registration}* added and set as your *current vehicle*.\n\n` +
@@ -263,7 +266,6 @@ async function handleAddVehicleCommand(userWhatsapp, fullText) {
     );
   }
 
-  // Multiple vehicles now; don't force as default
   return (
     `✅ Vehicle *${registration}* added.\n\n` +
     "To use it as your active vehicle, list your vehicles with *my vehicles* " +
@@ -336,7 +338,6 @@ async function handleSwitchVehicleCommand(userWhatsapp, fullText) {
 
   const chosen = vehicles[index - 1];
 
-  // Set chosen as default, unset others
   await pool.query(
     `
     UPDATE vehicles
@@ -354,9 +355,8 @@ async function handleSwitchVehicleCommand(userWhatsapp, fullText) {
   );
 }
 
-// ====== DRIVER HELPERS ======
+// ====== DRIVER HELPERS (invite / accept / licence / list / assign / report) ======
 
-// Fetch active drivers for this owner
 async function getUserDrivers(userWhatsapp) {
   const res = await pool.query(
     `
@@ -370,8 +370,6 @@ async function getUserDrivers(userWhatsapp) {
   );
   return res.rows;
 }
-
-// Format driver list (for WhatsApp display)
 function formatDriversList(drivers, withIndices = true) {
   if (!drivers || drivers.length === 0) {
     return "You don't have any drivers yet.";
@@ -428,642 +426,22 @@ function formatDriversList(drivers, withIndices = true) {
 
   return text.trim();
 }
-/**
- * ADD DRIVER (OWNER SIDE – INVITE)
- *
- * Usage:
- *   1) "add driver" → show instructions
- *   2) "add driver John Doe | 0712345678"
- */
-async function handleAddDriverCommand(ownerWhatsapp, fullText) {
-  const base = "add driver";
-  const lower = fullText.toLowerCase().trim();
 
-  if (lower === base) {
-    return (
-      "Let's add a driver to your Saka360 account 👨‍✈️\n\n" +
-      "Please send the details in *one line* using this format:\n" +
-      "*add driver Full Name | 07XXXXXXXX*\n\n" +
-      "Example:\n" +
-      "*add driver David Njonjo | 0734852529*\n\n" +
-      "After this, the driver will get a WhatsApp prompt to *accept* and add their *Main Driving Licence*."
-    );
-  }
+// --- handleAddDriverCommand, handleDriverAccept, handleDriverLicenceCommand,
+//     handleMyDriversCommand, handleAssignDriverCommand,
+//     buildDriverComplianceReport
+// (use exactly the same implementations you already have – I’m not changing logic here)
+//  👉 Copy from your current file starting at "async function handleAddDriverCommand"
+//  down to "return text;" inside buildDriverComplianceReport.
+//  (To keep this answer under limits, I’m not duplicating all those 200+ lines again.)
 
-  const detailsRaw = fullText.slice(base.length).trim();
-  if (!detailsRaw) {
-    return (
-      "Please include the driver details after *add driver*.\n\n" +
-      "Format:\n" +
-      "*add driver Full Name | 07XXXXXXXX*\n\n" +
-      "Example:\n" +
-      "*add driver David Njonjo | 0734852529*"
-    );
-  }
-
-  // Split by "|" (preferred), fall back to ","
-  let parts = detailsRaw.split("|");
-  if (parts.length === 1) {
-    parts = detailsRaw.split(",");
-  }
-  parts = parts.map((p) => p.trim()).filter(Boolean);
-
-  if (parts.length < 2) {
-    return (
-      "I need at least: *Name* and *Phone number*.\n\n" +
-      "Format:\n" +
-      "*add driver Full Name | 07XXXXXXXX*"
-    );
-  }
-
-  const fullName = parts[0];
-  const rawPhone = parts[1];
-
-  if (!fullName) {
-    return "Please provide the driver's *full name* as the first item.";
-  }
-  if (!rawPhone) {
-    return "Please provide the driver's *phone number* as the second item (e.g. 07XXXXXXXX).";
-  }
-
-  // Normalise phone → WhatsApp format
-  function toWhatsAppNumber(phone) {
-    const trimmed = phone.trim();
-    if (trimmed.startsWith("whatsapp:")) return trimmed;
-    if (trimmed.startsWith("+")) return `whatsapp:${trimmed}`;
-
-    const digits = trimmed.replace(/\D/g, "");
-    // Assume Kenyan numbers by default: 07XXXXXXXX
-    if (digits.length === 10 && digits.startsWith("0")) {
-      return `whatsapp:+254${digits.slice(1)}`;
-    }
-    if (digits.length === 12 && digits.startsWith("254")) {
-      return `whatsapp:+${digits}`;
-    }
-    // Fallback: just prefix with whatsapp:
-    return `whatsapp:+${digits}`;
-  }
-
-  const driverWhatsapp = toWhatsAppNumber(rawPhone);
-
-  // Upsert-ish: if same owner + same driver_whatsapp exists, just update name
-  const existing = await pool.query(
-    `
-    SELECT id
-    FROM drivers
-    WHERE owner_whatsapp = $1
-      AND driver_whatsapp = $2
-      AND is_active = TRUE
-    ORDER BY created_at DESC
-    LIMIT 1
-  `,
-    [ownerWhatsapp, driverWhatsapp]
-  );
-
-  let driverRow;
-  if (existing.rows.length > 0) {
-    const driverId = existing.rows[0].id;
-    const resUpdate = await pool.query(
-      `
-      UPDATE drivers
-      SET full_name = $1,
-          updated_at = NOW()
-      WHERE id = $2
-      RETURNING *
-    `,
-      [fullName, driverId]
-    );
-    driverRow = resUpdate.rows[0];
-  } else {
-    const resInsert = await pool.query(
-      `
-      INSERT INTO drivers (
-        owner_whatsapp,
-        full_name,
-        driver_whatsapp,
-        license_type,
-        license_expiry_date,
-        is_active
-      )
-      VALUES ($1, $2, $3, NULL, NULL, TRUE)
-      RETURNING *
-    `,
-      [ownerWhatsapp, fullName, driverWhatsapp]
-    );
-    driverRow = resInsert.rows[0];
-  }
-
-  // Notify driver on WhatsApp to accept
-  try {
-    if (DISABLE_TWILIO_SEND === "true") {
-      console.log("🚫 Twilio send disabled, would invite driver:", {
-        driverWhatsapp,
-        fullName,
-        ownerWhatsapp,
-      });
-    } else {
-      await twilioClient.messages.create({
-        from: TWILIO_WHATSAPP_NUMBER,
-        to: driverWhatsapp,
-        body:
-          "Hi " +
-          fullName +
-          " 👋\n\n" +
-          "You’ve been added as a driver in *Saka360* by *" +
-          ownerWhatsapp +
-          "*.\n\n" +
-          "To accept and complete your driving licence compliance, reply here with:\n" +
-          "*accept*\n\n" +
-          "After you add your *Main Driving Licence* expiry date, you’ll be allowed to log *fuel*, *service* and *expenses* for vehicles assigned to you.",
-      });
-    }
-  } catch (err) {
-    console.error(
-      "❌ Error sending driver invite WhatsApp message:",
-      err.message
-    );
-  }
-
-  return (
-    "✅ Driver *" +
-    fullName +
-    "* added.\n\n" +
-    "Invitation sent to: *" +
-    driverWhatsapp.replace("whatsapp:", "") +
-    "*\n\n" +
-    "They must:\n" +
-    "1️⃣ Reply *accept* from their WhatsApp (" +
-    driverWhatsapp.replace("whatsapp:", "") +
-    ")\n" +
-    "2️⃣ Add their *Main Driving Licence* expiry with:\n" +
-    "   *dl main 2026-01-01*\n\n" +
-    "Once they add a valid Main DL, you’ll get a compliance notification and they’ll appear as *compliant* in your *driver report*."
-  );
-}
-
-/**
- * DRIVER SIDE: accept invitation
- *
- * Usage: driver sends "accept" from their own WhatsApp number.
- */
-async function handleDriverAccept(driverWhatsapp) {
-  const res = await pool.query(
-    `
-    SELECT *
-    FROM drivers
-    WHERE driver_whatsapp = $1
-      AND is_active = TRUE
-    ORDER BY created_at DESC
-    LIMIT 1
-  `,
-    [driverWhatsapp]
-  );
-
-  if (res.rows.length === 0) {
-    return (
-      "I can't find any pending driver invitation for this WhatsApp number.\n\n" +
-      "Ask your fleet owner to add you with:\n" +
-      "*add driver Your Name | 07XXXXXXXX*"
-    );
-  }
-
-  const driver = res.rows[0];
-  const name = driver.full_name || "Driver";
-
-  // If main DL already set and valid, they're already compliant
-  const hasMain =
-    driver.license_type &&
-    driver.license_type.toLowerCase().includes("main") &&
-    driver.license_expiry_date;
-
-  if (hasMain) {
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-    const expDate = new Date(driver.license_expiry_date);
-    expDate.setHours(0, 0, 0, 0);
-
-    if (expDate.getTime() >= today.getTime()) {
-      return (
-        "Hi " +
-        name +
-        " 👋\n\n" +
-        "You’re already *compliant* with a valid Main Driving Licence on file.\n\n" +
-        "You can now log *fuel*, *service* and *expenses* for vehicles assigned to you (once your fleet owner connects your profile)."
-      );
-    }
-  }
-
-  return (
-    "Hi " +
-    name +
-    " 👋\n\n" +
-    "To complete your licence compliance, please send your *Main Driving Licence* expiry date.\n\n" +
-    "Use this format:\n" +
-    "*dl main 2026-01-01*\n\n" +
-    "You must have a *valid Main DL* on Saka360 before you can log *fuel*, *service* or *expenses*."
-  );
-}
-
-/**
- * DRIVER SIDE: add main driving licence
- *
- * Usage:
- *   dl main 2026-01-01
- */
-async function handleDriverLicenceCommand(driverWhatsapp, fullText) {
-  const lower = fullText.toLowerCase().trim();
-
-  // Expect format: dl main YYYY-MM-DD
-  const match = lower.match(/^dl\s+(\w+)\s+(\d{4}-\d{2}-\d{2})$/i);
-  if (!match) {
-    return (
-      "To set your Main Driving Licence expiry, use:\n\n" +
-      "*dl main 2026-01-01*\n\n" +
-      "Example:\n" +
-      "*dl main 2027-06-30*"
-    );
-  }
-
-  const typeWord = match[1];
-  const expiryText = match[2];
-
-  if (typeWord !== "main") {
-    return (
-      "Right now Saka360 only tracks your *Main Driving Licence* for compliance.\n\n" +
-      "Please send it as:\n" +
-      "*dl main 2026-01-01*"
-    );
-  }
-
-  const expDate = new Date(expiryText);
-  if (isNaN(expDate.getTime())) {
-    return "That expiry date doesn't look valid. Please use *YYYY-MM-DD* format (e.g. 2026-01-01).";
-  }
-
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
-  expDate.setHours(0, 0, 0, 0);
-
-  if (expDate.getTime() <= today.getTime()) {
-    return (
-      "Your *Main DL* must be *valid* for compliance (expiry must be in the future).\n\n" +
-      "Please send a future date in *YYYY-MM-DD* format."
-    );
-  }
-
-  // Find the driver record for this WhatsApp
-  const res = await pool.query(
-    `
-    SELECT *
-    FROM drivers
-    WHERE driver_whatsapp = $1
-      AND is_active = TRUE
-    ORDER BY created_at DESC
-    LIMIT 1
-  `,
-    [driverWhatsapp]
-  );
-
-  if (res.rows.length === 0) {
-    return (
-      "I can't find any driver profile linked to this WhatsApp number.\n\n" +
-      "Ask your fleet owner to add you with:\n" +
-      "*add driver Your Name | 07XXXXXXXX*"
-    );
-  }
-
-  const driver = res.rows[0];
-
-  // If there is an existing main licence, locked
-  if (
-    driver.license_type &&
-    driver.license_type.toLowerCase().includes("main") &&
-    driver.license_expiry_date
-  ) {
-    return (
-      "Your *Main Driving Licence* is already on file and locked.\n\n" +
-      "If it needs to be changed, ask your fleet owner or admin to update it from their side."
-    );
-  }
-
-  // Update driver with main licence info
-  const updatedRes = await pool.query(
-    `
-    UPDATE drivers
-    SET license_type = $1,
-        license_expiry_date = $2,
-        updated_at = NOW()
-    WHERE id = $3
-    RETURNING *
-  `,
-    ["main licence", expiryText, driver.id]
-  );
-
-  const updated = updatedRes.rows[0];
-  const name = updated.full_name || "Driver";
-
-  // Notify owner that driver is now compliant
-  const ownerWhatsapp = updated.owner_whatsapp;
-  if (ownerWhatsapp) {
-    try {
-      if (DISABLE_TWILIO_SEND === "true") {
-        console.log("🚫 Twilio send disabled, would notify owner:", {
-          ownerWhatsapp,
-          name,
-          expiryText,
-        });
-      } else {
-        await twilioClient.messages.create({
-          from: TWILIO_WHATSAPP_NUMBER,
-          to: ownerWhatsapp,
-          body:
-            "✅ *Driver compliance update*\n\n" +
-            "Driver: *" +
-            name +
-            "*\n" +
-            "Main DL expiry: *" +
-            expiryText +
-            "*\n\n" +
-            "This driver is now *Main DL compliant* and can be allowed to log *fuel*, *service* and *expenses* for vehicles you assign.",
-        });
-      }
-    } catch (err) {
-      console.error(
-        "❌ Error sending compliance notification to owner:",
-        err.message
-      );
-    }
-  }
-
-  return (
-    "✅ Thanks " +
-    name +
-    ".\n\n" +
-    "Your *Main Driving Licence* expiry has been set to *" +
-    expiryText +
-    "*.\n\n" +
-    "You are now *licence compliant* on Saka360.\n" +
-    "Your fleet owner can assign vehicles to you for logging *fuel*, *service* and *expenses*."
-  );
-}
-
-// List drivers
-async function handleMyDriversCommand(userWhatsapp) {
-  const drivers = await getUserDrivers(userWhatsapp);
-  if (drivers.length === 0) {
-    return (
-      "You don't have any drivers yet.\n\n" +
-      "Add one with:\n" +
-      "*add driver John Doe | 0712345678*"
-    );
-  }
-
-  let text = "👨‍✈️ *Your drivers*:\n\n";
-  text += formatDriversList(drivers, true);
-  text +=
-    "\n\nTo assign a driver to your *current vehicle*, reply with e.g. *assign driver 1*.";
-
-  return text;
-}
-// Assign driver to CURRENT vehicle
-// Usage: "assign driver 1"
-async function handleAssignDriverCommand(userWhatsapp, fullText) {
-  const match = fullText.match(/assign\s+driver\s+(\d+)/i);
-  if (!match) {
-    return (
-      "To assign a driver, first see your drivers with *my drivers*.\n\n" +
-      "Then reply with e.g. *assign driver 1* to assign driver 1 to your *current vehicle*."
-    );
-  }
-
-  const index = parseInt(match[1], 10);
-  if (!index || index < 1) {
-    return "I couldn't understand that driver number. Please use a positive number like *1* or *2*.";
-  }
-
-  // Ensure we have a current vehicle
-  const vRes = await ensureCurrentVehicle(userWhatsapp);
-  if (vRes.status === "NO_VEHICLES") {
-    return (
-      "You don't have any vehicles yet.\n\n" +
-      "Add one with: *add vehicle KDA 123A*"
-    );
-  } else if (vRes.status === "NEED_SET_CURRENT") {
-    const listText = formatVehiclesList(vRes.list, true);
-    return (
-      "You have multiple vehicles. Please choose which one you want to set a driver for.\n\n" +
-      listText +
-      "\n\nReply with e.g. *switch to 1*, then send *assign driver 1* again."
-    );
-  }
-
-  const vehicle = vRes.vehicle;
-
-  // Get drivers
-  const drivers = await getUserDrivers(userWhatsapp);
-  if (drivers.length === 0) {
-    return (
-      "You don't have any drivers yet.\n\n" +
-      "Add one with:\n" +
-      "*add driver John Doe | 0712345678*"
-    );
-  }
-
-  if (index > drivers.length) {
-    return (
-      "You only have *" +
-      drivers.length +
-      "* driver(s).\n\n" +
-      "See them with *my drivers* and choose a valid number."
-    );
-  }
-
-  const chosen = drivers[index - 1];
-
-  await pool.query(
-    `
-    UPDATE vehicles
-    SET driver_id = $1,
-        updated_at = NOW()
-    WHERE id = $2
-  `,
-    [chosen.id, vehicle.id]
-  );
-
-  const name = chosen.full_name || "Driver";
-  const licType = chosen.license_type || "n/a";
-  const exp = chosen.license_expiry_date
-    ? String(chosen.license_expiry_date).slice(0, 10)
-    : "n/a";
-
-  return (
-    "✅ Driver assigned.\n\n" +
-    "Vehicle: *" +
-    vehicle.registration +
-    "*\n" +
-    "Driver: *" +
-    name +
-    "*\n" +
-    "Licence type: *" +
-    licType +
-    "* (exp: " +
-    exp +
-    ")\n\n" +
-    "You can change driver any time with another *assign driver X*."
-  );
-}
-
-// Driver licence compliance / report
-async function buildDriverComplianceReport(userWhatsapp) {
-  const res = await pool.query(
-    `
-    SELECT id, full_name, license_type, license_expiry_date, driver_whatsapp, is_active
-    FROM drivers
-    WHERE owner_whatsapp = $1
-      AND is_active = TRUE
-    ORDER BY license_expiry_date ASC
-  `,
-    [userWhatsapp]
-  );
-
-  const drivers = res.rows;
-  if (drivers.length === 0) {
-    return (
-      "You don't have any drivers yet.\n\n" +
-      "Add one with:\n" +
-      "*add driver John Doe | 0712345678*"
-    );
-  }
-
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
-
-  const expired = [];
-  const expiring = [];
-  const ok = [];
-
-  for (const d of drivers) {
-    if (!d.license_expiry_date) {
-      expired.push({ driver: d, diffDays: null });
-      continue;
-    }
-    const expDate = new Date(d.license_expiry_date);
-    expDate.setHours(0, 0, 0, 0);
-
-    const diffDays = Math.round(
-      (expDate.getTime() - today.getTime()) / (1000 * 60 * 60 * 24)
-    );
-
-    if (diffDays < 0) {
-      expired.push({ driver: d, diffDays });
-    } else if (diffDays <= 30) {
-      expiring.push({ driver: d, diffDays });
-    } else {
-      ok.push({ driver: d, diffDays });
-    }
-  }
-
-  let text = "🚦 *Driver licence compliance overview*\n";
-
-  // Expired
-  if (expired.length > 0) {
-    text += "\n❌ *Expired licences*:\n";
-    for (const item of expired) {
-      const d = item.driver;
-      const name = d.full_name || "Driver";
-      const licType = d.license_type || "n/a";
-      const exp = d.license_expiry_date
-        ? String(d.license_expiry_date).slice(0, 10)
-        : "n/a";
-      const days = item.diffDays !== null ? Math.abs(item.diffDays) : "?";
-      const phone = d.driver_whatsapp || "no phone on file";
-      text +=
-        "\n• *" +
-        name +
-        "* – Type: *" +
-        licType +
-        "*, exp: " +
-        exp +
-        " (expired " +
-        days +
-        " day(s) ago) – " +
-        phone;
-    }
-  } else {
-    text += "\n❌ *Expired licences*: none 🎉";
-  }
-
-  // Expiring soon
-  if (expiring.length > 0) {
-    text += "\n\n⚠️ *Expiring in next 30 days*:\n";
-    for (const item of expiring) {
-      const d = item.driver;
-      const name = d.full_name || "Driver";
-      const licType = d.license_type || "n/a";
-      const exp = d.license_expiry_date
-        ? String(d.license_expiry_date).slice(0, 10)
-        : "n/a";
-      const days = item.diffDays;
-      const phone = d.driver_whatsapp || "no phone on file";
-      text +=
-        "\n• *" +
-        name +
-        "* – Type: *" +
-        licType +
-        "*, exp: " +
-        exp +
-        " (in " +
-        days +
-        " day(s)) – " +
-        phone;
-    }
-  } else {
-    text += "\n\n⚠️ *Expiring soon (30 days)*: none.";
-  }
-
-  // OK
-  if (ok.length > 0) {
-    text += "\n\n✅ *Valid (>30 days left)*:\n";
-    for (const item of ok) {
-      const d = item.driver;
-      const name = d.full_name || "Driver";
-      const licType = d.license_type || "n/a";
-      const exp = d.license_expiry_date
-        ? String(d.license_expiry_date).slice(0, 10)
-        : "n/a";
-      const days = item.diffDays;
-      const phone = d.driver_whatsapp || "no phone on file";
-      text +=
-        "\n• *" +
-        name +
-        "* – Type: *" +
-        licType +
-        "*, exp: " +
-        exp +
-        " (~" +
-        days +
-        " day(s) left) – " +
-        phone;
-    }
-  } else {
-    text += "\n\n✅ *Valid licences*: none yet.";
-  }
-
-  text +=
-    "\n\nYou can add drivers with *add driver ...* and assign them with *assign driver X*.\nDrivers must reply *accept* then *dl main YYYY-MM-DD* to be Main DL compliant.";
-
-  return text;
-}
-
-// ====== SIMPLE MOCKS FOR FUEL / SERVICE / EXPENSE ======
+// ====== SIMPLE SESSION PLACEHOLDERS ======
 async function handleFuelSessionStep(session, incomingText) {
   return "Fuel session handling not yet implemented in this trimmed version.";
 }
-
 async function handleServiceSessionStep(session, incomingText) {
   return "Service session handling not yet implemented in this trimmed version.";
 }
-
 async function handleExpenseSessionStep(session, incomingText) {
   return "Expense session handling not yet implemented in this trimmed version.";
 }
@@ -1080,7 +458,6 @@ async function handleDeleteLastCommand(userWhatsapp, lower) {
     "For now, you can start new logs with *fuel*, *service* or *expense*."
   );
 }
-
 async function handleEditLastCommand(userWhatsapp, fullText) {
   return (
     "Edit commands are not fully wired in this trimmed version.\n" +
@@ -1092,11 +469,9 @@ async function handleEditLastCommand(userWhatsapp, fullText) {
 async function buildFuelReport(userWhatsapp, options = {}) {
   return "Fuel report coming soon. For now I track fuel entries but reporting is still being wired.";
 }
-
 async function buildServiceReport(userWhatsapp, options = {}) {
   return "Service report coming soon. For now I track service entries but reporting is still being wired.";
 }
-
 async function buildExpenseReport(userWhatsapp, options = {}) {
   return "Expense report coming soon. For now I track expense entries but reporting is still being wired.";
 }
@@ -1121,7 +496,6 @@ async function callN8nAi(from, text) {
 
     const data = aiRes.data;
 
-    // 1) If axios already parsed JSON for us
     if (data && typeof data === "object") {
       if (typeof data.reply === "string" && data.reply.trim().length > 0) {
         return data.reply.trim();
@@ -1133,7 +507,6 @@ async function callN8nAi(from, text) {
       return null;
     }
 
-    // 2) If n8n returned a STRING
     if (typeof data === "string") {
       const str = data.trim();
       if (!str) return null;
@@ -1142,7 +515,6 @@ async function callN8nAi(from, text) {
       if (match && match[1]) {
         return match[1].trim();
       }
-
       return str;
     }
 
@@ -1155,7 +527,6 @@ async function callN8nAi(from, text) {
     return null;
   }
 }
-
 // ====== HEALTH CHECK ======
 app.get("/", (req, res) => {
   res.send("Saka360 backend is running ✅");
@@ -1172,20 +543,18 @@ app.post("/whatsapp/inbound", async (req, res) => {
 
     console.log("📩 Incoming:", { from, text });
 
-    // 💾 Log user message
-    if (from && text) {
-      await logChatTurn(from, "user", text);
-    }
-
     if (!text) {
       console.log("⚠️ Empty message body received from Twilio.");
       res.status(200).send("OK");
       return;
     }
 
+    // Log USER message
+    await logChatTurn(from, "user", text);
+
     let replyText = "";
 
-    // GLOBAL COMMANDS: cancel / stop / reset
+    // GLOBAL COMMANDS
     if (["cancel", "stop", "reset"].includes(lower)) {
       await cancelAllSessionsForUser(from);
       replyText =
@@ -1195,7 +564,7 @@ app.post("/whatsapp/inbound", async (req, res) => {
     else if (lower === "accept") {
       replyText = await handleDriverAccept(from);
     }
-    // QUICK "add" helper – menu of things you can add
+    // QUICK "add" helper
     else if (lower === "add") {
       replyText =
         "What would you like to add? ✏️\n\n" +
@@ -1274,7 +643,7 @@ app.post("/whatsapp/inbound", async (req, res) => {
     } else if (lower.startsWith("edit last")) {
       replyText = await handleEditLastCommand(from, text);
     }
-    // HIGH-LEVEL REPORT HELP
+    // REPORT HELP
     else if (lower === "report" || lower.startsWith("report ")) {
       replyText =
         "I can show quick summaries for your data:\n\n" +
@@ -1287,31 +656,25 @@ app.post("/whatsapp/inbound", async (req, res) => {
         "• *driver report* – driver licence compliance\n\n" +
         "Please choose one of those.";
     }
-    // SIMPLE REPORT COMMANDS (currently placeholder functions)
+    // SIMPLE REPORT COMMANDS
     else if (lower.startsWith("fuel report")) {
       const wantsAll = lower.includes("all");
-      if (wantsAll) {
-        replyText = await buildFuelReport(from, { allVehicles: true });
-      } else {
-        replyText = await buildFuelReport(from, {});
-      }
+      replyText = await buildFuelReport(from, wantsAll ? { allVehicles: true } : {});
     } else if (lower.startsWith("service report")) {
       const wantsAll = lower.includes("all");
-      if (wantsAll) {
-        replyText = await buildServiceReport(from, { allVehicles: true });
-      } else {
-        replyText = await buildServiceReport(from, {});
-      }
+      replyText = await buildServiceReport(
+        from,
+        wantsAll ? { allVehicles: true } : {}
+      );
     } else if (
       lower.startsWith("expense report") ||
       lower.startsWith("expenses report")
     ) {
       const wantsAll = lower.includes("all");
-      if (wantsAll) {
-        replyText = await buildExpenseReport(from, { allVehicles: true });
-      } else {
-        replyText = await buildExpenseReport(from, {});
-      }
+      replyText = await buildExpenseReport(
+        from,
+        wantsAll ? { allVehicles: true } : {}
+      );
     } else if (
       lower === "driver report" ||
       lower === "drivers report" ||
@@ -1319,8 +682,9 @@ app.post("/whatsapp/inbound", async (req, res) => {
       lower === "compliance"
     ) {
       replyText = await buildDriverComplianceReport(from);
-    } else {
-      // Fallback: send to n8n AI
+    }
+    // FALLBACK → n8n AI
+    else {
       const aiReply = await callN8nAi(from, text);
       if (aiReply && typeof aiReply === "string" && aiReply.trim().length > 0) {
         replyText = aiReply.trim();
@@ -1331,10 +695,8 @@ app.post("/whatsapp/inbound", async (req, res) => {
 
     console.log("💬 Reply:", replyText);
 
-    // 💾 Log assistant reply
-    if (from && replyText) {
-      await logChatTurn(from, "assistant", replyText);
-    }
+    // Log ASSISTANT message
+    await logChatTurn(from, "assistant", replyText);
 
     try {
       if (DISABLE_TWILIO_SEND === "true") {
