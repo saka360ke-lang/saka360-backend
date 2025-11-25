@@ -276,7 +276,7 @@ async function handleAddVehicleCommand(userWhatsapp, fullText) {
 
   // Multiple vehicles now; don't force as default
   return (
-    `✅ Vehicle *${registration}* added.\n\n" +
+    `✅ Vehicle *${registration}* added.\n\n` +
     "To use it as your active vehicle, list your vehicles with *my vehicles* " +
     "then send e.g. *switch to 2*."
   );
@@ -997,113 +997,6 @@ async function handleAssignDriverCommand(userWhatsapp, fullText) {
   );
 }
 
-// Show which drivers are assigned to which vehicles
-async function handleDriverAssignmentsOverview(userWhatsapp) {
-  const res = await pool.query(
-    `
-    SELECT
-      v.registration,
-      v.nickname,
-      v.is_default,
-      d.full_name AS driver_name,
-      d.license_type,
-      d.license_expiry_date
-    FROM vehicles v
-    LEFT JOIN drivers d
-      ON v.driver_id = d.id
-    WHERE v.owner_whatsapp = $1
-      AND v.is_active = TRUE
-    ORDER BY v.created_at ASC
-    `,
-    [userWhatsapp]
-  );
-
-  const rows = res.rows;
-  if (rows.length === 0) {
-    return (
-      "You don't have any vehicles yet.\n\n" +
-      "Add one with:\n" +
-      "*add vehicle KDA 123A*"
-    );
-  }
-
-  let text = "🚘 *Vehicle → Driver assignments*\n";
-  rows.forEach((row, index) => {
-    const idx = index + 1;
-    const reg = row.registration;
-    const nick = row.nickname ? ` (${row.nickname})` : "";
-    const currentMark = row.is_default ? " ✅ (current)" : "";
-    const driverName = row.driver_name || "no driver assigned";
-    const licType = row.license_type || "n/a";
-    const exp = row.license_expiry_date
-      ? String(row.license_expiry_date).slice(0, 10)
-      : "n/a";
-
-    if (row.driver_name) {
-      text +=
-        `\n${idx}. *${reg}*${nick}${currentMark}\n` +
-        `   Driver: *${driverName}* – ${licType} (exp: ${exp})`;
-    } else {
-      text +=
-        `\n${idx}. *${reg}*${nick}${currentMark}\n` +
-        `   Driver: *none assigned*`;
-    }
-  });
-
-  text +=
-    "\n\nYou can assign with *assign driver X* and soon unassign with *unassign driver* " +
-    "for your current vehicle.";
-
-  return text;
-}
-
-// Unassign driver from CURRENT vehicle
-async function handleUnassignDriverCommand(userWhatsapp) {
-  const vRes = await ensureCurrentVehicle(userWhatsapp);
-
-  if (vRes.status === "NO_VEHICLES") {
-    return (
-      "You don't have any vehicles yet.\n\n" +
-      "Add one with: *add vehicle KDA 123A*"
-    );
-  } else if (vRes.status === "NEED_SET_CURRENT") {
-    const listText = formatVehiclesList(vRes.list, true);
-    return (
-      "You have multiple vehicles. Please choose which one you want as *current* first.\n\n" +
-      listText +
-      "\n\nReply with e.g. *switch to 1*, then send *unassign driver* again."
-    );
-  }
-
-  const vehicle = vRes.vehicle;
-
-  if (!vehicle.driver_id) {
-    return (
-      "Your current vehicle *" +
-      vehicle.registration +
-      "* does not have a driver assigned.\n\n" +
-      "You can assign one with *assign driver X* after listing drivers with *my drivers*."
-    );
-  }
-
-  await pool.query(
-    `
-    UPDATE vehicles
-    SET driver_id = NULL,
-        updated_at = NOW()
-    WHERE id = $1
-    `,
-    [vehicle.id]
-  );
-
-  return (
-    "✅ Driver unassigned from *" +
-    vehicle.registration +
-    "*.\n\n" +
-    "You can assign a new driver later with *assign driver X*."
-  );
-}
-
 // Driver licence compliance / report
 async function buildDriverComplianceReport(userWhatsapp) {
   const res = await pool.query(
@@ -1479,35 +1372,9 @@ app.post("/whatsapp/inbound", async (req, res) => {
       replyText = await handleMyDriversCommand(from);
     } else if (lower.startsWith("assign driver")) {
       replyText = await handleAssignDriverCommand(from, text);
-    } else if (
-      lower === "driver assignments" ||
-      lower === "assignments" ||
-      lower.includes("which car is assigned to a driver") ||
-      lower.includes("see which car is assigned") ||
-      (lower.includes("driver") && lower.includes("assigned") && lower.includes("car"))
-    ) {
-      // Owner/fleet view: which driver is on which car
-      replyText = await handleDriverAssignmentsOverview(from);
-    } else if (
-      lower === "unassign driver" ||
-      lower === "remove driver" ||
-      (lower.includes("unassign") && lower.includes("driver"))
-    ) {
-      replyText = await handleUnassignDriverCommand(from);
     }
     // DRIVER LICENCE COMMAND
-    else if (
-      lower === "add license" ||
-      lower === "add licence" ||
-      lower.includes("add license") ||
-      lower.includes("add licence")
-    ) {
-      replyText =
-        "To add a driving licence on *Saka360*, the driver must send their *Main DL* expiry date from their own WhatsApp number.\n\n" +
-        "Ask the driver to reply with:\n" +
-        "*dl main 2026-01-01*  (use their real expiry date)\n\n" +
-        "Once they add a valid Main DL, they’ll appear as *compliant* in your *driver report* and you can assign vehicles to them.";
-    } else if (lower.startsWith("dl ")) {
+    else if (lower.startsWith("dl ")) {
       replyText = await handleDriverLicenceCommand(from, text);
     }
     // HIGH-LEVEL LOGGING SHORTCUTS (avoid generic n8n replies)
@@ -1628,42 +1495,7 @@ app.post("/whatsapp/inbound", async (req, res) => {
       lower === "license"
     ) {
       replyText = await handleMyOwnLicenceStatus(from);
-    }
-    // GENERIC "step by step" help for logging
-    else if (lower.includes("step by step")) {
-      replyText =
-        "Here’s how to log on *Saka360* step by step 👇\n\n" +
-        "⛽ *Fuel logging step by step*\n" +
-        "1️⃣ Make sure the correct vehicle is selected with *my vehicles* and *switch to X*.\n" +
-        "2️⃣ At the pump, note: litres, price per litre, total cost, station name, and odometer.\n" +
-        "3️⃣ Send everything in *one line* like:\n" +
-        "   *fuel 30L | 180 per litre | 5400 total | Shell Ngong Road | odo 123456*\n\n" +
-        "🛠️ *Service logging step by step*\n" +
-        "1️⃣ Choose the vehicle (*my vehicles*, then *switch to X* if needed).\n" +
-        "2️⃣ Note service type (minor, major), labour cost, parts cost, garage name, notes and odometer.\n" +
-        "3️⃣ Send:\n" +
-        "   *service major | 8500 labour | 12000 parts | Toyo Motors | notes: changed oil & filters | odo 145000*\n\n" +
-        "💸 *Expense logging step by step*\n" +
-        "1️⃣ Decide which vehicle the expense belongs to (same *my vehicles* logic).\n" +
-        "2️⃣ Note type (tyres, parking, repair etc.), amount, description, vendor and odometer if relevant.\n" +
-        "3️⃣ Send:\n" +
-        "   *expense tyres | 48000 | 4 new tyres | Sameer Park | odo 160000*\n\n" +
-        "In upcoming versions I’ll guide you through this interactively. For now, I use the one-line format above to keep your logs clean and consistent ✅.";
-    }
-    // REMINDERS / DOCUMENT REMINDERS (honest limitation)
-    else if (
-      lower === "add reminder" ||
-      lower.includes("reminder") ||
-      lower.includes("expiry date") ||
-      lower.includes("expiration date")
-    ) {
-      replyText =
-        "Right now *Saka360* automatically focuses on *Driving Licence* expiry reminders via the *driver report* and each driver’s DL status.\n\n" +
-        "In upcoming versions you’ll also be able to store other documents (e.g. insurance, inspection, road licence) with reminder dates.\n\n" +
-        "For now, you can use the *notes* field in your *service* or *expense* logs to tag important dates, and I’ll keep those tied to each vehicle.";
-    }
-    // FALLBACK → n8n AI
-    else {
+    } else {
       // Fallback: send to n8n AI
       const aiReply = await callN8nAi(from, text);
       if (aiReply && typeof aiReply === "string" && aiReply.trim().length > 0) {
