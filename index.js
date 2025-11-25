@@ -666,6 +666,97 @@ async function handleDriverAccept(driverWhatsapp) {
 async function handleDriverLicenceCommand(driverWhatsapp, fullText) {
   const lower = fullText.toLowerCase().trim();
 
+  // Is this WhatsApp number a driver in the system?
+async function findDriverByWhatsapp(driverWhatsapp) {
+  const res = await pool.query(
+    `
+    SELECT *
+    FROM drivers
+    WHERE driver_whatsapp = $1
+      AND is_active = TRUE
+    ORDER BY created_at DESC
+    LIMIT 1
+  `,
+    [driverWhatsapp]
+  );
+  return res.rows[0] || null;
+}
+
+/**
+ * DRIVER: see my own licence status
+ */
+async function handleMyOwnLicenceStatus(driverWhatsapp) {
+  const driver = await findDriverByWhatsapp(driverWhatsapp);
+
+  if (!driver) {
+    return (
+      "I cannot find a driver profile linked to this WhatsApp number.\n\n" +
+      "Ask your fleet owner to add you with:\n" +
+      "*add driver Your Name | 07XXXXXXXX*"
+    );
+  }
+
+  const name = driver.full_name || "Driver";
+  const licType = driver.license_type || "not set";
+  const expRaw = driver.license_expiry_date
+    ? String(driver.license_expiry_date).slice(0, 10)
+    : null;
+
+  if (!licType || !expRaw) {
+    return (
+      "Hi " +
+      name +
+      " 👋\n\n" +
+      "You do not have a *Main Driving Licence* expiry date on Saka360 yet.\n\n" +
+      "To become compliant, send:\n" +
+      "*dl main 2026-01-01*  (use your real expiry date)\n\n" +
+      "After that your fleet owner can safely assign cars to you."
+    );
+  }
+
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const expDate = new Date(expRaw);
+  expDate.setHours(0, 0, 0, 0);
+
+  const diffDays = Math.round(
+    (expDate.getTime() - today.getTime()) / (1000 * 60 * 60 * 24)
+  );
+
+  let statusLine = "";
+  let icon = "✅";
+
+  if (diffDays < 0) {
+    icon = "❌";
+    statusLine = "Your licence *expired* " + Math.abs(diffDays) + " day(s) ago.";
+  } else if (diffDays <= 30) {
+    icon = "⚠️";
+    statusLine =
+      "Your licence is *expiring soon* in " + diffDays + " day(s).";
+  } else {
+    icon = "✅";
+    statusLine =
+      "Your licence is *valid* with about " + diffDays + " day(s) left.";
+  }
+
+  return (
+    icon +
+    " *Your licence status*\n\n" +
+    "Name: *" +
+    name +
+    "*\n" +
+    "Licence type: *" +
+    licType +
+    "*\n" +
+    "Expiry date: *" +
+    expRaw +
+    "*\n\n" +
+    statusLine +
+    "\n\n" +
+    "If this looks wrong, ask your fleet owner to review your details in Saka360."
+  );
+}
+
   // Expect format: dl main YYYY-MM-DD
   const match = lower.match(/^dl\s+(\w+)\s+(\d{4}-\d{2}-\d{2})$/i);
   if (!match) {
