@@ -997,6 +997,112 @@ async function handleAssignDriverCommand(userWhatsapp, fullText) {
   );
 }
 
+// Show which drivers are assigned to which vehicles
+async function handleDriverAssignmentsOverview(userWhatsapp) {
+  const res = await pool.query(
+    `
+    SELECT
+      v.registration,
+      v.nickname,
+      v.is_default,
+      d.full_name AS driver_name,
+      d.license_type,
+      d.license_expiry_date
+    FROM vehicles v
+    LEFT JOIN drivers d
+      ON v.driver_id = d.id
+    WHERE v.owner_whatsapp = $1
+      AND v.is_active = TRUE
+    ORDER BY v.created_at ASC
+    `,
+    [userWhatsapp]
+  );
+
+  const rows = res.rows;
+  if (rows.length === 0) {
+    return (
+      "You don't have any vehicles yet.\n\n" +
+      "Add one with:\n" +
+      "*add vehicle KDA 123A*"
+    );
+  }
+
+  let text = "🚘 *Vehicle → Driver assignments*\n";
+  rows.forEach((row, index) => {
+    const idx = index + 1;
+    const reg = row.registration;
+    const nick = row.nickname ? ` (${row.nickname})` : "";
+    const currentMark = row.is_default ? " ✅ (current)" : "";
+    const driverName = row.driver_name || "no driver assigned";
+    const licType = row.license_type || "n/a";
+    const exp = row.license_expiry_date
+      ? String(row.license_expiry_date).slice(0, 10)
+      : "n/a";
+
+    if (row.driver_name) {
+      text +=
+        `\n${idx}. *${reg}*${nick}${currentMark}\n` +
+        `   Driver: *${driverName}* – ${licType} (exp: ${exp})`;
+    } else {
+      text +=
+        `\n${idx}. *${reg}*${nick}${currentMark}\n` +
+        `   Driver: *none assigned*`;
+    }
+  });
+
+  text +=
+    "\n\nYou can assign with *assign driver X* and unassign with *unassign driver* for your current vehicle.";
+
+  return text;
+}
+
+// Unassign driver from CURRENT vehicle
+async function handleUnassignDriverCommand(userWhatsapp) {
+  const vRes = await ensureCurrentVehicle(userWhatsapp);
+
+  if (vRes.status === "NO_VEHICLES") {
+    return (
+      "You don't have any vehicles yet.\n\n" +
+      "Add one with: *add vehicle KDA 123A*"
+    );
+  } else if (vRes.status === "NEED_SET_CURRENT") {
+    const listText = formatVehiclesList(vRes.list, true);
+    return (
+      "You have multiple vehicles. Please choose which one you want as *current* first.\n\n" +
+      listText +
+      "\n\nReply with e.g. *switch to 1*, then send *unassign driver* again."
+    );
+  }
+
+  const vehicle = vRes.vehicle;
+
+  if (!vehicle.driver_id) {
+    return (
+      "Your current vehicle *" +
+      vehicle.registration +
+      "* does not have a driver assigned.\n\n" +
+      "You can assign one with *assign driver X* after listing drivers with *my drivers*."
+    );
+  }
+
+  await pool.query(
+    `
+    UPDATE vehicles
+    SET driver_id = NULL,
+        updated_at = NOW()
+    WHERE id = $1
+    `,
+    [vehicle.id]
+  );
+
+  return (
+    "✅ Driver unassigned from *" +
+    vehicle.registration +
+    "*.\n\n" +
+    "You can assign a new driver later with *assign driver X*."
+  );
+}
+
 // Driver licence compliance / report
 async function buildDriverComplianceReport(userWhatsapp) {
   const res = await pool.query(
@@ -1140,7 +1246,7 @@ async function buildDriverComplianceReport(userWhatsapp) {
   return text;
 }
 
-// ====== SIMPLE MOCKS FOR FUEL / SERVICE / EXPENSE (you can wire real flows later) ======
+// ====== SIMPLE MOCKS FOR FUEL / SERVICE / EXPENSE ======
 
 async function handleFuelSessionStep(session, incomingText) {
   return "Fuel session handling not yet fully implemented in this backend. For now, follow the guidance I send in chat.";
@@ -1207,7 +1313,7 @@ async function callN8nAi(from, text) {
 
     console.log("🤖 Raw n8n AI response:", aiRes.status, aiRes.data);
 
-    const data = aiRes.data;
+    let data = aiRes.data;
 
     // Case 1: axios already parsed JSON object
     if (data && typeof data === "object") {
@@ -1221,28 +1327,36 @@ async function callN8nAi(from, text) {
       return null;
     }
 
-    // Case 2: n8n returned a plain string (possibly JSON)
+    // Case 2: n8n returned a plain string (may itself be JSON or quoted)
     if (typeof data === "string") {
-      const str = data.trim();
+      let str = data.trim();
       if (!str) return null;
 
-      // Try to parse as JSON first
-      try {
-        const maybe = JSON.parse(str);
-        if (maybe && typeof maybe === "object") {
-          if (typeof maybe.reply === "string" && maybe.reply.trim().length > 0) {
-            return maybe.reply.trim();
+      // If it's JSON, try to parse and extract { reply: "..." }
+      if (str.startsWith("{") || str.startsWith("[")) {
+        try {
+          const parsed = JSON.parse(str);
+          if (
+            parsed &&
+            typeof parsed === "object" &&
+            typeof parsed.reply === "string"
+          ) {
+            return parsed.reply.trim();
           }
-          if (typeof maybe.text === "string" && maybe.text.trim().length > 0) {
-            return maybe.text.trim();
-          }
+        } catch (e) {
+          // not JSON, fall through
         }
-      } catch (e) {
-        // not JSON, ignore
       }
 
-      // Fallback: return raw string
-      return str;
+      // Strip wrapping quotes like "Hi ... " if present
+      if (
+        (str.startsWith('"') && str.endsWith('"')) ||
+        (str.startsWith("'") && str.endsWith("'"))
+      ) {
+        str = str.slice(1, -1);
+      }
+
+      return str.trim();
     }
 
     console.warn("⚠️ n8n AI response had no usable 'reply'/'text' string.");
@@ -1364,6 +1478,8 @@ app.post("/whatsapp/inbound", async (req, res) => {
       lower === "car"
     ) {
       replyText = await handleMyVehiclesCommand(from);
+    } else if (lower.startsWith("switch")) {
+      replyText = await handleSwitchVehicleCommand(from, text);
     }
     // DRIVER COMMANDS
     else if (lower.startsWith("add driver")) {
@@ -1372,47 +1488,36 @@ app.post("/whatsapp/inbound", async (req, res) => {
       replyText = await handleMyDriversCommand(from);
     } else if (lower.startsWith("assign driver")) {
       replyText = await handleAssignDriverCommand(from, text);
+    } else if (
+      lower === "driver assignments" ||
+      lower === "assignments" ||
+      lower.includes("which car is assigned to a driver") ||
+      lower.includes("see which car is assigned") ||
+      (lower.includes("driver") && lower.includes("assigned") && lower.includes("car"))
+    ) {
+      // Owner/fleet view: which driver is on which car
+      replyText = await handleDriverAssignmentsOverview(from);
+    } else if (
+      lower === "unassign driver" ||
+      lower === "remove driver" ||
+      (lower.includes("unassign") && lower.includes("driver"))
+    ) {
+      replyText = await handleUnassignDriverCommand(from);
     }
-    // DRIVER LICENCE COMMAND
-    else if (lower.startsWith("dl ")) {
-      replyText = await handleDriverLicenceCommand(from, text);
-    }
-    // HIGH-LEVEL LOGGING SHORTCUTS (avoid generic n8n replies)
+    // DRIVER LICENCE COMMANDS + ADD LICENSE
     else if (
-      lower === "fuel" ||
-      lower === "log fuel" ||
-      lower.startsWith("fuel ") ||
-      lower.startsWith("log fuel")
+      lower === "add license" ||
+      lower === "add licence" ||
+      lower.includes("add license") ||
+      lower.includes("add licence")
     ) {
       replyText =
-        "⛽ *How to log fuel on Saka360*\n\n" +
-        "1️⃣ Make sure the correct vehicle is selected with *my vehicles* and *switch to X*.\n" +
-        "2️⃣ Then send your fuel details in one line like:\n" +
-        "*fuel 30L | 180 per litre | 5400 total | Shell Ngong Road | odo 123456*\n\n" +
-        "I’ll use this format to track your fuel entries per vehicle in upcoming versions.\n" +
-        "You can also ask: *How do I log fuel step by step?*";
-    } else if (
-      lower === "service" ||
-      lower === "log service" ||
-      lower.startsWith("service ") ||
-      lower.startsWith("log service")
-    ) {
-      replyText =
-        "🛠️ *How to log a service on Saka360*\n\n" +
-        "Use a one-line format like:\n" +
-        "*service major | 8500 labour | 12000 parts | Toyo Motors | notes: changed oil & filters | odo 145000*\n\n" +
-        "I’ll use this to keep a clear history of what was done on each vehicle.";
-    } else if (
-      lower === "expense" ||
-      lower === "log expense" ||
-      lower.startsWith("expense ") ||
-      lower.startsWith("log expense")
-    ) {
-      replyText =
-        "💸 *How to log an expense on Saka360*\n\n" +
-        "Send a one-line entry like:\n" +
-        "*expense tyres | 48000 | 4 new tyres | Sameer Park | odo 160000*\n\n" +
-        "Expenses help you see total running costs per vehicle over time.";
+        "To add a driving licence on *Saka360*, the driver must send their *Main DL* expiry date from their own WhatsApp number.\n\n" +
+        "Ask the driver to reply with:\n" +
+        "*dl main 2026-01-01*  (use their real expiry date)\n\n" +
+        "Once they add a valid Main DL, they’ll appear as *compliant* in your *driver report* and you can assign vehicles to them.";
+    } else if (lower.startsWith("dl ")) {
+      replyText = await handleDriverLicenceCommand(from, text);
     }
     // SIMPLE EDIT / DELETE HELPERS
     else if (lower === "edit") {
@@ -1471,7 +1576,9 @@ app.post("/whatsapp/inbound", async (req, res) => {
       } else {
         replyText = await buildExpenseReport(from, {});
       }
-    } else if (
+    }
+    // COMPLIANCE / LICENCE ROUTING
+    else if (
       lower === "driver report" ||
       lower === "drivers report" ||
       lower === "driver compliance" ||
@@ -1495,30 +1602,49 @@ app.post("/whatsapp/inbound", async (req, res) => {
       lower === "license"
     ) {
       replyText = await handleMyOwnLicenceStatus(from);
-    } else {
-      // Fallback: send to n8n AI
+    }
+    // GENERIC "step by step" help for logging
+    else if (lower.includes("step by step")) {
+      replyText =
+        "Here’s how to log on *Saka360* step by step 👇\n\n" +
+        "⛽ *Fuel logging step by step*\n" +
+        "1️⃣ Make sure the correct vehicle is selected with *my vehicles* and *switch to X*.\n" +
+        "2️⃣ At the pump, note: litres, price per litre, total cost, station name, and odometer.\n" +
+        "3️⃣ Send everything in *one line* like:\n" +
+        "   *fuel 30L | 180 per litre | 5400 total | Shell Ngong Road | odo 123456*\n\n" +
+        "🛠️ *Service logging step by step*\n" +
+        "1️⃣ Choose the vehicle (*my vehicles*, then *switch to X* if needed).\n" +
+        "2️⃣ Note service type (minor, major), labour cost, parts cost, garage name, notes and odometer.\n" +
+        "3️⃣ Send:\n" +
+        "   *service major | 8500 labour | 12000 parts | Toyo Motors | notes: changed oil & filters | odo 145000*\n\n" +
+        "💸 *Expense logging step by step*\n" +
+        "1️⃣ Decide which vehicle the expense belongs to (same *my vehicles* logic).\n" +
+        "2️⃣ Note type (tyres, parking, repair etc.), amount, description, vendor and odometer if relevant.\n" +
+        "3️⃣ Send:\n" +
+        "   *expense tyres | 48000 | 4 new tyres | Sameer Park | odo 160000*\n\n" +
+        "In upcoming versions I’ll guide you through this interactively. For now, I use the one-line format above to keep your logs clean and consistent ✅.";
+    }
+    // REMINDERS / DOCUMENT EXPIRY
+    else if (
+      lower === "add reminder" ||
+      lower.includes("reminder") ||
+      lower.includes("expiry date") ||
+      lower.includes("expiration date")
+    ) {
+      replyText =
+        "Right now *Saka360* automatically focuses on *Driving Licence* expiry reminders via the *driver report* and each driver’s DL status.\n\n" +
+        "In upcoming versions you’ll also be able to store other documents (e.g. insurance, inspection, road licence) with reminder dates.\n\n" +
+        "For now, you can use the *notes* field in your *service* or *expense* logs to tag important dates, and I’ll keep those tied to each vehicle.";
+    }
+    // FALLBACK → n8n AI
+    else {
       const aiReply = await callN8nAi(from, text);
       if (aiReply && typeof aiReply === "string" && aiReply.trim().length > 0) {
         replyText = aiReply.trim();
       } else {
-        replyText =
-          "Hi! 👋 I’m Saka360. I help you with vehicles, drivers, fuel, service, expenses and licence compliance. What would you like to do?";
+        replyText = "Hi 👋 I’m Saka360. How can I help?";
       }
     }
-
-    // ---- FORCE REPLY TO BE A STRING (FIXES JSON BEING SENT TO WHATSAPP) ----
-    if (typeof replyText !== "string") {
-      if (replyText && typeof replyText === "object") {
-        replyText =
-          replyText.reply ||
-          replyText.text ||
-          JSON.stringify(replyText, null, 2);
-      } else {
-        replyText = String(replyText);
-      }
-    }
-    replyText = replyText.trim();
-    // -----------------------------------------------------------------------
 
     // Log assistant reply into memory
     await logChatTurn(from, "assistant", replyText);
