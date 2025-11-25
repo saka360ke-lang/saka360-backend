@@ -1338,10 +1338,15 @@ app.post("/whatsapp/inbound", async (req, res) => {
     // VEHICLE COMMANDS
     else if (lower.startsWith("add vehicle")) {
       replyText = await handleAddVehicleCommand(from, text);
-    } else if (lower === "my vehicles") {
+    } else if (
+      lower === "my vehicles" ||
+      lower === "my vehicle" ||
+      lower === "my cars" ||
+      lower === "my car" ||
+      lower === "cars" ||
+      lower === "car"
+    ) {
       replyText = await handleMyVehiclesCommand(from);
-    } else if (lower.startsWith("switch")) {
-      replyText = await handleSwitchVehicleCommand(from, text);
     }
     // DRIVER COMMANDS
     else if (lower.startsWith("add driver")) {
