@@ -276,9 +276,9 @@ async function handleAddVehicleCommand(userWhatsapp, fullText) {
 
   // Multiple vehicles now; don't force as default
   return (
-    `✅ Vehicle *${registration}* added.\n\n" +
+    `✅ Vehicle *${registration}* added.\n\n` +
     "To use it as your active vehicle, list your vehicles with *my vehicles* " +
-    "then send e.g. *switch to 2*.`
+    "then send e.g. *switch to 2*."
   );
 }
 
@@ -443,9 +443,9 @@ function formatDriversList(drivers, withIndices = true) {
 // ADD DRIVER (owner → invite)
 async function handleAddDriverCommand(ownerWhatsapp, fullText) {
   const base = "add driver";
-  const lower = fullText.toLowerCase().trim();
+  the_lower = fullText.toLowerCase().trim();
 
-  if (lower === base) {
+  if (the_lower === base) {
     return (
       "Let's add a driver to your Saka360 account 👨‍✈️\n\n" +
       "Please send the details in *one line* using this format:\n" +
@@ -1451,6 +1451,21 @@ app.post("/whatsapp/inbound", async (req, res) => {
       }
     }
 
+    // ---- FORCE REPLY TO BE A STRING (FIXES JSON BEING SENT TO WHATSAPP) ----
+    if (typeof replyText !== "string") {
+      // if somehow an object slipped through, try common fields
+      if (replyText && typeof replyText === "object") {
+        replyText =
+          replyText.reply ||
+          replyText.text ||
+          JSON.stringify(replyText, null, 2);
+      } else {
+        replyText = String(replyText);
+      }
+    }
+    replyText = replyText.trim();
+    // -----------------------------------------------------------------------
+
     // Log assistant reply into memory
     await logChatTurn(from, "assistant", replyText);
 
@@ -1460,12 +1475,11 @@ app.post("/whatsapp/inbound", async (req, res) => {
       if (DISABLE_TWILIO_SEND === "true") {
         console.log("🚫 Twilio send disabled by DISABLE_TWILIO_SEND env.");
       } else {
-      await twilioClient.messages.create({
+        await twilioClient.messages.create({
           from: TWILIO_WHATSAPP_NUMBER,
           to: from,
-          body: typeof replyText === "string" ? replyText : JSON.stringify(replyText.reply || replyText.text || replyText),
+          body: replyText,
         });
-
       }
     } catch (twilioErr) {
       console.error(
