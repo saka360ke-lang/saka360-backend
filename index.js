@@ -276,9 +276,9 @@ async function handleAddVehicleCommand(userWhatsapp, fullText) {
 
   // Multiple vehicles now; don't force as default
   return (
-    `✅ Vehicle *${registration}* added.\n\n` +
+    `✅ Vehicle *${registration}* added.\n\n" +
     "To use it as your active vehicle, list your vehicles with *my vehicles* " +
-    "then send e.g. *switch to 2*."
+    "then send e.g. *switch to 2*.`
   );
 }
 
@@ -1460,11 +1460,12 @@ app.post("/whatsapp/inbound", async (req, res) => {
       if (DISABLE_TWILIO_SEND === "true") {
         console.log("🚫 Twilio send disabled by DISABLE_TWILIO_SEND env.");
       } else {
-        await twilioClient.messages.create({
+      await twilioClient.messages.create({
           from: TWILIO_WHATSAPP_NUMBER,
           to: from,
-          body: replyText,
+          body: typeof replyText === "string" ? replyText : JSON.stringify(replyText.reply || replyText.text || replyText),
         });
+
       }
     } catch (twilioErr) {
       console.error(
