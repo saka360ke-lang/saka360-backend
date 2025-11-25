@@ -443,9 +443,9 @@ function formatDriversList(drivers, withIndices = true) {
 // ADD DRIVER (owner → invite)
 async function handleAddDriverCommand(ownerWhatsapp, fullText) {
   const base = "add driver";
-  the_lower = fullText.toLowerCase().trim();
+  const lower = fullText.toLowerCase().trim();
 
-  if (the_lower === base) {
+  if (lower === base) {
     return (
       "Let's add a driver to your Saka360 account 👨‍✈️\n\n" +
       "Please send the details in *one line* using this format:\n" +
@@ -1221,10 +1221,27 @@ async function callN8nAi(from, text) {
       return null;
     }
 
-    // Case 2: n8n returned a plain string
+    // Case 2: n8n returned a plain string (possibly JSON)
     if (typeof data === "string") {
       const str = data.trim();
       if (!str) return null;
+
+      // Try to parse as JSON first
+      try {
+        const maybe = JSON.parse(str);
+        if (maybe && typeof maybe === "object") {
+          if (typeof maybe.reply === "string" && maybe.reply.trim().length > 0) {
+            return maybe.reply.trim();
+          }
+          if (typeof maybe.text === "string" && maybe.text.trim().length > 0) {
+            return maybe.text.trim();
+          }
+        }
+      } catch (e) {
+        // not JSON, ignore
+      }
+
+      // Fallback: return raw string
       return str;
     }
 
@@ -1360,6 +1377,43 @@ app.post("/whatsapp/inbound", async (req, res) => {
     else if (lower.startsWith("dl ")) {
       replyText = await handleDriverLicenceCommand(from, text);
     }
+    // HIGH-LEVEL LOGGING SHORTCUTS (avoid generic n8n replies)
+    else if (
+      lower === "fuel" ||
+      lower === "log fuel" ||
+      lower.startsWith("fuel ") ||
+      lower.startsWith("log fuel")
+    ) {
+      replyText =
+        "⛽ *How to log fuel on Saka360*\n\n" +
+        "1️⃣ Make sure the correct vehicle is selected with *my vehicles* and *switch to X*.\n" +
+        "2️⃣ Then send your fuel details in one line like:\n" +
+        "*fuel 30L | 180 per litre | 5400 total | Shell Ngong Road | odo 123456*\n\n" +
+        "I’ll use this format to track your fuel entries per vehicle in upcoming versions.\n" +
+        "You can also ask: *How do I log fuel step by step?*";
+    } else if (
+      lower === "service" ||
+      lower === "log service" ||
+      lower.startsWith("service ") ||
+      lower.startsWith("log service")
+    ) {
+      replyText =
+        "🛠️ *How to log a service on Saka360*\n\n" +
+        "Use a one-line format like:\n" +
+        "*service major | 8500 labour | 12000 parts | Toyo Motors | notes: changed oil & filters | odo 145000*\n\n" +
+        "I’ll use this to keep a clear history of what was done on each vehicle.";
+    } else if (
+      lower === "expense" ||
+      lower === "log expense" ||
+      lower.startsWith("expense ") ||
+      lower.startsWith("log expense")
+    ) {
+      replyText =
+        "💸 *How to log an expense on Saka360*\n\n" +
+        "Send a one-line entry like:\n" +
+        "*expense tyres | 48000 | 4 new tyres | Sameer Park | odo 160000*\n\n" +
+        "Expenses help you see total running costs per vehicle over time.";
+    }
     // SIMPLE EDIT / DELETE HELPERS
     else if (lower === "edit") {
       replyText =
@@ -1447,13 +1501,13 @@ app.post("/whatsapp/inbound", async (req, res) => {
       if (aiReply && typeof aiReply === "string" && aiReply.trim().length > 0) {
         replyText = aiReply.trim();
       } else {
-        replyText = "Hi 👋 I’m Saka360. How can I help?";
+        replyText =
+          "Hi! 👋 I’m Saka360. I help you with vehicles, drivers, fuel, service, expenses and licence compliance. What would you like to do?";
       }
     }
 
     // ---- FORCE REPLY TO BE A STRING (FIXES JSON BEING SENT TO WHATSAPP) ----
     if (typeof replyText !== "string") {
-      // if somehow an object slipped through, try common fields
       if (replyText && typeof replyText === "object") {
         replyText =
           replyText.reply ||
