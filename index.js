@@ -364,6 +364,7 @@ async function handleSwitchVehicleCommand(userWhatsapp, fullText) {
     "You can now log with *fuel*, *service*, or *expense*."
   );
 }
+
 // ====== DRIVER HELPERS ======
 
 async function getUserDrivers(userWhatsapp) {
@@ -662,11 +663,7 @@ async function handleDriverAccept(driverWhatsapp) {
   );
 }
 
-// DRIVER SIDE: add main driving licence
-async function handleDriverLicenceCommand(driverWhatsapp, fullText) {
-  const lower = fullText.toLowerCase().trim();
-
-  // Is this WhatsApp number a driver in the system?
+// DRIVER HELPER: find driver by WhatsApp
 async function findDriverByWhatsapp(driverWhatsapp) {
   const res = await pool.query(
     `
@@ -756,6 +753,10 @@ async function handleMyOwnLicenceStatus(driverWhatsapp) {
     "If this looks wrong, ask your fleet owner to review your details in Saka360."
   );
 }
+
+// DRIVER SIDE: add main driving licence
+async function handleDriverLicenceCommand(driverWhatsapp, fullText) {
+  const lower = fullText.toLowerCase().trim();
 
   // Expect format: dl main YYYY-MM-DD
   const match = lower.match(/^dl\s+(\w+)\s+(\d{4}-\d{2}-\d{2})$/i);
@@ -1187,6 +1188,7 @@ async function buildServiceReport(userWhatsapp, options = {}) {
 async function buildExpenseReport(userWhatsapp, options = {}) {
   return "Expense report coming soon. For now I track expense entries, but reporting is still being wired.";
 }
+
 // ====== AI FALLBACK → n8n ======
 async function callN8nAi(from, text) {
   if (!N8N_WEBHOOK_URL) {
@@ -1411,30 +1413,29 @@ app.post("/whatsapp/inbound", async (req, res) => {
         replyText = await buildExpenseReport(from, {});
       }
     } else if (
-  lower === "driver report" ||
-  lower === "drivers report" ||
-  lower === "driver compliance" ||
-  lower === "compliance" ||
-  lower === "check licences" ||
-  lower === "check licenses"
-) {
-  // If this WhatsApp is a driver, show THEIR own licence status.
-  const driver = await findDriverByWhatsapp(from);
-  if (driver) {
-    replyText = await handleMyOwnLicenceStatus(from);
-  } else {
-    // Treat as owner / fleet compliance overview
-    replyText = await buildDriverComplianceReport(from);
-  }
-} else if (
-  lower === "my licence" ||
-  lower === "my license" ||
-  lower === "my dl" ||
-  lower === "licence" ||
-  lower === "license"
-) {
-  replyText = await handleMyOwnLicenceStatus(from);
-}
+      lower === "driver report" ||
+      lower === "drivers report" ||
+      lower === "driver compliance" ||
+      lower === "compliance" ||
+      lower === "check licences" ||
+      lower === "check licenses"
+    ) {
+      // If this WhatsApp is a driver, show THEIR own licence status.
+      const driver = await findDriverByWhatsapp(from);
+      if (driver) {
+        replyText = await handleMyOwnLicenceStatus(from);
+      } else {
+        // Treat as owner / fleet compliance overview
+        replyText = await buildDriverComplianceReport(from);
+      }
+    } else if (
+      lower === "my licence" ||
+      lower === "my license" ||
+      lower === "my dl" ||
+      lower === "licence" ||
+      lower === "license"
+    ) {
+      replyText = await handleMyOwnLicenceStatus(from);
     } else {
       // Fallback: send to n8n AI
       const aiReply = await callN8nAi(from, text);
@@ -1444,6 +1445,7 @@ app.post("/whatsapp/inbound", async (req, res) => {
         replyText = "Hi 👋 I’m Saka360. How can I help?";
       }
     }
+
     // Log assistant reply into memory
     await logChatTurn(from, "assistant", replyText);
 
