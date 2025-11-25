@@ -84,10 +84,6 @@ async function ensureChatTurnsTable() {
     console.error("❌ Error ensuring chat_turns table:", err.message);
   }
 }
-ensureChatTurnsTable();
-ensureChatTurnsTable();
-ensureLoggingSessionsTable();
-ensureFuelLogsTable();
 
 // Ensure logging_sessions exists
 async function ensureLoggingSessionsTable() {
@@ -96,8 +92,8 @@ async function ensureLoggingSessionsTable() {
       CREATE TABLE IF NOT EXISTS logging_sessions (
         id SERIAL PRIMARY KEY,
         user_whatsapp TEXT NOT NULL,
-        kind          TEXT NOT NULL,
-        state         TEXT NOT NULL,
+        kind          TEXT NOT NULL,      -- 'fuel', 'service', etc
+        state         TEXT NOT NULL,      -- 'awaiting_total_cost', ...
         vehicle_id    INT,
         driver_id     INT,
         payload       JSONB NOT NULL DEFAULT '{}'::jsonb,
@@ -111,14 +107,14 @@ async function ensureLoggingSessionsTable() {
   }
 }
 
-// Ensure fuel_logs exists
+// Ensure fuel_logs exists (uses user_whatsapp, not owner_whatsapp)
 async function ensureFuelLogsTable() {
   try {
     await pool.query(`
       CREATE TABLE IF NOT EXISTS fuel_logs (
         id SERIAL PRIMARY KEY,
         vehicle_id INT NOT NULL REFERENCES vehicles(id) ON DELETE CASCADE,
-        owner_whatsapp  TEXT NOT NULL,
+        user_whatsapp  TEXT NOT NULL,
         driver_whatsapp TEXT,
         litres          NUMERIC,
         price_per_litre NUMERIC,
@@ -134,6 +130,24 @@ async function ensureFuelLogsTable() {
     console.error("❌ Error ensuring fuel_logs table:", err.message);
   }
 }
+
+// Ensure vehicles has fuel_type column
+async function ensureVehicleFuelTypeColumn() {
+  try {
+    await pool.query(`
+      ALTER TABLE vehicles
+      ADD COLUMN IF NOT EXISTS fuel_type TEXT;
+    `);
+    console.log("⛽ vehicles.fuel_type column is ready.");
+  } catch (err) {
+    console.error("❌ Error ensuring vehicles.fuel_type column:", err.message);
+  }
+}
+
+ensureChatTurnsTable();
+ensureLoggingSessionsTable();
+ensureFuelLogsTable();
+ensureVehicleFuelTypeColumn();
 
 // ====== GENERIC HELPERS ======
 function parseNumber(text) {
@@ -227,11 +241,12 @@ function formatVehiclesList(vehicles, withIndices = true) {
     const idx = index + 1;
     const reg = v.registration;
     const nick = v.nickname ? ` (${v.nickname})` : "";
+    const fuel = v.fuel_type ? ` [${v.fuel_type}]` : "";
     const mark = v.is_default ? " ✅ (current)" : "";
     if (withIndices) {
-      text += `\n${idx}. *${reg}*${nick}${mark}`;
+      text += `\n${idx}. *${reg}*${nick}${fuel}${mark}`;
     } else {
-      text += `\n• *${reg}*${nick}${mark}`;
+      text += `\n• *${reg}*${nick}${fuel}${mark}`;
     }
   });
 
@@ -247,7 +262,8 @@ async function handleAddVehicleCommand(userWhatsapp, fullText) {
       "Let's add a vehicle to your Saka360 account 🚗\n\n" +
       "Please send your vehicle registration in this format:\n" +
       "*add vehicle KDA 123A*\n\n" +
-      "Example: *add vehicle KCY 456B*"
+      "Example: *add vehicle KCY 456B*\n\n" +
+      "After that, you can set its fuel type with *fuel type diesel* or *fuel type petrol*."
     );
   }
 
@@ -298,7 +314,8 @@ async function handleAddVehicleCommand(userWhatsapp, fullText) {
     return (
       `This vehicle *${registration}* is already on your account.\n` +
       "I’ve set it as your *current vehicle*.\n\n" +
-      "You can now log with *fuel*, *service* or *expense*."
+      "You can now log with *fuel*, *service* or *expense*.\n" +
+      "You can also set its fuel type with *fuel type diesel* or *fuel type petrol*."
     );
   }
 
@@ -325,9 +342,10 @@ async function handleAddVehicleCommand(userWhatsapp, fullText) {
     return (
       `✅ Vehicle *${registration}* added and set as your *current vehicle*.\n\n` +
       "You can now log:\n" +
-      "• *fuel* – log fuel\n" +
+      "• *fuel* – log fuel step by step\n" +
       "• *service* – log service\n" +
-      "• *expense* – log other vehicle expenses"
+      "• *expense* – log other vehicle expenses\n\n" +
+      "Set its fuel type with *fuel type diesel* or *fuel type petrol*."
     );
   }
 
@@ -335,7 +353,8 @@ async function handleAddVehicleCommand(userWhatsapp, fullText) {
   return (
     `✅ Vehicle *${registration}* added.\n\n` +
     "To use it as your active vehicle, list your vehicles with *my vehicles* " +
-    "then send e.g. *switch to 2*."
+    "then send e.g. *switch to 2*.\n\n" +
+    "You can set its fuel type with *fuel type diesel* or *fuel type petrol*."
   );
 }
 
@@ -352,7 +371,8 @@ async function handleMyVehiclesCommand(userWhatsapp) {
   let text = "🚗 *Your vehicles*:\n\n";
   text += formatVehiclesList(vehicles, true);
   text +=
-    "\n\nTo change your current vehicle, reply with e.g. *switch to 1* or *switch to 2*.";
+    "\n\nTo change your current vehicle, reply with e.g. *switch to 1* or *switch to 2*.\n" +
+    "You can also set fuel type for the current vehicle with *fuel type diesel* or *fuel type petrol*.";
 
   return text;
 }
@@ -419,6 +439,72 @@ async function handleSwitchVehicleCommand(userWhatsapp, fullText) {
   return (
     `✅ Okay, I’ll use *${reg}* as your *current vehicle*.\n\n` +
     "You can now log with *fuel*, *service*, or *expense*."
+  );
+}
+
+// Set fuel type for current vehicle
+async function handleSetFuelTypeCommand(userWhatsapp, fullText) {
+  const lower = fullText.toLowerCase();
+  let rest;
+  if (lower.startsWith("set fuel type")) {
+    rest = lower.slice("set fuel type".length).trim();
+  } else if (lower.startsWith("fuel type")) {
+    rest = lower.slice("fuel type".length).trim();
+  } else {
+    rest = "";
+  }
+
+  if (!rest) {
+    return (
+      "Please specify the fuel type as *diesel* or *petrol*.\n\n" +
+      "Example: *fuel type diesel*"
+    );
+  }
+
+  let normalized;
+  if (rest.includes("diesel")) {
+    normalized = "diesel";
+  } else if (rest.includes("petrol") || rest.includes("gasoline")) {
+    normalized = "petrol";
+  } else {
+    return (
+      "I only recognise *diesel* or *petrol* as fuel types.\n\n" +
+      "Example: *fuel type diesel*"
+    );
+  }
+
+  const vRes = await ensureCurrentVehicle(userWhatsapp);
+  if (vRes.status === "NO_VEHICLES") {
+    return (
+      "You don't have any vehicles yet.\n\n" +
+      "Add one first with *add vehicle KDA 123A*."
+    );
+  }
+  if (vRes.status === "NEED_SET_CURRENT") {
+    const listText = formatVehiclesList(vRes.list, true);
+    return (
+      "You have multiple vehicles.\n\n" +
+      listText +
+      "\n\nPlease choose which one to update by sending e.g. *switch to 1*, then send *fuel type diesel* again."
+    );
+  }
+
+  const vehicle = vRes.vehicle;
+
+  await pool.query(
+    `
+    UPDATE vehicles
+    SET fuel_type = $1,
+        updated_at = NOW()
+    WHERE id = $2
+  `,
+    [normalized, vehicle.id]
+  );
+
+  return (
+    "✅ Fuel type updated.\n\n" +
+    "Vehicle: *" + vehicle.registration + "*\n" +
+    "Fuel type: *" + normalized.toUpperCase() + "*"
   );
 }
 
@@ -1054,112 +1140,6 @@ async function handleAssignDriverCommand(userWhatsapp, fullText) {
   );
 }
 
-// Show which drivers are assigned to which vehicles
-async function handleDriverAssignmentsOverview(userWhatsapp) {
-  const res = await pool.query(
-    `
-    SELECT
-      v.registration,
-      v.nickname,
-      v.is_default,
-      d.full_name AS driver_name,
-      d.license_type,
-      d.license_expiry_date
-    FROM vehicles v
-    LEFT JOIN drivers d
-      ON v.driver_id = d.id
-    WHERE v.owner_whatsapp = $1
-      AND v.is_active = TRUE
-    ORDER BY v.created_at ASC
-    `,
-    [userWhatsapp]
-  );
-
-  const rows = res.rows;
-  if (rows.length === 0) {
-    return (
-      "You don't have any vehicles yet.\n\n" +
-      "Add one with:\n" +
-      "*add vehicle KDA 123A*"
-    );
-  }
-
-  let text = "🚘 *Vehicle → Driver assignments*\n";
-  rows.forEach((row, index) => {
-    const idx = index + 1;
-    const reg = row.registration;
-    const nick = row.nickname ? ` (${row.nickname})` : "";
-    const currentMark = row.is_default ? " ✅ (current)" : "";
-    const driverName = row.driver_name || "no driver assigned";
-    const licType = row.license_type || "n/a";
-    const exp = row.license_expiry_date
-      ? String(row.license_expiry_date).slice(0, 10)
-      : "n/a";
-
-    if (row.driver_name) {
-      text +=
-        `\n${idx}. *${reg}*${nick}${currentMark}\n` +
-        `   Driver: *${driverName}* – ${licType} (exp: ${exp})`;
-    } else {
-      text +=
-        `\n${idx}. *${reg}*${nick}${currentMark}\n` +
-        `   Driver: *none assigned*`;
-    }
-  });
-
-  text +=
-    "\n\nYou can assign with *assign driver X* and unassign with *unassign driver* for your current vehicle.";
-
-  return text;
-}
-
-// Unassign driver from CURRENT vehicle
-async function handleUnassignDriverCommand(userWhatsapp) {
-  const vRes = await ensureCurrentVehicle(userWhatsapp);
-
-  if (vRes.status === "NO_VEHICLES") {
-    return (
-      "You don't have any vehicles yet.\n\n" +
-      "Add one with: *add vehicle KDA 123A*"
-    );
-  } else if (vRes.status === "NEED_SET_CURRENT") {
-    const listText = formatVehiclesList(vRes.list, true);
-    return (
-      "You have multiple vehicles. Please choose which one you want as *current* first.\n\n" +
-      listText +
-      "\n\nReply with e.g. *switch to 1*, then send *unassign driver* again."
-    );
-  }
-
-  const vehicle = vRes.vehicle;
-
-  if (!vehicle.driver_id) {
-    return (
-      "Your current vehicle *" +
-      vehicle.registration +
-      "* does not have a driver assigned.\n\n" +
-      "You can assign one with *assign driver X* after listing drivers with *my drivers*."
-    );
-  }
-
-  await pool.query(
-    `
-    UPDATE vehicles
-    SET driver_id = NULL,
-        updated_at = NOW()
-    WHERE id = $1
-    `,
-    [vehicle.id]
-  );
-
-  return (
-    "✅ Driver unassigned from *" +
-    vehicle.registration +
-    "*.\n\n" +
-    "You can assign a new driver later with *assign driver X*."
-  );
-}
-
 // Driver licence compliance / report
 async function buildDriverComplianceReport(userWhatsapp) {
   const res = await pool.query(
@@ -1303,8 +1283,8 @@ async function buildDriverComplianceReport(userWhatsapp) {
   return text;
 }
 
-// ====== SIMPLE MOCKS FOR FUEL / SERVICE / EXPENSE ======
 // ====== LOGGING SESSION HELPERS (fuel step-by-step) ======
+
 async function getActiveFuelSession(userWhatsapp) {
   const res = await pool.query(
     `
@@ -1354,13 +1334,13 @@ async function startFuelSession(userWhatsapp) {
     [userWhatsapp]
   );
 
-  // Start a fresh fuel session
+  // Start a fresh fuel session (amount first)
   const res = await pool.query(
     `
     INSERT INTO logging_sessions (
       user_whatsapp, kind, state, vehicle_id, payload
     )
-    VALUES ($1, 'fuel', 'awaiting_litres', $2, '{}'::jsonb)
+    VALUES ($1, 'fuel', 'awaiting_total_cost', $2, '{}'::jsonb)
     RETURNING *
   `,
     [userWhatsapp, vehicle.id]
@@ -1372,7 +1352,7 @@ async function startFuelSession(userWhatsapp) {
     "⛽ Let's log fuel for *" +
     vehicle.registration +
     "*.\n\n" +
-    "How many litres did you put? (e.g. *30*)"
+    "How much did you spend in total on fuel? (e.g. *5400* KES)"
   );
 }
 
@@ -1396,13 +1376,13 @@ async function handleFuelSessionStep(session, incomingText) {
     return isNaN(n) ? NaN : n;
   }
 
-  if (state === "awaiting_litres") {
-    const litres = numOrNaN(raw);
-    if (!litres || !isFinite(litres)) {
-      return "Please send the *number of litres* as a number, e.g. *30*.";
+  if (state === "awaiting_total_cost") {
+    const total = numOrNaN(raw);
+    if (!total || !isFinite(total)) {
+      return "Please send the *total amount* spent on fuel as a number, e.g. *5400*.";
     }
 
-    payload.litres = litres;
+    payload.total_cost = total;
 
     await pool.query(
       `
@@ -1429,49 +1409,6 @@ async function handleFuelSessionStep(session, incomingText) {
     await pool.query(
       `
       UPDATE logging_sessions
-      SET state = 'awaiting_total_cost',
-          payload = $1,
-          updated_at = NOW()
-      WHERE id = $2
-    `,
-      [payload, session.id]
-    );
-
-    return "What was the *total cost* of the fuel? (e.g. *5400* KES)";
-  }
-
-  if (state === "awaiting_total_cost") {
-    const total = numOrNaN(raw);
-    if (!total || !isFinite(total)) {
-      return "Please send the *total cost* as a number, e.g. *5400*.";
-    }
-
-    payload.total_cost = total;
-
-    await pool.query(
-      `
-      UPDATE logging_sessions
-      SET state = 'awaiting_station',
-          payload = $1,
-          updated_at = NOW()
-      WHERE id = $2
-    `,
-      [payload, session.id]
-    );
-
-    return "Which *station* did you fuel at? (e.g. *Shell Ngong Road*)";
-  }
-
-  if (state === "awaiting_station") {
-    if (!raw) {
-      return "Please send the *station name*, e.g. *Shell Ngong Road*.";
-    }
-
-    payload.station_name = raw;
-
-    await pool.query(
-      `
-      UPDATE logging_sessions
       SET state = 'awaiting_odo',
           payload = $1,
           updated_at = NOW()
@@ -1490,6 +1427,31 @@ async function handleFuelSessionStep(session, incomingText) {
     }
 
     payload.odometer = odo;
+
+    await pool.query(
+      `
+      UPDATE logging_sessions
+      SET state = 'awaiting_notes',
+          payload = $1,
+          updated_at = NOW()
+      WHERE id = $2
+    `,
+      [payload, session.id]
+    );
+
+    return (
+      "Any short *note* to attach? (e.g. *Shell Ngong Road*, *night shift*, etc.)\n" +
+      "If you want to skip, reply with *skip*."
+    );
+  }
+
+  if (state === "awaiting_notes") {
+    const lower = raw.toLowerCase();
+    if (!raw || lower === "skip" || lower === "none") {
+      payload.notes = null;
+    } else {
+      payload.notes = raw;
+    }
 
     // Move to confirm step
     await pool.query(
@@ -1510,20 +1472,24 @@ async function handleFuelSessionStep(session, incomingText) {
 
     const reg = veh ? veh.registration : "this vehicle";
 
-    const litres = payload.litres ?? "?";
-    const price = payload.price_per_litre ?? "?";
-    const total = payload.total_cost ?? "?";
-    const station = payload.station_name || "?";
+    const total = payload.total_cost ? Number(payload.total_cost) : null;
+    const price = payload.price_per_litre ? Number(payload.price_per_litre) : null;
+    let litres = null;
+    if (total && price && price !== 0) {
+      litres = total / price;
+    }
+
     const odoVal = payload.odometer ?? "?";
+    const notes = payload.notes || "none";
 
     return (
       "Please confirm this fuel entry:\n\n" +
       "Vehicle: *" + reg + "*\n" +
-      "Litres: *" + litres + "*\n" +
-      "Price per litre: *" + price + "*\n" +
-      "Total cost: *" + total + "*\n" +
-      "Station: *" + station + "*\n" +
-      "Odometer: *" + odoVal + "*\n\n" +
+      "Amount spent: *" + (total ?? "?") + " KES*\n" +
+      "Price per litre: *" + (price ?? "?") + " KES*\n" +
+      "Estimated litres: *" + (litres ? litres.toFixed(2) : "?") + " L*\n" +
+      "Odometer: *" + odoVal + "*\n" +
+      "Note: *" + notes + "*\n\n" +
       "Reply *YES* to save or *NO* to cancel."
     );
   }
@@ -1546,44 +1512,40 @@ async function handleFuelSessionStep(session, incomingText) {
         ? await getVehicleById(session.vehicle_id)
         : null;
 
-      // Default ownership
-      const ownerWhatsapp = veh?.owner_whatsapp || userWhatsapp;
+      const userWhatsappToStore = userWhatsapp;
       const driverWhatsapp =
         veh && veh.owner_whatsapp && veh.owner_whatsapp !== userWhatsapp
           ? userWhatsapp
           : null;
 
-      const litres = payload.litres ? Number(payload.litres) : null;
+      const total = payload.total_cost ? Number(payload.total_cost) : null;
       let price = payload.price_per_litre
         ? Number(payload.price_per_litre)
         : null;
-      let total = payload.total_cost ? Number(payload.total_cost) : null;
+      let litres = null;
 
-      // If we only have two of the three, try to compute the third
-      if (litres && price && !total) {
-        total = litres * price;
-      } else if (litres && total && !price) {
-        price = total / litres;
+      if (total && price && price !== 0) {
+        litres = total / price;
       }
 
       await pool.query(
         `
         INSERT INTO fuel_logs (
-          vehicle_id, owner_whatsapp, driver_whatsapp,
+          vehicle_id, user_whatsapp, driver_whatsapp,
           litres, price_per_litre, total_cost,
           station_name, odometer, notes
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL)
+        VALUES ($1, $2, $3, $4, $5, $6, NULL, $7, $8)
       `,
         [
           session.vehicle_id,
-          ownerWhatsapp,
+          userWhatsappToStore,
           driverWhatsapp,
           litres,
           price,
           total,
-          payload.station_name || null,
-          payload.odometer ? Number(payload.odometer) : null
+          payload.odometer ? Number(payload.odometer) : null,
+          payload.notes || null
         ]
       );
 
@@ -1614,6 +1576,8 @@ async function handleFuelSessionStep(session, incomingText) {
   return "Something went wrong with this fuel entry, so I cancelled it. Please start again with *fuel*.";
 }
 
+// ====== SIMPLE MOCKS FOR SERVICE / EXPENSE (you can wire real flows later) ======
+
 async function handleServiceSessionStep(session, incomingText) {
   return "Service session handling not yet fully implemented in this backend. For now, follow the guidance I send in chat.";
 }
@@ -1622,7 +1586,7 @@ async function handleExpenseSessionStep(session, incomingText) {
   return "Expense session handling not yet fully implemented in this backend. For now, follow the guidance I send in chat.";
 }
 
-// ====== GLOBAL SESSION CANCEL (placeholder) ======
+// ====== GLOBAL SESSION CANCEL ======
 async function cancelAllSessionsForUser(userWhatsapp) {
   try {
     await pool.query(
@@ -1684,7 +1648,7 @@ async function callN8nAi(from, text) {
 
     console.log("🤖 Raw n8n AI response:", aiRes.status, aiRes.data);
 
-    let data = aiRes.data;
+    const data = aiRes.data;
 
     // Case 1: axios already parsed JSON object
     if (data && typeof data === "object") {
@@ -1698,36 +1662,11 @@ async function callN8nAi(from, text) {
       return null;
     }
 
-    // Case 2: n8n returned a plain string (may itself be JSON or quoted)
+    // Case 2: n8n returned a plain string
     if (typeof data === "string") {
-      let str = data.trim();
+      const str = data.trim();
       if (!str) return null;
-
-      // If it's JSON, try to parse and extract { reply: "..." }
-      if (str.startsWith("{") || str.startsWith("[")) {
-        try {
-          const parsed = JSON.parse(str);
-          if (
-            parsed &&
-            typeof parsed === "object" &&
-            typeof parsed.reply === "string"
-          ) {
-            return parsed.reply.trim();
-          }
-        } catch (e) {
-          // not JSON, fall through
-        }
-      }
-
-      // Strip wrapping quotes like "Hi ... " if present
-      if (
-        (str.startsWith('"') && str.endsWith('"')) ||
-        (str.startsWith("'") && str.endsWith("'"))
-      ) {
-        str = str.slice(1, -1);
-      }
-
-      return str.trim();
+      return str;
     }
 
     console.warn("⚠️ n8n AI response had no usable 'reply'/'text' string.");
@@ -1802,7 +1741,6 @@ app.post("/whatsapp/inbound", async (req, res) => {
 
     // If we already produced a reply (fuel session), skip the rest
     if (replyText) {
-      // Log assistant reply into memory and send via Twilio
       await logChatTurn(from, "assistant", replyText);
       console.log("💬 Reply:", replyText);
 
@@ -1826,13 +1764,10 @@ app.post("/whatsapp/inbound", async (req, res) => {
       return res.status(200).send("OK");
     }
 
+    // No active fuel session, route commands
     // DRIVER: accept invitation
     if (lower === "accept") {
       replyText = await handleDriverAccept(from);
-    }
-    // FUEL: start step-by-step flow
-    else if (lower === "fuel" || lower === "log fuel") {
-      replyText = await startFuelSession(from);
     }
     // QUICK "add" helper – menu of things you can add
     else if (lower === "add") {
@@ -1850,7 +1785,7 @@ app.post("/whatsapp/inbound", async (req, res) => {
         "Welcome to *Saka360* 👋\n" +
         "I help you track fuel, service, expenses and driver compliance for your vehicles.\n\n" +
         "Quick commands:\n" +
-        "• *fuel* – log fuel\n" +
+        "• *fuel* – log fuel step by step\n" +
         "• *service* – log service\n" +
         "• *expense* – log other costs\n" +
         "• *add vehicle* – register a vehicle\n" +
@@ -1889,6 +1824,17 @@ app.post("/whatsapp/inbound", async (req, res) => {
     } else if (lower.startsWith("switch")) {
       replyText = await handleSwitchVehicleCommand(from, text);
     }
+    // FUEL: start step-by-step flow (when not already in a session)
+    else if (lower === "fuel" || lower === "log fuel") {
+      replyText = await startFuelSession(from);
+    }
+    // FUEL TYPE for current vehicle
+    else if (
+      lower.startsWith("fuel type") ||
+      lower.startsWith("set fuel type")
+    ) {
+      replyText = await handleSetFuelTypeCommand(from, text);
+    }
     // DRIVER COMMANDS
     else if (lower.startsWith("add driver")) {
       replyText = await handleAddDriverCommand(from, text);
@@ -1896,35 +1842,9 @@ app.post("/whatsapp/inbound", async (req, res) => {
       replyText = await handleMyDriversCommand(from);
     } else if (lower.startsWith("assign driver")) {
       replyText = await handleAssignDriverCommand(from, text);
-    } else if (
-      lower === "driver assignments" ||
-      lower === "assignments" ||
-      lower.includes("which car is assigned to a driver") ||
-      lower.includes("see which car is assigned") ||
-      (lower.includes("driver") && lower.includes("assigned") && lower.includes("car"))
-    ) {
-      // Owner/fleet view: which driver is on which car
-      replyText = await handleDriverAssignmentsOverview(from);
-    } else if (
-      lower === "unassign driver" ||
-      lower === "remove driver" ||
-      (lower.includes("unassign") && lower.includes("driver"))
-    ) {
-      replyText = await handleUnassignDriverCommand(from);
     }
-    // DRIVER LICENCE COMMANDS + ADD LICENSE
-    else if (
-      lower === "add license" ||
-      lower === "add licence" ||
-      lower.includes("add license") ||
-      lower.includes("add licence")
-    ) {
-      replyText =
-        "To add a driving licence on *Saka360*, the driver must send their *Main DL* expiry date from their own WhatsApp number.\n\n" +
-        "Ask the driver to reply with:\n" +
-        "*dl main 2026-01-01*  (use their real expiry date)\n\n" +
-        "Once they add a valid Main DL, they’ll appear as *compliant* in your *driver report* and you can assign vehicles to them.";
-    } else if (lower.startsWith("dl ")) {
+    // DRIVER LICENCE COMMAND
+    else if (lower.startsWith("dl ")) {
       replyText = await handleDriverLicenceCommand(from, text);
     }
     // SIMPLE EDIT / DELETE HELPERS
@@ -1984,9 +1904,7 @@ app.post("/whatsapp/inbound", async (req, res) => {
       } else {
         replyText = await buildExpenseReport(from, {});
       }
-    }
-    // COMPLIANCE / LICENCE ROUTING
-    else if (
+    } else if (
       lower === "driver report" ||
       lower === "drivers report" ||
       lower === "driver compliance" ||
@@ -2010,42 +1928,8 @@ app.post("/whatsapp/inbound", async (req, res) => {
       lower === "license"
     ) {
       replyText = await handleMyOwnLicenceStatus(from);
-    }
-    // GENERIC "step by step" help for logging
-    else if (lower.includes("step by step")) {
-      replyText =
-        "Here’s how to log on *Saka360* step by step 👇\n\n" +
-        "⛽ *Fuel logging step by step*\n" +
-        "1️⃣ Make sure the correct vehicle is selected with *my vehicles* and *switch to X*.\n" +
-        "2️⃣ At the pump, note: litres, price per litre, total cost, station name, and odometer.\n" +
-        "3️⃣ Send everything in *one line* like:\n" +
-        "   *fuel 30L | 180 per litre | 5400 total | Shell Ngong Road | odo 123456*\n\n" +
-        "🛠️ *Service logging step by step*\n" +
-        "1️⃣ Choose the vehicle (*my vehicles*, then *switch to X* if needed).\n" +
-        "2️⃣ Note service type (minor, major), labour cost, parts cost, garage name, notes and odometer.\n" +
-        "3️⃣ Send:\n" +
-        "   *service major | 8500 labour | 12000 parts | Toyo Motors | notes: changed oil & filters | odo 145000*\n\n" +
-        "💸 *Expense logging step by step*\n" +
-        "1️⃣ Decide which vehicle the expense belongs to (same *my vehicles* logic).\n" +
-        "2️⃣ Note type (tyres, parking, repair etc.), amount, description, vendor and odometer if relevant.\n" +
-        "3️⃣ Send:\n" +
-        "   *expense tyres | 48000 | 4 new tyres | Sameer Park | odo 160000*\n\n" +
-        "In upcoming versions I’ll guide you through this interactively. For now, I use the one-line format above to keep your logs clean and consistent ✅.";
-    }
-    // REMINDERS / DOCUMENT EXPIRY
-    else if (
-      lower === "add reminder" ||
-      lower.includes("reminder") ||
-      lower.includes("expiry date") ||
-      lower.includes("expiration date")
-    ) {
-      replyText =
-        "Right now *Saka360* automatically focuses on *Driving Licence* expiry reminders via the *driver report* and each driver’s DL status.\n\n" +
-        "In upcoming versions you’ll also be able to store other documents (e.g. insurance, inspection, road licence) with reminder dates.\n\n" +
-        "For now, you can use the *notes* field in your *service* or *expense* logs to tag important dates, and I’ll keep those tied to each vehicle.";
-    }
-    // FALLBACK → n8n AI
-    else {
+    } else {
+      // Fallback: send to n8n AI
       const aiReply = await callN8nAi(from, text);
       if (aiReply && typeof aiReply === "string" && aiReply.trim().length > 0) {
         replyText = aiReply.trim();
