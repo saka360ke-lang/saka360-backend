@@ -1411,12 +1411,30 @@ app.post("/whatsapp/inbound", async (req, res) => {
         replyText = await buildExpenseReport(from, {});
       }
     } else if (
-      lower === "driver report" ||
-      lower === "drivers report" ||
-      lower === "driver compliance" ||
-      lower === "compliance"
-    ) {
-      replyText = await buildDriverComplianceReport(from);
+  lower === "driver report" ||
+  lower === "drivers report" ||
+  lower === "driver compliance" ||
+  lower === "compliance" ||
+  lower === "check licences" ||
+  lower === "check licenses"
+) {
+  // If this WhatsApp is a driver, show THEIR own licence status.
+  const driver = await findDriverByWhatsapp(from);
+  if (driver) {
+    replyText = await handleMyOwnLicenceStatus(from);
+  } else {
+    // Treat as owner / fleet compliance overview
+    replyText = await buildDriverComplianceReport(from);
+  }
+} else if (
+  lower === "my licence" ||
+  lower === "my license" ||
+  lower === "my dl" ||
+  lower === "licence" ||
+  lower === "license"
+) {
+  replyText = await handleMyOwnLicenceStatus(from);
+}
     } else {
       // Fallback: send to n8n AI
       const aiReply = await callN8nAi(from, text);
