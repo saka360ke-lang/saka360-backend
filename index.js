@@ -63,6 +63,19 @@ async function testDb() {
 }
 testDb();
 
+// 💾 CHAT LOGGING HELPER
+async function logChatTurn(userWhatsapp, role, message) {
+  try {
+    await pool.query(
+      `INSERT INTO chat_turns (user_whatsapp, role, message)
+       VALUES ($1, $2, $3)`,
+      [userWhatsapp, role, message]
+    );
+  } catch (err) {
+    console.error("❌ Failed to log chat turn:", err.message);
+  }
+}
+
 // ====== GENERIC HELPERS ======
 function parseNumber(text) {
   if (!text) return NaN;
@@ -157,7 +170,6 @@ function formatVehiclesList(vehicles, withIndices = true) {
 
   return text.trim();
 }
-
 async function handleAddVehicleCommand(userWhatsapp, fullText) {
   const base = "add vehicle";
   const lower = fullText.toLowerCase();
@@ -358,6 +370,7 @@ async function getUserDrivers(userWhatsapp) {
   );
   return res.rows;
 }
+
 // Format driver list (for WhatsApp display)
 function formatDriversList(drivers, withIndices = true) {
   if (!drivers || drivers.length === 0) {
@@ -415,7 +428,6 @@ function formatDriversList(drivers, withIndices = true) {
 
   return text.trim();
 }
-
 /**
  * ADD DRIVER (OWNER SIDE – INVITE)
  *
@@ -1044,10 +1056,6 @@ async function buildDriverComplianceReport(userWhatsapp) {
 }
 
 // ====== SIMPLE MOCKS FOR FUEL / SERVICE / EXPENSE ======
-// (You already had complex versions – keep those here if needed)
-// For now, we keep your "fuel", "service", "expense" TODO placeholders so the
-// main flow compiles, and the actual brain for guidance is n8n.
-
 async function handleFuelSessionStep(session, incomingText) {
   return "Fuel session handling not yet implemented in this trimmed version.";
 }
@@ -1062,8 +1070,6 @@ async function handleExpenseSessionStep(session, incomingText) {
 
 // ====== GLOBAL SESSION CANCEL (placeholder) ======
 async function cancelAllSessionsForUser(userWhatsapp) {
-  // If you still use fuel_sessions / service_sessions / expense_sessions tables,
-  // you can re-add the UPDATE queries here.
   return;
 }
 
@@ -1127,19 +1133,16 @@ async function callN8nAi(from, text) {
       return null;
     }
 
-    // 2) If n8n returned a STRING (which is what your logs show)
+    // 2) If n8n returned a STRING
     if (typeof data === "string") {
       const str = data.trim();
       if (!str) return null;
 
-      // Try to pull `"reply": "...."` out with a regex that tolerates newlines
-      // between the opening quote and the final closing quote.
       const match = str.match(/"reply"\s*:\s*"([\s\S]*)"[\s\r\n]*\}$/);
       if (match && match[1]) {
         return match[1].trim();
       }
 
-      // Fallback: just send the whole string
       return str;
     }
 
@@ -1168,6 +1171,11 @@ app.post("/whatsapp/inbound", async (req, res) => {
     const lower = text.toLowerCase();
 
     console.log("📩 Incoming:", { from, text });
+
+    // 💾 Log user message
+    if (from && text) {
+      await logChatTurn(from, "user", text);
+    }
 
     if (!text) {
       console.log("⚠️ Empty message body received from Twilio.");
@@ -1322,6 +1330,11 @@ app.post("/whatsapp/inbound", async (req, res) => {
     }
 
     console.log("💬 Reply:", replyText);
+
+    // 💾 Log assistant reply
+    if (from && replyText) {
+      await logChatTurn(from, "assistant", replyText);
+    }
 
     try {
       if (DISABLE_TWILIO_SEND === "true") {
