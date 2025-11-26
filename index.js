@@ -1331,10 +1331,95 @@ async function handleServiceSessionStep(sessionRow, incomingText) {
   }
 
   if (currentStep === "ask_notes") {
-    let notes = text;
-    if (lower === "skip") {
-      notes = "";
-    }
+  let notes = text;
+  if (lower === "skip") notes = "";
+
+  await updateSession({ notes }, "ask_reminder");
+
+  return (
+    "Would you like to set a reminder for the next service?\n\n" +
+    "Options:\n" +
+    "• *mileage 5000* – remind after 5000 km\n" +
+    "• *date 2025-06-10* – remind on a date\n" +
+    "• *skip* – no reminder\n\n" +
+    "Please type your choice."
+  );
+}
+
+if (currentStep === "ask_reminder") {
+  let reminderType = null;
+  let reminderValue = null;
+
+  if (lower.startsWith("mileage")) {
+    const m = lower.match(/mileage\s+(\d+)/);
+    if (!m) return "Please use: mileage 5000";
+    reminderType = "mileage";
+    reminderValue = m[1];
+  } else if (lower.startsWith("date")) {
+    const m = lower.match(/date\s+(\d{4}-\d{2}-\d{2})/);
+    if (!m) return "Please use: date YYYY-MM-DD";
+    reminderType = "date";
+    reminderValue = m[1];
+  } else if (lower === "skip") {
+    reminderType = null;
+    reminderValue = null;
+  } else {
+    return (
+      "Please choose one:\n" +
+      "• mileage 5000\n" +
+      "• date 2025-06-10\n" +
+      "• skip"
+    );
+  }
+
+  await updateSession(
+    {
+      reminder_type: reminderType,
+      reminder_value: reminderValue,
+    },
+    "confirm"
+  );
+
+  const s = sessionRow.state || {};
+  const vLabel = await getVehicleLabel();
+  const labour = s.labour_cost ?? "";
+  const parts = s.parts_cost ?? "";
+  const total = (labour || 0) + (parts || 0);
+  const notes = s.notes || "-";
+
+  return (
+    "Please confirm this service entry:\n\n" +
+    "Vehicle: *" +
+    vLabel +
+    "*\n" +
+    "Service type: *" +
+    s.service_type +
+    "*\n" +
+    "Labour: *" +
+    labour +
+    "* KES\n" +
+    "Parts: *" +
+    parts +
+    "* KES\n" +
+    "Total: *" +
+    total +
+    "* KES\n" +
+    "Garage: *" +
+    s.workshop_name +
+    "*\n" +
+    "Odometer: *" +
+    s.odometer +
+    "*\n" +
+    "Notes: " +
+    notes +
+    "\n\n" +
+    (reminderType
+      ? `Reminder set: *${reminderType} → ${reminderValue}*`
+      : "Reminder: *none*") +
+    "\n\n" +
+    "Reply *YES* to save or *NO* to cancel."
+  );
+}
 
     await updateSession({ notes }, "confirm");
 
