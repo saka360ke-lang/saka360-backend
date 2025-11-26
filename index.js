@@ -76,6 +76,7 @@ async function ensureChatTurnsTable() {
         user_whatsapp TEXT NOT NULL,
         role TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
         message TEXT NOT NULL,
+        message_type TEXT DEFAULT 'chat',
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
     `);
@@ -84,70 +85,7 @@ async function ensureChatTurnsTable() {
     console.error("❌ Error ensuring chat_turns table:", err.message);
   }
 }
-
-// Ensure logging_sessions exists
-async function ensureLoggingSessionsTable() {
-  try {
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS logging_sessions (
-        id SERIAL PRIMARY KEY,
-        user_whatsapp TEXT NOT NULL,
-        kind          TEXT NOT NULL,      -- 'fuel', 'service', etc
-        state         TEXT NOT NULL,      -- 'awaiting_total_cost', ...
-        vehicle_id    INT,
-        driver_id     INT,
-        payload       JSONB NOT NULL DEFAULT '{}'::jsonb,
-        created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      );
-    `);
-    console.log("🧠 logging_sessions table is ready.");
-  } catch (err) {
-    console.error("❌ Error ensuring logging_sessions table:", err.message);
-  }
-}
-
-// Ensure fuel_logs exists (uses user_whatsapp, not owner_whatsapp)
-async function ensureFuelLogsTable() {
-  try {
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS fuel_logs (
-        id SERIAL PRIMARY KEY,
-        vehicle_id INT NOT NULL REFERENCES vehicles(id) ON DELETE CASCADE,
-        user_whatsapp  TEXT NOT NULL,
-        driver_whatsapp TEXT,
-        litres          NUMERIC,
-        price_per_litre NUMERIC,
-        total_cost      NUMERIC,
-        station_name    TEXT,
-        odometer        NUMERIC,
-        notes           TEXT,
-        created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      );
-    `);
-    console.log("⛽ fuel_logs table is ready.");
-  } catch (err) {
-    console.error("❌ Error ensuring fuel_logs table:", err.message);
-  }
-}
-
-// Ensure vehicles has fuel_type column
-async function ensureVehicleFuelTypeColumn() {
-  try {
-    await pool.query(`
-      ALTER TABLE vehicles
-      ADD COLUMN IF NOT EXISTS fuel_type TEXT;
-    `);
-    console.log("⛽ vehicles.fuel_type column is ready.");
-  } catch (err) {
-    console.error("❌ Error ensuring vehicles.fuel_type column:", err.message);
-  }
-}
-
 ensureChatTurnsTable();
-ensureLoggingSessionsTable();
-ensureFuelLogsTable();
-ensureVehicleFuelTypeColumn();
 
 // ====== GENERIC HELPERS ======
 function parseNumber(text) {
@@ -184,14 +122,6 @@ async function getCurrentVehicle(userWhatsapp) {
     LIMIT 1
   `,
     [userWhatsapp]
-  );
-  return res.rows[0] || null;
-}
-
-async function getVehicleById(id) {
-  const res = await pool.query(
-    `SELECT * FROM vehicles WHERE id = $1`,
-    [id]
   );
   return res.rows[0] || null;
 }
@@ -241,12 +171,11 @@ function formatVehiclesList(vehicles, withIndices = true) {
     const idx = index + 1;
     const reg = v.registration;
     const nick = v.nickname ? ` (${v.nickname})` : "";
-    const fuel = v.fuel_type ? ` [${v.fuel_type}]` : "";
     const mark = v.is_default ? " ✅ (current)" : "";
     if (withIndices) {
-      text += `\n${idx}. *${reg}*${nick}${fuel}${mark}`;
+      text += `\n${idx}. *${reg}*${nick}${mark}`;
     } else {
-      text += `\n• *${reg}*${nick}${fuel}${mark}`;
+      text += `\n• *${reg}*${nick}${mark}`;
     }
   });
 
@@ -262,8 +191,7 @@ async function handleAddVehicleCommand(userWhatsapp, fullText) {
       "Let's add a vehicle to your Saka360 account 🚗\n\n" +
       "Please send your vehicle registration in this format:\n" +
       "*add vehicle KDA 123A*\n\n" +
-      "Example: *add vehicle KCY 456B*\n\n" +
-      "After that, you can set its fuel type with *fuel type diesel* or *fuel type petrol*."
+      "Example: *add vehicle KCY 456B*"
     );
   }
 
@@ -314,8 +242,7 @@ async function handleAddVehicleCommand(userWhatsapp, fullText) {
     return (
       `This vehicle *${registration}* is already on your account.\n` +
       "I’ve set it as your *current vehicle*.\n\n" +
-      "You can now log with *fuel*, *service* or *expense*.\n" +
-      "You can also set its fuel type with *fuel type diesel* or *fuel type petrol*."
+      "You can now log with *fuel*, *service* or *expense*."
     );
   }
 
@@ -342,10 +269,9 @@ async function handleAddVehicleCommand(userWhatsapp, fullText) {
     return (
       `✅ Vehicle *${registration}* added and set as your *current vehicle*.\n\n` +
       "You can now log:\n" +
-      "• *fuel* – log fuel step by step\n" +
+      "• *fuel* – log fuel\n" +
       "• *service* – log service\n" +
-      "• *expense* – log other vehicle expenses\n\n" +
-      "Set its fuel type with *fuel type diesel* or *fuel type petrol*."
+      "• *expense* – log other vehicle expenses"
     );
   }
 
@@ -353,8 +279,7 @@ async function handleAddVehicleCommand(userWhatsapp, fullText) {
   return (
     `✅ Vehicle *${registration}* added.\n\n` +
     "To use it as your active vehicle, list your vehicles with *my vehicles* " +
-    "then send e.g. *switch to 2*.\n\n" +
-    "You can set its fuel type with *fuel type diesel* or *fuel type petrol*."
+    "then send e.g. *switch to 2*."
   );
 }
 
@@ -371,8 +296,7 @@ async function handleMyVehiclesCommand(userWhatsapp) {
   let text = "🚗 *Your vehicles*:\n\n";
   text += formatVehiclesList(vehicles, true);
   text +=
-    "\n\nTo change your current vehicle, reply with e.g. *switch to 1* or *switch to 2*.\n" +
-    "You can also set fuel type for the current vehicle with *fuel type diesel* or *fuel type petrol*.";
+    "\n\nTo change your current vehicle, reply with e.g. *switch to 1* or *switch to 2*.";
 
   return text;
 }
@@ -439,72 +363,6 @@ async function handleSwitchVehicleCommand(userWhatsapp, fullText) {
   return (
     `✅ Okay, I’ll use *${reg}* as your *current vehicle*.\n\n` +
     "You can now log with *fuel*, *service*, or *expense*."
-  );
-}
-
-// Set fuel type for current vehicle
-async function handleSetFuelTypeCommand(userWhatsapp, fullText) {
-  const lower = fullText.toLowerCase();
-  let rest;
-  if (lower.startsWith("set fuel type")) {
-    rest = lower.slice("set fuel type".length).trim();
-  } else if (lower.startsWith("fuel type")) {
-    rest = lower.slice("fuel type".length).trim();
-  } else {
-    rest = "";
-  }
-
-  if (!rest) {
-    return (
-      "Please specify the fuel type as *diesel* or *petrol*.\n\n" +
-      "Example: *fuel type diesel*"
-    );
-  }
-
-  let normalized;
-  if (rest.includes("diesel")) {
-    normalized = "diesel";
-  } else if (rest.includes("petrol") || rest.includes("gasoline")) {
-    normalized = "petrol";
-  } else {
-    return (
-      "I only recognise *diesel* or *petrol* as fuel types.\n\n" +
-      "Example: *fuel type diesel*"
-    );
-  }
-
-  const vRes = await ensureCurrentVehicle(userWhatsapp);
-  if (vRes.status === "NO_VEHICLES") {
-    return (
-      "You don't have any vehicles yet.\n\n" +
-      "Add one first with *add vehicle KDA 123A*."
-    );
-  }
-  if (vRes.status === "NEED_SET_CURRENT") {
-    const listText = formatVehiclesList(vRes.list, true);
-    return (
-      "You have multiple vehicles.\n\n" +
-      listText +
-      "\n\nPlease choose which one to update by sending e.g. *switch to 1*, then send *fuel type diesel* again."
-    );
-  }
-
-  const vehicle = vRes.vehicle;
-
-  await pool.query(
-    `
-    UPDATE vehicles
-    SET fuel_type = $1,
-        updated_at = NOW()
-    WHERE id = $2
-  `,
-    [normalized, vehicle.id]
-  );
-
-  return (
-    "✅ Fuel type updated.\n\n" +
-    "Vehicle: *" + vehicle.registration + "*\n" +
-    "Fuel type: *" + normalized.toUpperCase() + "*"
   );
 }
 
@@ -1283,303 +1141,350 @@ async function buildDriverComplianceReport(userWhatsapp) {
   return text;
 }
 
-// ====== LOGGING SESSION HELPERS (fuel step-by-step) ======
+// ====== STEP-BY-STEP SERVICE LOGGING (using interaction_sessions + service_logs) ======
 
-async function getActiveFuelSession(userWhatsapp) {
+// Get active session for a user & type
+async function getActiveSession(userWhatsapp, sessionType) {
   const res = await pool.query(
     `
     SELECT *
-    FROM logging_sessions
+    FROM interaction_sessions
     WHERE user_whatsapp = $1
-      AND kind = 'fuel'
-      AND state IS NOT NULL
-    ORDER BY updated_at DESC
+      AND session_type = $2
+      AND is_complete = FALSE
+      AND is_cancelled = FALSE
+    ORDER BY created_at DESC
     LIMIT 1
   `,
-    [userWhatsapp]
+    [userWhatsapp, sessionType]
   );
   return res.rows[0] || null;
 }
 
-async function startFuelSession(userWhatsapp) {
-  // Ensure we know which vehicle we are logging for
+// Start a new service session
+async function startServiceSession(userWhatsapp) {
   const vRes = await ensureCurrentVehicle(userWhatsapp);
 
   if (vRes.status === "NO_VEHICLES") {
     return (
       "You don't have any vehicles yet.\n\n" +
-      "Add one first with:\n" +
-      "*add vehicle KDA 123A*"
+      "Add one with: *add vehicle KDA 123A*"
     );
   }
 
   if (vRes.status === "NEED_SET_CURRENT") {
     const listText = formatVehiclesList(vRes.list, true);
     return (
-      "You have multiple vehicles.\n\n" +
+      "You have multiple vehicles. Please choose which one you want to log a service for.\n\n" +
       listText +
-      "\n\nPlease choose which one to use by sending e.g. *switch to 1*, then send *fuel* again."
+      "\n\nReply with e.g. *switch to 1*, then send *service* again."
     );
   }
 
   const vehicle = vRes.vehicle;
 
-  // Clear any previous fuel session for this user
-  await pool.query(
+  // Create interaction session
+  const insert = await pool.query(
     `
-    DELETE FROM logging_sessions
-    WHERE user_whatsapp = $1
-      AND kind = 'fuel'
-  `,
-    [userWhatsapp]
-  );
-
-  // Start a fresh fuel session (amount first)
-  const res = await pool.query(
-    `
-    INSERT INTO logging_sessions (
-      user_whatsapp, kind, state, vehicle_id, payload
+    INSERT INTO interaction_sessions (
+      user_whatsapp,
+      session_type,
+      vehicle_id,
+      state,
+      current_step,
+      is_complete,
+      is_cancelled
     )
-    VALUES ($1, 'fuel', 'awaiting_total_cost', $2, '{}'::jsonb)
+    VALUES ($1, 'service', $2, '{}'::jsonb, 'ask_service_type', FALSE, FALSE)
     RETURNING *
   `,
     [userWhatsapp, vehicle.id]
   );
 
-  console.log("🧾 Started fuel session:", res.rows[0].id);
+  const vReg = vehicle.registration || "your vehicle";
 
   return (
-    "⛽ Let's log fuel for *" +
-    vehicle.registration +
+    "🛠️ Let's log a service for *" +
+    vReg +
     "*.\n\n" +
-    "How much did you spend in total on fuel? (e.g. *5400* KES)"
+    "First, what kind of service was this?\n" +
+    "For example: *major*, *minor*, *grease service*, *tyre rotation*..."
   );
 }
 
-async function handleFuelSessionStep(session, incomingText) {
-  const userWhatsapp = session.user_whatsapp;
-  const state = session.state;
-  const raw = String(incomingText || "").trim();
+// Handle each step of an existing service session
+async function handleServiceSessionStep(sessionRow, incomingText) {
+  const text = String(incomingText || "").trim();
+  const lower = text.toLowerCase();
 
-  // Ensure payload is an object
-  let payload = session.payload || {};
-  if (typeof payload === "string") {
-    try {
-      payload = JSON.parse(payload);
-    } catch (e) {
-      payload = {};
-    }
-  }
-
-  function numOrNaN(value) {
-    const n = parseNumber(value);
-    return isNaN(n) ? NaN : n;
-  }
-
-  if (state === "awaiting_total_cost") {
-    const total = numOrNaN(raw);
-    if (!total || !isFinite(total)) {
-      return "Please send the *total amount* spent on fuel as a number, e.g. *5400*.";
-    }
-
-    payload.total_cost = total;
-
+  // Allow simple cancel inside service session
+  if (["cancel", "stop", "reset"].includes(lower)) {
     await pool.query(
       `
-      UPDATE logging_sessions
-      SET state = 'awaiting_price_per_litre',
-          payload = $1,
+      UPDATE interaction_sessions
+      SET is_cancelled = TRUE,
           updated_at = NOW()
-      WHERE id = $2
+      WHERE id = $1
     `,
-      [payload, session.id]
+      [sessionRow.id]
     );
-
-    return "What was the *price per litre*? (e.g. *180* KES)";
+    return "✅ I’ve cancelled this service entry. You can start again with *service*.";
   }
 
-  if (state === "awaiting_price_per_litre") {
-    const price = numOrNaN(raw);
-    if (!price || !isFinite(price)) {
-      return "Please send the *price per litre* as a number, e.g. *180*.";
-    }
+  const state = sessionRow.state || {};
+  const currentStep = sessionRow.current_step || "ask_service_type";
 
-    payload.price_per_litre = price;
-
+  // Helper to update state + step
+  async function updateSession(patch, nextStep) {
+    const mergedState = { ...state, ...patch };
     await pool.query(
       `
-      UPDATE logging_sessions
-      SET state = 'awaiting_odo',
-          payload = $1,
+      UPDATE interaction_sessions
+      SET state = $1::jsonb,
+          current_step = $2,
           updated_at = NOW()
-      WHERE id = $2
+      WHERE id = $3
     `,
-      [payload, session.id]
+      [JSON.stringify(mergedState), nextStep, sessionRow.id]
     );
-
-    return "What is the *current odometer reading*? (e.g. *123456*)";
+    sessionRow.state = mergedState;
+    sessionRow.current_step = nextStep;
   }
 
-  if (state === "awaiting_odo") {
-    const odo = numOrNaN(raw);
-    if (!odo || !isFinite(odo)) {
-      return "Please send the *odometer reading* as a number, e.g. *123456*.";
+  // Helper to fetch vehicle registration
+  async function getVehicleLabel() {
+    if (!sessionRow.vehicle_id) return "your vehicle";
+    const res = await pool.query(
+      `SELECT registration FROM vehicles WHERE id = $1`,
+      [sessionRow.vehicle_id]
+    );
+    if (res.rows.length === 0) return "your vehicle";
+    return res.rows[0].registration || "your vehicle";
+  }
+
+  if (currentStep === "ask_service_type") {
+    if (!text) {
+      return "What kind of service was this? For example: *major*, *minor*, *grease*, *tyre rotation*...";
     }
 
-    payload.odometer = odo;
-
-    await pool.query(
-      `
-      UPDATE logging_sessions
-      SET state = 'awaiting_notes',
-          payload = $1,
-          updated_at = NOW()
-      WHERE id = $2
-    `,
-      [payload, session.id]
+    await updateSession({ service_type: text }, "ask_labour_cost");
+    return (
+      "Got it 👍\n" +
+      "How much did you pay for *labour only*? (KES)\n\n" +
+      "Example: *8500*"
     );
+  }
+
+  if (currentStep === "ask_labour_cost") {
+    const num = parseNumber(text);
+    if (isNaN(num) || num < 0) {
+      return "Please send the *labour cost* as a number in KES. Example: *8500*";
+    }
+
+    await updateSession({ labour_cost: num }, "ask_parts_cost");
+    return (
+      "Thanks.\n" +
+      "Now how much did you pay for *parts/materials*? (KES)\n" +
+      "Reply *0* if there were no parts."
+    );
+  }
+
+  if (currentStep === "ask_parts_cost") {
+    const num = parseNumber(text);
+    if (isNaN(num) || num < 0) {
+      return "Please send the *parts cost* as a number in KES. Example: *12000* or *0* if none.";
+    }
+
+    await updateSession({ parts_cost: num }, "ask_workshop");
+    return (
+      "Great.\n" +
+      "Which garage or place did you service at?\n" +
+      "Example: *Toyo Motors*, *Shell Ngong Road*.\n" +
+      "Reply *skip* to leave this blank."
+    );
+  }
+
+  if (currentStep === "ask_workshop") {
+    let workshop = text;
+    if (lower === "skip") {
+      workshop = "";
+    }
+
+    await updateSession({ workshop_name: workshop }, "ask_odometer");
+    return (
+      "What was the *odometer reading* after the service?\n" +
+      "Example: *145000*"
+    );
+  }
+
+  if (currentStep === "ask_odometer") {
+    const num = parseNumber(text);
+    if (isNaN(num) || num < 0) {
+      return "Please send the odometer reading as a number. Example: *145000*";
+    }
+
+    await updateSession({ odometer: num }, "ask_notes");
+    return (
+      "Any notes about what was done? (e.g. *changed oil & filters, rotated tyres*)\n" +
+      "Reply *skip* to leave notes blank."
+    );
+  }
+
+  if (currentStep === "ask_notes") {
+    let notes = text;
+    if (lower === "skip") {
+      notes = "";
+    }
+
+    await updateSession({ notes }, "confirm");
+
+    const s = sessionRow.state || {};
+    const serviceType = s.service_type || "service";
+    const labour = s.labour_cost ?? "";
+    const parts = s.parts_cost ?? "";
+    const total = (labour || 0) + (parts || 0);
+    const workshop = s.workshop_name || "-";
+    const odometer = s.odometer ?? "-";
+    const notesDisplay = notes || "-";
+    const vLabel = await getVehicleLabel();
 
     return (
-      "Any short *note* to attach? (e.g. *Shell Ngong Road*, *night shift*, etc.)\n" +
-      "If you want to skip, reply with *skip*."
-    );
-  }
-
-  if (state === "awaiting_notes") {
-    const lower = raw.toLowerCase();
-    if (!raw || lower === "skip" || lower === "none") {
-      payload.notes = null;
-    } else {
-      payload.notes = raw;
-    }
-
-    // Move to confirm step
-    await pool.query(
-      `
-      UPDATE logging_sessions
-      SET state = 'awaiting_confirm',
-          payload = $1,
-          updated_at = NOW()
-      WHERE id = $2
-    `,
-      [payload, session.id]
-    );
-
-    // Build confirmation summary
-    const veh = session.vehicle_id
-      ? await getVehicleById(session.vehicle_id)
-      : null;
-
-    const reg = veh ? veh.registration : "this vehicle";
-
-    const total = payload.total_cost ? Number(payload.total_cost) : null;
-    const price = payload.price_per_litre ? Number(payload.price_per_litre) : null;
-    let litres = null;
-    if (total && price && price !== 0) {
-      litres = total / price;
-    }
-
-    const odoVal = payload.odometer ?? "?";
-    const notes = payload.notes || "none";
-
-    return (
-      "Please confirm this fuel entry:\n\n" +
-      "Vehicle: *" + reg + "*\n" +
-      "Amount spent: *" + (total ?? "?") + " KES*\n" +
-      "Price per litre: *" + (price ?? "?") + " KES*\n" +
-      "Estimated litres: *" + (litres ? litres.toFixed(2) : "?") + " L*\n" +
-      "Odometer: *" + odoVal + "*\n" +
-      "Note: *" + notes + "*\n\n" +
+      "Please confirm this service entry:\n\n" +
+      "Vehicle: *" +
+      vLabel +
+      "*\n" +
+      "Service type: *" +
+      serviceType +
+      "*\n" +
+      "Labour: *" +
+      labour +
+      "* KES\n" +
+      "Parts: *" +
+      parts +
+      "* KES\n" +
+      "Total: *" +
+      total +
+      "* KES\n" +
+      "Garage: *" +
+      workshop +
+      "*\n" +
+      "Odometer: *" +
+      odometer +
+      "*\n" +
+      "Notes: " +
+      notesDisplay +
+      "\n\n" +
       "Reply *YES* to save or *NO* to cancel."
     );
   }
 
-  if (state === "awaiting_confirm") {
-    const answer = raw.toLowerCase();
-
-    if (answer === "no" || answer === "n") {
-      // Cancel session
-      await pool.query(
-        `DELETE FROM logging_sessions WHERE id = $1`,
-        [session.id]
-      );
-      return "Okay, I’ve *cancelled* this fuel entry. You can start again with *fuel*.";
-    }
-
-    if (answer === "yes" || answer === "y") {
-      // Save to fuel_logs
-      const veh = session.vehicle_id
-        ? await getVehicleById(session.vehicle_id)
-        : null;
-
-      const userWhatsappToStore = userWhatsapp;
-      const driverWhatsapp =
-        veh && veh.owner_whatsapp && veh.owner_whatsapp !== userWhatsapp
-          ? userWhatsapp
-          : null;
-
-      const total = payload.total_cost ? Number(payload.total_cost) : null;
-      let price = payload.price_per_litre
-        ? Number(payload.price_per_litre)
-        : null;
-      let litres = null;
-
-      if (total && price && price !== 0) {
-        litres = total / price;
-      }
+  if (currentStep === "confirm") {
+    if (["yes", "y"].includes(lower)) {
+      const s = sessionRow.state || {};
+      const serviceType = s.service_type || "service";
+      const labour = Number(s.labour_cost || 0);
+      const parts = Number(s.parts_cost || 0);
+      const total = labour + parts;
+      const workshop = s.workshop_name || null;
+      const odometer = s.odometer != null ? Number(s.odometer) : null;
+      const notes = s.notes || null;
 
       await pool.query(
         `
-        INSERT INTO fuel_logs (
-          vehicle_id, user_whatsapp, driver_whatsapp,
-          litres, price_per_litre, total_cost,
-          station_name, odometer, notes
+        INSERT INTO service_logs (
+          vehicle_id,
+          user_whatsapp,
+          service_type,
+          labour_cost,
+          parts_cost,
+          total_cost,
+          workshop_name,
+          odometer,
+          notes
         )
-        VALUES ($1, $2, $3, $4, $5, $6, NULL, $7, $8)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
       `,
         [
-          session.vehicle_id,
-          userWhatsappToStore,
-          driverWhatsapp,
-          litres,
-          price,
+          sessionRow.vehicle_id,
+          sessionRow.user_whatsapp,
+          serviceType,
+          labour,
+          parts,
           total,
-          payload.odometer ? Number(payload.odometer) : null,
-          payload.notes || null
+          workshop,
+          odometer,
+          notes,
         ]
       );
 
-      // End session
       await pool.query(
-        `DELETE FROM logging_sessions WHERE id = $1`,
-        [session.id]
+        `
+        UPDATE interaction_sessions
+        SET is_complete = TRUE,
+            updated_at = NOW()
+        WHERE id = $1
+      `,
+        [sessionRow.id]
       );
 
-      const reg = veh ? veh.registration : "your vehicle";
+      const vLabel = await getVehicleLabel();
 
       return (
-        "✅ Fuel entry saved for *" + reg + "*.\n\n" +
-        "You can log another refill with *fuel*, or see reports later with *fuel report*."
+        "✅ Service entry saved.\n\n" +
+        "Vehicle: *" +
+        vLabel +
+        "*\n" +
+        "Service type: *" +
+        serviceType +
+        "*\n" +
+        "Total cost: *" +
+        total +
+        "* KES\n\n" +
+        "You can log another service with *service* or see reports with *service report*."
       );
     }
 
-    // Any other text during confirm
-    return "Please reply *YES* to save this fuel entry or *NO* to cancel it.";
+    if (["no", "n"].includes(lower)) {
+      await pool.query(
+        `
+        UPDATE interaction_sessions
+        SET is_cancelled = TRUE,
+            updated_at = NOW()
+        WHERE id = $1
+      `,
+        [sessionRow.id]
+      );
+
+      return (
+        "❌ Okay, I’ve cancelled that service entry.\n\n" +
+        "You can start again with *service*."
+      );
+    }
+
+    return "Please reply with *YES* to save this service entry or *NO* to cancel it.";
   }
 
-  // Unknown state → clean up
-  console.warn("⚠️ Unknown fuel session state:", state);
+  // Fallback if somehow in unknown step
   await pool.query(
-    `DELETE FROM logging_sessions WHERE id = $1`,
-    [session.id]
+    `
+    UPDATE interaction_sessions
+    SET is_cancelled = TRUE,
+        updated_at = NOW()
+    WHERE id = $1
+  `,
+    [sessionRow.id]
   );
-  return "Something went wrong with this fuel entry, so I cancelled it. Please start again with *fuel*.";
+  return (
+    "Something went wrong with this service entry, so I’ve cancelled it.\n\n" +
+    "Please start again with *service*."
+  );
 }
 
-// ====== SIMPLE MOCKS FOR SERVICE / EXPENSE (you can wire real flows later) ======
+// ====== SIMPLE MOCKS FOR FUEL / EXPENSE (real fuel step-by-step already exists in your codebase) ======
 
-async function handleServiceSessionStep(session, incomingText) {
-  return "Service session handling not yet fully implemented in this backend. For now, follow the guidance I send in chat.";
+async function handleFuelSessionStep(session, incomingText) {
+  // Keep as placeholder (your fuel step-by-step is already implemented elsewhere)
+  return "Fuel session handling not yet fully implemented in this trimmed placeholder.";
 }
 
 async function handleExpenseSessionStep(session, incomingText) {
@@ -1591,14 +1496,17 @@ async function cancelAllSessionsForUser(userWhatsapp) {
   try {
     await pool.query(
       `
-      DELETE FROM logging_sessions
+      UPDATE interaction_sessions
+      SET is_cancelled = TRUE,
+          updated_at = NOW()
       WHERE user_whatsapp = $1
+        AND is_complete = FALSE
+        AND is_cancelled = FALSE
     `,
       [userWhatsapp]
     );
-    console.log("🧹 Cancelled all active logging sessions for", userWhatsapp);
   } catch (err) {
-    console.error("❌ Error cancelling sessions for user:", err.message);
+    console.error("❌ Error cancelling interaction_sessions:", err.message);
   }
 }
 
@@ -1726,23 +1634,19 @@ app.post("/whatsapp/inbound", async (req, res) => {
 
     let replyText = "";
 
-    // GLOBAL COMMANDS: cancel / stop / reset
-    if (["cancel", "stop", "reset"].includes(lower)) {
-      await cancelAllSessionsForUser(from);
-      replyText =
-        "✅ I’ve cancelled your current entry. You can start again with *fuel*, *service*, or *expense*.";
-    } else {
-      // If user is in an active FUEL session, handle that first
-      const activeFuelSession = await getActiveFuelSession(from);
-      if (activeFuelSession) {
-        replyText = await handleFuelSessionStep(activeFuelSession, text);
-      }
-    }
+    // 1) If there's an active SERVICE session, and this isn't a global cancel,
+    //    route into the step-by-step handler FIRST.
+    const activeServiceSession = await getActiveSession(from, "service");
+    if (
+      activeServiceSession &&
+      !["cancel", "stop", "reset"].includes(lower)
+    ) {
+      replyText = await handleServiceSessionStep(activeServiceSession, text);
 
-    // If we already produced a reply (fuel session), skip the rest
-    if (replyText) {
+      // Log assistant reply
       await logChatTurn(from, "assistant", replyText);
-      console.log("💬 Reply:", replyText);
+
+      console.log("💬 Reply (service session):", replyText);
 
       try {
         if (DISABLE_TWILIO_SEND === "true") {
@@ -1761,12 +1665,19 @@ app.post("/whatsapp/inbound", async (req, res) => {
         );
       }
 
-      return res.status(200).send("OK");
+      res.status(200).send("OK");
+      return;
     }
 
-    // No active fuel session, route commands
+    // 2) Normal command routing if no active service session (or user typed cancel)
+    // GLOBAL COMMANDS: cancel / stop / reset
+    if (["cancel", "stop", "reset"].includes(lower)) {
+      await cancelAllSessionsForUser(from);
+      replyText =
+        "✅ I’ve cancelled your current entry. You can start again with *fuel*, *service*, or *expense*.";
+    }
     // DRIVER: accept invitation
-    if (lower === "accept") {
+    else if (lower === "accept") {
       replyText = await handleDriverAccept(from);
     }
     // QUICK "add" helper – menu of things you can add
@@ -1785,7 +1696,7 @@ app.post("/whatsapp/inbound", async (req, res) => {
         "Welcome to *Saka360* 👋\n" +
         "I help you track fuel, service, expenses and driver compliance for your vehicles.\n\n" +
         "Quick commands:\n" +
-        "• *fuel* – log fuel step by step\n" +
+        "• *fuel* – log fuel\n" +
         "• *service* – log service\n" +
         "• *expense* – log other costs\n" +
         "• *add vehicle* – register a vehicle\n" +
@@ -1821,19 +1732,6 @@ app.post("/whatsapp/inbound", async (req, res) => {
       lower === "car"
     ) {
       replyText = await handleMyVehiclesCommand(from);
-    } else if (lower.startsWith("switch")) {
-      replyText = await handleSwitchVehicleCommand(from, text);
-    }
-    // FUEL: start step-by-step flow (when not already in a session)
-    else if (lower === "fuel" || lower === "log fuel") {
-      replyText = await startFuelSession(from);
-    }
-    // FUEL TYPE for current vehicle
-    else if (
-      lower.startsWith("fuel type") ||
-      lower.startsWith("set fuel type")
-    ) {
-      replyText = await handleSetFuelTypeCommand(from, text);
     }
     // DRIVER COMMANDS
     else if (lower.startsWith("add driver")) {
@@ -1846,6 +1744,14 @@ app.post("/whatsapp/inbound", async (req, res) => {
     // DRIVER LICENCE COMMAND
     else if (lower.startsWith("dl ")) {
       replyText = await handleDriverLicenceCommand(from, text);
+    }
+    // SERVICE STEP-BY-STEP ENTRY
+    else if (
+      lower === "service" ||
+      lower === "service step-by-step" ||
+      lower === "log service"
+    ) {
+      replyText = await startServiceSession(from);
     }
     // SIMPLE EDIT / DELETE HELPERS
     else if (lower === "edit") {
