@@ -89,21 +89,33 @@ async function ensureChatTurnsTable() {
 }
 ensureChatTurnsTable();
 
-// Ensure vehicle doc tables (idempotent)
+// Ensure vehicle doc tables (idempotent + add missing columns)
 async function ensureVehicleDocumentTables() {
   try {
-    // NOTE: no user_whatsapp here – matches your current table
+    // Base definition for fresh installs
     await pool.query(`
       CREATE TABLE IF NOT EXISTS vehicle_documents (
         id              SERIAL PRIMARY KEY,
         vehicle_id      INTEGER NOT NULL,
-        title           TEXT NOT NULL,
+        title           TEXT,
         cost            NUMERIC,
         expiry_date     DATE,
         notes           TEXT,
         created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
+    `);
+
+    // Ensure required columns exist even if table was created earlier with a different schema
+    await pool.query(`
+      ALTER TABLE vehicle_documents
+        ADD COLUMN IF NOT EXISTS vehicle_id INTEGER,
+        ADD COLUMN IF NOT EXISTS title TEXT,
+        ADD COLUMN IF NOT EXISTS cost NUMERIC,
+        ADD COLUMN IF NOT EXISTS expiry_date DATE,
+        ADD COLUMN IF NOT EXISTS notes TEXT,
+        ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
     `);
 
     await pool.query(`
@@ -120,6 +132,21 @@ async function ensureVehicleDocumentTables() {
         created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
+    `);
+
+    // Also ensure all expected columns exist on sessions (if table previously existed)
+    await pool.query(`
+      ALTER TABLE vehicle_document_sessions
+        ADD COLUMN IF NOT EXISTS user_whatsapp TEXT,
+        ADD COLUMN IF NOT EXISTS vehicle_id INTEGER,
+        ADD COLUMN IF NOT EXISTS step TEXT,
+        ADD COLUMN IF NOT EXISTS title TEXT,
+        ADD COLUMN IF NOT EXISTS cost NUMERIC,
+        ADD COLUMN IF NOT EXISTS expiry_date DATE,
+        ADD COLUMN IF NOT EXISTS notes TEXT,
+        ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active',
+        ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
     `);
 
     console.log("📄 vehicle_documents & vehicle_document_sessions tables are ready.");
@@ -189,7 +216,6 @@ async function ensureCurrentVehicle(userWhatsapp) {
 
   // No default yet
   if (vehicles.length === 1) {
-    // autoselect single vehicle
     const only = vehicles[0];
     await pool.query(
       `UPDATE vehicles SET is_default = TRUE WHERE id = $1`,
@@ -2787,7 +2813,7 @@ app.post("/whatsapp/inbound", async (req, res) => {
         "• *my vehicles* – see and switch current vehicle\n" +
         "• *my drivers* – see drivers and their licence status\n" +
         "• *assign driver 1* – assign driver 1 to your current vehicle\n" +
-        "• *driver report* – see licence compliance overview\n\n" +
+        "• *driver report* – see driver licence compliance overview\n\n" +
         "You can also type normal questions like:\n" +
         "• *How do I log fuel?*\n" +
         "• *How do I add a fleet account?*\n" +
