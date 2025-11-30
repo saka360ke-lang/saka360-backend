@@ -92,10 +92,10 @@ ensureChatTurnsTable();
 // Ensure vehicle doc tables (idempotent)
 async function ensureVehicleDocumentTables() {
   try {
+    // NOTE: no user_whatsapp here – matches your current table
     await pool.query(`
       CREATE TABLE IF NOT EXISTS vehicle_documents (
         id              SERIAL PRIMARY KEY,
-        user_whatsapp   TEXT NOT NULL,
         vehicle_id      INTEGER NOT NULL,
         title           TEXT NOT NULL,
         cost            NUMERIC,
@@ -1183,7 +1183,7 @@ async function getActiveFuelSession(userWhatsapp) {
       SELECT *
       FROM fuel_sessions
       WHERE user_whatsapp = $1
-        AND status = 'active'
+        AND step NOT IN ('completed', 'cancelled', 'error')
       ORDER BY created_at DESC
       LIMIT 1
       `,
@@ -1209,7 +1209,6 @@ async function saveFuelSession(session) {
         station = $6,
         odometer = $7,
         notes = $8,
-        status = $9,
         updated_at = NOW()
       WHERE id = $1
       `,
@@ -1222,7 +1221,6 @@ async function saveFuelSession(session) {
         session.station || null,
         session.odometer != null ? session.odometer : null,
         session.notes || null,
-        session.status || "active",
       ]
     );
   } catch (err) {
@@ -1261,10 +1259,9 @@ async function startFuelSession(userWhatsapp) {
     INSERT INTO fuel_sessions (
       user_whatsapp,
       vehicle_id,
-      step,
-      status
+      step
     )
-    VALUES ($1, $2, 'ask_total', 'active')
+    VALUES ($1, $2, 'ask_total')
     RETURNING *
     `,
     [userWhatsapp, vehicle.id]
@@ -1287,7 +1284,7 @@ async function handleFuelSessionStep(session, incomingText) {
   const lower = text.toLowerCase();
 
   if (["cancel", "stop", "reset"].includes(lower)) {
-    session.status = "cancelled";
+    session.step = "cancelled";
     await saveFuelSession(session);
     return (
       "✅ I’ve cancelled your fuel entry.\n" +
@@ -1324,10 +1321,7 @@ async function handleFuelSessionStep(session, incomingText) {
     session.step = "ask_price";
     await saveFuelSession(session);
 
-    return (
-      "What was the *price per litre*? (KES)\n" +
-      "Example: *180*"
-    );
+    return "What was the *price per litre*? (KES)\nExample: *180*";
   }
 
   if (session.step === "ask_price") {
@@ -1480,7 +1474,7 @@ async function handleFuelSessionStep(session, incomingText) {
           ]
         );
 
-        session.status = "completed";
+        session.step = "completed";
         await saveFuelSession(session);
 
         const totalStr =
@@ -1525,7 +1519,7 @@ async function handleFuelSessionStep(session, incomingText) {
         );
       } catch (err) {
         console.error("❌ Error saving fuel log:", err.message);
-        session.status = "error";
+        session.step = "error";
         await saveFuelSession(session);
         return (
           "Sorry, I couldn't save that fuel entry due to a system error.\n" +
@@ -1535,7 +1529,7 @@ async function handleFuelSessionStep(session, incomingText) {
     }
 
     if (["no", "n"].includes(lower)) {
-      session.status = "cancelled";
+      session.step = "cancelled";
       await saveFuelSession(session);
       return (
         "Okay, I’ve *cancelled* that fuel entry.\n" +
@@ -1547,7 +1541,7 @@ async function handleFuelSessionStep(session, incomingText) {
   }
 
   console.warn("⚠️ Fuel session in unknown step:", session.step);
-  session.status = "error";
+  session.step = "error";
   await saveFuelSession(session);
   return (
     "Something went wrong with this fuel entry.\n" +
@@ -1564,7 +1558,7 @@ async function getActiveServiceSession(userWhatsapp) {
       SELECT *
       FROM service_sessions
       WHERE user_whatsapp = $1
-        AND status = 'active'
+        AND step NOT IN ('completed', 'cancelled', 'error')
       ORDER BY created_at DESC
       LIMIT 1
       `,
@@ -1593,7 +1587,6 @@ async function saveServiceSession(session) {
         notes = $9,
         reminder_type = $10,
         reminder_value = $11,
-        status = $12,
         updated_at = NOW()
       WHERE id = $1
       `,
@@ -1609,7 +1602,6 @@ async function saveServiceSession(session) {
         session.notes || null,
         session.reminder_type || null,
         session.reminder_value || null,
-        session.status || "active",
       ]
     );
   } catch (err) {
@@ -1648,10 +1640,9 @@ async function startServiceSession(userWhatsapp) {
     INSERT INTO service_sessions (
       user_whatsapp,
       vehicle_id,
-      step,
-      status
+      step
     )
-    VALUES ($1, $2, 'ask_type', 'active')
+    VALUES ($1, $2, 'ask_type')
     RETURNING *
     `,
     [userWhatsapp, vehicle.id]
@@ -1674,7 +1665,7 @@ async function handleServiceSessionStep(session, incomingText) {
   const lower = text.toLowerCase();
 
   if (["cancel", "stop", "reset"].includes(lower)) {
-    session.status = "cancelled";
+    session.step = "cancelled";
     await saveServiceSession(session);
     return (
       "✅ I’ve cancelled your service entry.\n" +
@@ -1925,7 +1916,7 @@ async function handleServiceSessionStep(session, incomingText) {
     }
 
     if (["no", "n"].includes(lower)) {
-      session.status = "cancelled";
+      session.step = "cancelled";
       await saveServiceSession(session);
       return (
         "Okay, I’ve *cancelled* that service entry.\n" +
@@ -2033,7 +2024,7 @@ async function handleServiceSessionStep(session, incomingText) {
           }
         }
 
-        session.status = "completed";
+        session.step = "completed";
         await saveServiceSession(session);
 
         return (
@@ -2069,7 +2060,7 @@ async function handleServiceSessionStep(session, incomingText) {
         );
       } catch (err) {
         console.error("❌ Error saving service log:", err.message);
-        session.status = "error";
+        session.step = "error";
         await saveServiceSession(session);
         return (
           "Sorry, I couldn't save that service entry due to a system error.\n" +
@@ -2080,7 +2071,7 @@ async function handleServiceSessionStep(session, incomingText) {
   }
 
   console.warn("⚠️ Service session in unknown step:", session.step);
-  session.status = "error";
+  session.step = "error";
   await saveServiceSession(session);
   return (
     "Something went wrong with this service entry.\n" +
@@ -2322,18 +2313,16 @@ async function handleVehicleDocumentSessionStep(session, incomingText) {
         const docRes = await pool.query(
           `
           INSERT INTO vehicle_documents (
-            user_whatsapp,
             vehicle_id,
             title,
             cost,
             expiry_date,
             notes
           )
-          VALUES ($1, $2, $3, $4, $5, $6)
+          VALUES ($1, $2, $3, $4, $5)
           RETURNING *
           `,
           [
-            session.user_whatsapp,
             session.vehicle_id,
             session.title,
             session.cost != null ? session.cost : null,
@@ -2565,30 +2554,48 @@ async function logChatTurn(userWhatsapp, role, message) {
 
 // ====== GLOBAL SESSION CANCEL ======
 async function cancelAllSessionsForUser(userWhatsapp) {
-  const tables = [
-    "fuel_sessions",
-    "service_sessions",
-    "vehicle_document_sessions",
-  ];
+  // fuel_sessions and service_sessions have NO status column in your DB → just delete
+  try {
+    await pool.query(
+      `
+      DELETE FROM fuel_sessions
+      WHERE user_whatsapp = $1
+      `,
+      [userWhatsapp]
+    );
+  } catch (err) {
+    console.error("⚠️ Could not delete fuel_sessions for user:", err.message);
+  }
 
-  for (const table of tables) {
-    try {
-      await pool.query(
-        `
-        UPDATE ${table}
-        SET status = 'cancelled',
-            updated_at = NOW()
-        WHERE user_whatsapp = $1
-          AND status = 'active'
-        `,
-        [userWhatsapp]
-      );
-    } catch (err) {
-      console.error(
-        `⚠️ Could not cancel sessions in ${table}:`,
-        err.message
-      );
-    }
+  try {
+    await pool.query(
+      `
+      DELETE FROM service_sessions
+      WHERE user_whatsapp = $1
+      `,
+      [userWhatsapp]
+    );
+  } catch (err) {
+    console.error("⚠️ Could not delete service_sessions for user:", err.message);
+  }
+
+  // vehicle_document_sessions DOES have status → cancel active ones
+  try {
+    await pool.query(
+      `
+      UPDATE vehicle_document_sessions
+      SET status = 'cancelled',
+          updated_at = NOW()
+      WHERE user_whatsapp = $1
+        AND status = 'active'
+      `,
+      [userWhatsapp]
+    );
+  } catch (err) {
+    console.error(
+      "⚠️ Could not cancel vehicle_document_sessions for user:",
+      err.message
+    );
   }
 }
 
