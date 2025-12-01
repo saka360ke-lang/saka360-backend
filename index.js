@@ -156,6 +156,50 @@ async function ensureVehicleDocumentTables() {
 }
 ensureVehicleDocumentTables();
 
+// Ensure personal_documents & personal_document_sessions tables
+async function ensurePersonalDocumentsTables() {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS personal_documents (
+        id              SERIAL PRIMARY KEY,
+        owner_whatsapp  TEXT NOT NULL,
+        driver_whatsapp TEXT NOT NULL,
+        driver_id       INTEGER REFERENCES drivers(id) ON DELETE SET NULL,
+        doc_title       TEXT NOT NULL,
+        doc_type        TEXT,
+        cost_amount     NUMERIC(12,2),
+        currency        TEXT NOT NULL DEFAULT 'KES',
+        expiry_date     DATE,
+        notes           TEXT,
+        reminder_id     INTEGER REFERENCES reminders(id) ON DELETE SET NULL,
+        created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS personal_document_sessions (
+        id              SERIAL PRIMARY KEY,
+        user_whatsapp   TEXT NOT NULL,
+        step            TEXT NOT NULL,
+        status          TEXT NOT NULL DEFAULT 'ACTIVE',
+        doc_title       TEXT,
+        doc_type        TEXT,
+        cost_amount     NUMERIC(12,2),
+        expiry_date     DATE,
+        notes           TEXT,
+        created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+    `);
+
+    console.log("📄 personal_documents & personal_document_sessions tables are ready.");
+  } catch (err) {
+    console.error("❌ Error ensuring personal_documents tables:", err.message);
+  }
+}
+ensurePersonalDocumentsTables();
+
 // ====== GENERIC HELPERS ======
 function parseNumber(text) {
   if (!text) return NaN;
@@ -2307,7 +2351,9 @@ async function handleVehicleDocumentSessionStep(session, incomingText) {
     session.step = "confirm";
     await saveVehicleDocumentSession(session);
 
-    const expStr = session.expiry_date ? `*${session.expiry_date}*` : "_none set_";
+    const expStr = session.expiry_date
+      ? `*${session.expiry_date}*`
+      : "_none set_";
     const costStr =
       session.cost != null ? `*${session.cost}* KES` : "_not recorded_";
     const notesStr = session.notes ? session.notes : "_none_";
@@ -2489,6 +2535,381 @@ async function handleVehicleDocumentSessionStep(session, incomingText) {
   );
 }
 
+// ====== PERSONAL DOCUMENT (DRIVER / OWNER) HELPERS ======
+
+async function getActivePersonalDocumentSession(userWhatsapp) {
+  try {
+    const res = await pool.query(
+      `
+      SELECT *
+      FROM personal_document_sessions
+      WHERE user_whatsapp = $1
+        AND status = 'ACTIVE'
+      ORDER BY created_at DESC
+      LIMIT 1
+      `,
+      [userWhatsapp]
+    );
+    return res.rows[0] || null;
+  } catch (err) {
+    console.error("❌ Error fetching personal_document_session:", err.message);
+    return null;
+  }
+}
+
+async function savePersonalDocumentSession(session) {
+  try {
+    await pool.query(
+      `
+      UPDATE personal_document_sessions
+      SET
+        step        = $2,
+        doc_title   = $3,
+        doc_type    = $4,
+        cost_amount = $5,
+        expiry_date = $6,
+        notes       = $7,
+        status      = $8,
+        updated_at  = NOW()
+      WHERE id = $1
+      `,
+      [
+        session.id,
+        session.step,
+        session.doc_title || null,
+        session.doc_type || null,
+        session.cost_amount != null ? session.cost_amount : null,
+        session.expiry_date || null,
+        session.notes || null,
+        session.status || "ACTIVE",
+      ]
+    );
+  } catch (err) {
+    console.error("❌ Error saving personal_document_session:", err.message);
+  }
+}
+
+async function startPersonalDocumentSession(userWhatsapp) {
+  const insert = await pool.query(
+    `
+    INSERT INTO personal_document_sessions (
+      user_whatsapp,
+      step,
+      status
+    )
+    VALUES ($1, 'ASK_TITLE', 'ACTIVE')
+    RETURNING *
+    `,
+    [userWhatsapp]
+  );
+
+  const session = insert.rows[0];
+
+  const reply =
+    "📄 Let's add a *personal document* linked to your driving profile.\n" +
+    "What document is this?\n" +
+    "Example: *Main DL*, *PSV Badge*, *TSV Licence*, *Good Conduct*";
+
+  return { session, reply };
+}
+
+async function handlePersonalDocumentSessionStep(session, from, incomingText) {
+  const text = String(incomingText || "").trim();
+  const lower = text.toLowerCase();
+
+  if (["cancel", "stop", "reset"].includes(lower)) {
+    session.status = "CANCELLED";
+    await savePersonalDocumentSession(session);
+    return (
+      "✅ I’ve cancelled your current personal document entry.\n" +
+      "You can start again with *my document*."
+    );
+  }
+
+  if (session.step === "ASK_TITLE") {
+    if (!text) {
+      return (
+        "Please tell me what this document is.\n" +
+        "Example: *Main DL*, *PSV Badge*, *TSV Licence*, *Good Conduct*"
+      );
+    }
+
+    session.doc_title = text;
+    session.step = "ASK_TYPE";
+    await savePersonalDocumentSession(session);
+
+    return (
+      "What *type* of document is this?\n" +
+      "Example: *main*, *psv*, *tsv*, *badge*, *other*.\n" +
+      "Reply *skip* to leave type blank."
+    );
+  }
+
+  if (session.step === "ASK_TYPE") {
+    let docType = text;
+    if (lower === "skip" || !text) {
+      docType = null;
+    }
+
+    session.doc_type = docType;
+    session.step = "ASK_COST";
+    await savePersonalDocumentSession(session);
+
+    return (
+      "How much did you pay for this document? (optional, KES)\n" +
+      "Example: *3000*\n" +
+      "Reply *0* if it was free or *skip* to leave it blank."
+    );
+  }
+
+  if (session.step === "ASK_COST") {
+    let costAmount = null;
+    if (!(lower === "skip" || lower === "0")) {
+      const parsed = parseNumber(text);
+      if (isNaN(parsed) || parsed < 0) {
+        return (
+          "That amount doesn’t look right.\n" +
+          "Please send a number like *3000* or *0* if it was free.\n" +
+          "You can also reply *skip* to leave it blank."
+        );
+      }
+      costAmount = parsed;
+    }
+
+    session.cost_amount = costAmount;
+    session.step = "ASK_EXPIRY";
+    await savePersonalDocumentSession(session);
+
+    return (
+      "When does this document *expire*?\n" +
+      "Send the date in *YYYY-MM-DD* format (e.g. *2026-01-01*).\n" +
+      "Reply *skip* if there is no expiry date."
+    );
+  }
+
+  if (session.step === "ASK_EXPIRY") {
+    let expiryDate = null;
+
+    if (!(lower === "skip")) {
+      const match = text.match(/^\d{4}-\d{2}-\d{2}$/);
+      if (!match) {
+        return (
+          "That date doesn’t look right.\n" +
+          "Please send in *YYYY-MM-DD* format, e.g. *2026-01-01*,\n" +
+          "or reply *skip* if there is no expiry."
+        );
+      }
+      expiryDate = text;
+    }
+
+    session.expiry_date = expiryDate;
+    session.step = "ASK_NOTES";
+    await savePersonalDocumentSession(session);
+
+    return (
+      "Any notes about this document? (e.g. *NTSA main DL*, *PSV Nairobi Routes*, etc.)\n" +
+      "Reply *skip* to leave notes blank."
+    );
+  }
+
+  if (session.step === "ASK_NOTES") {
+    let notes = text;
+    if (lower === "skip") {
+      notes = "";
+    }
+
+    session.notes = notes;
+    session.step = "CONFIRM";
+    await savePersonalDocumentSession(session);
+
+    const title = session.doc_title || "(no title)";
+    const docType = session.doc_type || "n/a";
+    const cost = session.cost_amount != null ? session.cost_amount : null;
+    const expRaw = session.expiry_date
+      ? String(session.expiry_date).slice(0, 10)
+      : null;
+    const notesText =
+      session.notes && session.notes.trim().length
+        ? session.notes.trim()
+        : "none";
+
+    let msg =
+      "Please confirm this *personal document*:\n\n" +
+      "Title: *" +
+      title +
+      "*\n" +
+      "Type: *" +
+      docType +
+      "*\n";
+
+    if (cost != null) {
+      msg += "Cost: *" + cost + "* KES\n";
+    } else {
+      msg += "Cost: *not recorded*\n";
+    }
+
+    if (expRaw) {
+      msg += "Expiry: *" + expRaw + "*\n";
+    } else {
+      msg += "Expiry: *none set*\n";
+    }
+
+    msg += "Notes: " + notesText + "\n\n";
+    msg += "Reply *YES* to save or *NO* to cancel.";
+
+    return msg;
+  }
+
+  if (session.step === "CONFIRM") {
+    if (lower === "no") {
+      session.status = "CANCELLED";
+      await savePersonalDocumentSession(session);
+      return "Okay, I’ve cancelled this personal document entry. No changes were saved.";
+    }
+
+    if (lower !== "yes") {
+      return "Please reply *YES* to save or *NO* to cancel this personal document entry.";
+    }
+
+    // Save to personal_documents + reminder (if expiry set)
+    try {
+      const docTitle = session.doc_title || "(no title)";
+      const docType = session.doc_type || null;
+      const costAmount =
+        session.cost_amount != null ? session.cost_amount : null;
+      const expiryDate = session.expiry_date || null;
+      const notes = session.notes || null;
+
+      // Optional link to an existing driver row
+      const driver = await findDriverByWhatsapp(from); // may be null
+
+      const insertRes = await pool.query(
+        `
+        INSERT INTO personal_documents (
+          owner_whatsapp,
+          driver_whatsapp,
+          driver_id,
+          doc_title,
+          doc_type,
+          cost_amount,
+          expiry_date,
+          notes
+        )
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+        RETURNING id
+        `,
+        [
+          from,
+          from,
+          driver ? driver.id : null,
+          docTitle,
+          docType,
+          costAmount,
+          expiryDate,
+          notes,
+        ]
+      );
+
+      const personalDocId = insertRes.rows[0].id;
+
+      // Reminder if we have an expiry date
+      if (expiryDate) {
+        try {
+          const remRes = await pool.query(
+            `
+            INSERT INTO reminders (
+              user_whatsapp,
+              driver_id,
+              reminder_type,
+              label,
+              due_date,
+              is_done
+            )
+            VALUES ($1,$2,$3,$4,$5,FALSE)
+            RETURNING id
+            `,
+            [
+              from,
+              driver ? driver.id : null,
+              "personal_document",
+              docTitle,
+              expiryDate,
+            ]
+          );
+          const reminderId = remRes.rows[0].id;
+
+          await pool.query(
+            `
+            UPDATE personal_documents
+            SET reminder_id = $1,
+                updated_at = NOW()
+            WHERE id = $2
+            `,
+            [reminderId, personalDocId]
+          );
+        } catch (err) {
+          console.warn(
+            "⚠️ Could not insert reminder for personal document:",
+            err.message
+          );
+        }
+      }
+
+      session.status = "DONE";
+      await savePersonalDocumentSession(session);
+
+      const expShort = expiryDate ? String(expiryDate).slice(5, 10) : null;
+
+      let doneMsg =
+        "✅ Personal document saved.\n\n" +
+        "Title: *" +
+        docTitle +
+        "*\n" +
+        "Type: *" +
+        (docType || "n/a") +
+        "*\n";
+
+      if (costAmount != null) {
+        doneMsg += "Cost: *" + costAmount + "* KES\n";
+      }
+
+      if (expShort) {
+        doneMsg += "Expiry: *" + expShort + "*\n";
+      } else if (expiryDate) {
+        doneMsg += "Expiry: *" + String(expiryDate).slice(0, 10) + "*\n";
+      } else {
+        doneMsg += "Expiry: *none set*\n";
+      }
+
+      if (notes && notes.trim().length) {
+        doneMsg += "Notes: " + notes.trim() + "\n";
+      }
+
+      doneMsg +=
+        "\nI’ll include this in your *personal compliance* and reminder summaries.";
+
+      return doneMsg;
+    } catch (err) {
+      console.error("❌ Error saving personal document:", err.message);
+      session.status = "ERROR";
+      await savePersonalDocumentSession(session);
+      return (
+        "Sorry, I couldn't save that personal document due to a system error.\n" +
+        "Please try again later."
+      );
+    }
+  }
+
+  // Fallback if an unknown step sneaks in
+  console.warn("⚠️ Personal document session in unknown step:", session.step);
+  session.status = "ERROR";
+  await savePersonalDocumentSession(session);
+  return (
+    "Something went wrong with this personal document entry.\n" +
+    "Please start again with *my document*."
+  );
+}
+
 // ====== SIMPLE DELETE / EDIT PLACEHOLDERS ======
 async function handleDeleteLastCommand(userWhatsapp, lower) {
   return (
@@ -2620,6 +3041,25 @@ async function cancelAllSessionsForUser(userWhatsapp) {
   } catch (err) {
     console.error(
       "⚠️ Could not cancel vehicle_document_sessions for user:",
+      err.message
+    );
+  }
+
+  // personal_document_sessions use status 'ACTIVE' → cancel them
+  try {
+    await pool.query(
+      `
+      UPDATE personal_document_sessions
+      SET status = 'CANCELLED',
+          updated_at = NOW()
+      WHERE user_whatsapp = $1
+        AND status = 'ACTIVE'
+      `,
+      [userWhatsapp]
+    );
+  } catch (err) {
+    console.error(
+      "⚠️ Could not cancel personal_document_sessions for user:",
       err.message
     );
   }
@@ -2769,6 +3209,39 @@ app.post("/whatsapp/inbound", async (req, res) => {
       return;
     }
 
+    // If user is inside a PERSONAL DOCUMENT session
+    const activePersonalDocSession = await getActivePersonalDocumentSession(
+      from
+    );
+    if (activePersonalDocSession) {
+      replyText = await handlePersonalDocumentSessionStep(
+        activePersonalDocSession,
+        from,
+        text
+      );
+
+      await logChatTurn(from, "assistant", replyText);
+      console.log("💬 Reply (personal document session):", replyText);
+      try {
+        if (DISABLE_TWILIO_SEND === "true") {
+          console.log("🚫 Twilio send disabled by DISABLE_TWILIO_SEND env.");
+        } else {
+          await twilioClient.messages.create({
+            from: TWILIO_WHATSAPP_NUMBER,
+            to: from,
+            body: replyText,
+          });
+        }
+      } catch (twilioErr) {
+        console.error(
+          "❌ Error sending WhatsApp message via Twilio:",
+          twilioErr.message
+        );
+      }
+      res.status(200).send("OK");
+      return;
+    }
+
     // NO ACTIVE SESSION → Command routing
 
     // DRIVER: accept invitation
@@ -2796,6 +3269,7 @@ app.post("/whatsapp/inbound", async (req, res) => {
         "• *fuel* – log fuel step by step\n" +
         "• *service* – log a service step by step\n" +
         "• *document* – add a vehicle document & reminder\n" +
+        "• *my document* – add a personal/driver document\n" +
         "• *expense* – log other costs (coming soon)\n" +
         "• *add vehicle* – register a vehicle\n" +
         "• *add driver* – invite a driver\n" +
@@ -2807,6 +3281,7 @@ app.post("/whatsapp/inbound", async (req, res) => {
         "• *fuel* – log a fuel refill step by step\n" +
         "• *service* – log a service with notes and reminders\n" +
         "• *document* – log vehicle documents with cost & expiry\n" +
+        "• *my document* – log personal/driver documents (DL, PSV, TSV, etc.)\n" +
         "• *expense* – log other costs (tyres, parking, repairs)\n" +
         "• *add vehicle* – add a vehicle to your account\n" +
         "• *add driver* – invite a driver and track DL compliance\n" +
@@ -2866,7 +3341,18 @@ app.post("/whatsapp/inbound", async (req, res) => {
       const { session, reply } = await startServiceSession(from);
       replyText = reply;
     }
-    // VEHICLE DOCUMENT COMMANDS – start step-by-step flow
+    // PERSONAL DOCUMENT COMMANDS – start personal-doc flow
+    else if (
+      lower === "my document" ||
+      lower === "my documents" ||
+      lower === "personal document" ||
+      lower === "personal documents" ||
+      lower === "add my document"
+    ) {
+      const { session, reply } = await startPersonalDocumentSession(from);
+      replyText = reply;
+    }
+    // VEHICLE DOCUMENT COMMANDS – start vehicle-doc flow
     else if (
       lower === "document" ||
       lower === "documents" ||
