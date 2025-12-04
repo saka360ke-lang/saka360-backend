@@ -200,6 +200,44 @@ async function ensurePersonalDocumentsTables() {
 }
 ensurePersonalDocumentsTables();
 
+// Ensure expense_sessions table
+async function ensureExpenseSessionsTable() {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS expense_sessions (
+        id SERIAL PRIMARY KEY,
+        user_whatsapp TEXT NOT NULL,
+        vehicle_id INTEGER NOT NULL,
+        step TEXT NOT NULL,
+        title TEXT,
+        amount NUMERIC,
+        odometer INTEGER,
+        notes TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+    `);
+
+    await pool.query(`
+      ALTER TABLE expense_sessions
+        ADD COLUMN IF NOT EXISTS user_whatsapp TEXT,
+        ADD COLUMN IF NOT EXISTS vehicle_id INTEGER,
+        ADD COLUMN IF NOT EXISTS step TEXT,
+        ADD COLUMN IF NOT EXISTS title TEXT,
+        ADD COLUMN IF NOT EXISTS amount NUMERIC,
+        ADD COLUMN IF NOT EXISTS odometer INTEGER,
+        ADD COLUMN IF NOT EXISTS notes TEXT,
+        ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+    `);
+
+    console.log("💸 expense_sessions table is ready.");
+  } catch (err) {
+    console.error("❌ Error ensuring expense_sessions table:", err.message);
+  }
+}
+ensureExpenseSessionsTable();
+
 // ====== GENERIC HELPERS ======
 function parseNumber(text) {
   if (!text) return NaN;
@@ -1576,9 +1614,9 @@ async function handleFuelSessionStep(session, incomingText) {
           "Litres (approx): " +
           litresStr +
           "\n" +
-          "Station: *" +
+          "Station: " +
           stationStr +
-          "*\n" +
+          "\n" +
           "Odometer: " +
           odoStr +
           "\n" +
@@ -2146,6 +2184,324 @@ async function handleServiceSessionStep(session, incomingText) {
   return (
     "Something went wrong with this service entry.\n" +
     "Please start again with *service*."
+  );
+}
+
+// ====== EXPENSE SESSION HELPERS ======
+
+async function getActiveExpenseSession(userWhatsapp) {
+  try {
+    const res = await pool.query(
+      `
+      SELECT *
+      FROM expense_sessions
+      WHERE user_whatsapp = $1
+        AND step NOT IN ('completed', 'cancelled', 'error')
+      ORDER BY created_at DESC
+      LIMIT 1
+      `,
+      [userWhatsapp]
+    );
+    return res.rows[0] || null;
+  } catch (err) {
+    console.error("❌ Error fetching expense_session:", err.message);
+    return null;
+  }
+}
+
+async function saveExpenseSession(session) {
+  try {
+    await pool.query(
+      `
+      UPDATE expense_sessions
+      SET
+        step = $2,
+        title = $3,
+        amount = $4,
+        odometer = $5,
+        notes = $6,
+        updated_at = NOW()
+      WHERE id = $1
+      `,
+      [
+        session.id,
+        session.step,
+        session.title || null,
+        session.amount != null ? session.amount : null,
+        session.odometer != null ? session.odometer : null,
+        session.notes || null,
+      ]
+    );
+  } catch (err) {
+    console.error("❌ Error saving expense_session:", err.message);
+  }
+}
+
+async function startExpenseSession(userWhatsapp) {
+  const vRes = await ensureCurrentVehicle(userWhatsapp);
+
+  if (vRes.status === "NO_VEHICLES") {
+    return {
+      session: null,
+      reply:
+        "You don't have any vehicles yet.\n\n" +
+        "Add one with:\n" +
+        "*add vehicle KDA 123A*",
+    };
+  }
+
+  if (vRes.status === "NEED_SET_CURRENT") {
+    const listText = formatVehiclesList(vRes.list, true);
+    return {
+      session: null,
+      reply:
+        "You have multiple vehicles. Please choose which one you want to log an expense for.\n\n" +
+        listText +
+        "\n\nReply with e.g. *switch to 1*, then send *expense* again.",
+    };
+  }
+
+  const vehicle = vRes.vehicle;
+
+  const insert = await pool.query(
+    `
+    INSERT INTO expense_sessions (
+      user_whatsapp,
+      vehicle_id,
+      step
+    )
+    VALUES ($1, $2, 'ask_title')
+    RETURNING *
+    `,
+    [userWhatsapp, vehicle.id]
+  );
+
+  const session = insert.rows[0];
+
+  const reply =
+    "💸 Let's log an expense for *" +
+    vehicle.registration +
+    "*.\n" +
+    "What kind of expense is this?\n" +
+    "Example: *Tyres*, *Parking*, *Toll*, *Car wash*, *Repair*";
+
+  return { session, reply };
+}
+
+async function handleExpenseSessionStep(session, incomingText) {
+  const text = String(incomingText || "").trim();
+  const lower = text.toLowerCase();
+
+  if (["cancel", "stop", "reset"].includes(lower)) {
+    session.step = "cancelled";
+    await saveExpenseSession(session);
+    return (
+      "✅ I’ve cancelled your expense entry.\n" +
+      "You can start again with *expense*."
+    );
+  }
+
+  let vehicleReg = "this vehicle";
+  try {
+    const vRes = await pool.query(
+      `SELECT registration FROM vehicles WHERE id = $1`,
+      [session.vehicle_id]
+    );
+    if (vRes.rows[0] && vRes.rows[0].registration) {
+      vehicleReg = vRes.rows[0].registration;
+    }
+  } catch (err) {
+    console.error("⚠️ Error fetching vehicle for expense session:", err.message);
+  }
+
+  if (session.step === "ask_title") {
+    if (!text) {
+      return (
+        "What kind of expense is this?\n" +
+        "Example: *Tyres*, *Parking*, *Toll*, *Car wash*, *Repair*"
+      );
+    }
+
+    session.title = text;
+    session.step = "ask_amount";
+    await saveExpenseSession(session);
+
+    return (
+      "How much did you pay in total for this expense? (KES)\n" +
+      "Example: *2500*"
+    );
+  }
+
+  if (session.step === "ask_amount") {
+    const amount = parseNumber(text);
+    if (isNaN(amount) || amount <= 0) {
+      return "That amount doesn't look valid. Please send the *total cost* in KES (e.g. *2500*).";
+    }
+
+    session.amount = amount;
+    session.step = "ask_odo";
+    await saveExpenseSession(session);
+
+    return (
+      "What was the *odometer reading* at this expense?\n" +
+      "Example: *150000*\n" +
+      "Reply *skip* if you don't want to track odometer."
+    );
+  }
+
+  if (session.step === "ask_odo") {
+    if (lower === "skip") {
+      session.odometer = null;
+    } else {
+      const odoNum = parseNumber(text);
+      if (isNaN(odoNum) || odoNum < 0) {
+        return (
+          "That odometer value doesn't look valid. Please send a number like *150000*,\n" +
+          "or reply *skip* to leave it blank."
+        );
+      }
+      session.odometer = Math.round(odoNum);
+    }
+
+    session.step = "ask_notes";
+    await saveExpenseSession(session);
+
+    return (
+      "Any notes about this expense?\n" +
+      "Example: *2 tyres changed*, *night parking CBD*, *Mombasa Road tolls*.\n" +
+      "Reply *skip* to leave notes blank."
+    );
+  }
+
+  if (session.step === "ask_notes") {
+    if (lower === "skip") {
+      session.notes = null;
+    } else {
+      session.notes = text;
+    }
+
+    session.step = "confirm";
+    await saveExpenseSession(session);
+
+    const amountStr =
+      session.amount != null ? `*${session.amount}* KES` : "_not set_";
+    const odoStr =
+      session.odometer != null ? `*${session.odometer}*` : "_not set_";
+    const notesStr = session.notes ? session.notes : "_none_";
+
+    return (
+      "Please confirm this expense entry:\n\n" +
+      "Vehicle: *" +
+      vehicleReg +
+      "*\n" +
+      "Title: *" +
+      session.title +
+      "*\n" +
+      "Amount: " +
+      amountStr +
+      "\n" +
+      "Odometer: " +
+      odoStr +
+      "\n" +
+      "Notes: " +
+      notesStr +
+      "\n\n" +
+      "Reply *YES* to save or *NO* to cancel."
+    );
+  }
+
+  if (session.step === "confirm") {
+    if (["yes", "y"].includes(lower)) {
+      try {
+        const messageText =
+          "Expense: " +
+          (session.title || "n/a") +
+          ", amount " +
+          (session.amount || 0) +
+          " KES, odometer " +
+          (session.odometer != null ? session.odometer : "n/a");
+
+        await pool.query(
+          `
+          INSERT INTO expense_logs (
+            user_whatsapp,
+            vehicle_id,
+            title,
+            amount,
+            odometer,
+            notes,
+            message_text
+          )
+          VALUES ($1,$2,$3,$4,$5,$6,$7)
+          `,
+          [
+            session.user_whatsapp,
+            session.vehicle_id,
+            session.title || null,
+            session.amount != null ? session.amount : null,
+            session.odometer != null ? session.odometer : null,
+            session.notes || null,
+            messageText,
+          ]
+        );
+
+        session.step = "completed";
+        await saveExpenseSession(session);
+
+        const amountStr =
+          session.amount != null ? `*${session.amount}* KES` : "_not set_";
+        const odoStr =
+          session.odometer != null ? `*${session.odometer}*` : "_not set_";
+        const notesStr = session.notes ? session.notes : "_none_";
+
+        return (
+          "✅ Expense entry saved.\n\n" +
+          "Vehicle: *" +
+          vehicleReg +
+          "*\n" +
+          "Title: *" +
+          session.title +
+          "*\n" +
+          "Amount: " +
+          amountStr +
+          "\n" +
+          "Odometer: " +
+          odoStr +
+          "\n" +
+          "Notes: " +
+          notesStr +
+          "\n\n" +
+          "This will appear in your expense summaries."
+        );
+      } catch (err) {
+        console.error("❌ Error saving expense log:", err.message);
+        session.step = "error";
+        await saveExpenseSession(session);
+        return (
+          "Sorry, I couldn't save that expense entry due to a system error.\n" +
+          "Please try again later."
+        );
+      }
+    }
+
+    if (["no", "n"].includes(lower)) {
+      session.step = "cancelled";
+      await saveExpenseSession(session);
+      return (
+        "Okay, I’ve *cancelled* that expense entry.\n" +
+        "You can start again with *expense*."
+      );
+    }
+
+    return 'Please reply with *YES* to save or *NO* to cancel this expense entry.';
+  }
+
+  console.warn("⚠️ Expense session in unknown step:", session.step);
+  session.step = "error";
+  await saveExpenseSession(session);
+  return (
+    "Something went wrong with this expense entry.\n" +
+    "Please start again with *expense*."
   );
 }
 
@@ -2935,7 +3291,170 @@ async function buildServiceReport(userWhatsapp, options = {}) {
 }
 
 async function buildExpenseReport(userWhatsapp, options = {}) {
-  return "Expense report coming soon. For now I track expense entries, but reporting is still being wired.";
+  const allVehicles = options.allVehicles;
+
+  if (allVehicles) {
+    try {
+      const res = await pool.query(
+        `
+        SELECT v.registration,
+               COALESCE(SUM(e.amount), 0) AS total_amount,
+               COUNT(*) AS count_entries
+        FROM expense_logs e
+        JOIN vehicles v ON v.id = e.vehicle_id
+        WHERE e.user_whatsapp = $1
+        GROUP BY v.registration
+        ORDER BY v.registration
+        `,
+        [userWhatsapp]
+      );
+      const rows = res.rows;
+
+      if (rows.length === 0) {
+        return (
+          "You don't have any expense logs yet.\n\n" +
+          "Log your first one with *expense* (tyres, parking, tolls, car wash, repairs…)."
+        );
+      }
+
+      let text = "💸 *Expense summary – all vehicles*\n";
+
+      let grandTotal = 0;
+      for (const row of rows) {
+        const reg = row.registration || "Unknown";
+        const total = Number(row.total_amount || 0);
+        const count = Number(row.count_entries || 0);
+        grandTotal += total;
+
+        text +=
+          "\n• *" +
+          reg +
+          "* – *" +
+          total +
+          "* KES across " +
+          count +
+          " expense(s)";
+      }
+
+      text +=
+        "\n\nTotal spend across all vehicles: *" +
+        grandTotal +
+        "* KES.\n" +
+        "Log new expenses anytime with *expense*.";
+
+      return text;
+    } catch (err) {
+      console.error("❌ Error building all-vehicles expense report:", err.message);
+      return (
+        "Sorry, I couldn't load your expense report due to a system error.\n" +
+        "Please try again later."
+      );
+    }
+  }
+
+  // current-vehicle only
+  const vRes = await ensureCurrentVehicle(userWhatsapp);
+  if (vRes.status === "NO_VEHICLES") {
+    return (
+      "You don't have any vehicles yet.\n\n" +
+      "Add one with:\n" +
+      "*add vehicle KDA 123A*"
+    );
+  }
+  if (vRes.status === "NEED_SET_CURRENT") {
+    const listText = formatVehiclesList(vRes.list, true);
+    return (
+      "You have multiple vehicles. Please choose which one you want the expense report for.\n\n" +
+      listText +
+      "\n\nReply with e.g. *switch to 1*, then send *expense report* again."
+    );
+  }
+
+  const vehicle = vRes.vehicle;
+
+  try {
+    const summaryRes = await pool.query(
+      `
+      SELECT
+        COALESCE(SUM(amount), 0) AS total_amount,
+        COUNT(*) AS count_entries
+      FROM expense_logs
+      WHERE user_whatsapp = $1
+        AND vehicle_id = $2
+      `,
+      [userWhatsapp, vehicle.id]
+    );
+    const summary = summaryRes.rows[0];
+
+    if (!summary || Number(summary.count_entries) === 0) {
+      return (
+        "You don't have any expense logs yet for *" +
+        vehicle.registration +
+        "*.\n\n" +
+        "Log one with *expense* – for tyres, parking, tolls, car wash, repairs and more."
+      );
+    }
+
+    const totalAmount = Number(summary.total_amount || 0);
+    const countEntries = Number(summary.count_entries || 0);
+
+    const byTitleRes = await pool.query(
+      `
+      SELECT
+        COALESCE(title, 'Other') AS title,
+        COALESCE(SUM(amount), 0) AS total_amount,
+        COUNT(*) AS count_entries
+      FROM expense_logs
+      WHERE user_whatsapp = $1
+        AND vehicle_id = $2
+      GROUP BY COALESCE(title, 'Other')
+      ORDER BY total_amount DESC
+      LIMIT 5
+      `,
+      [userWhatsapp, vehicle.id]
+    );
+    const byTitle = byTitleRes.rows;
+
+    let text =
+      "💸 *Expense summary – " +
+      vehicle.registration +
+      "*\n\n" +
+      "Total spend: *" +
+      totalAmount +
+      "* KES\n" +
+      "Number of expenses: *" +
+      countEntries +
+      "*\n";
+
+    if (byTitle.length > 0) {
+      text += "\nTop categories:\n";
+      for (const row of byTitle) {
+        const title = row.title || "Other";
+        const tTotal = Number(row.total_amount || 0);
+        const tCount = Number(row.count_entries || 0);
+        text +=
+          "\n• *" +
+          title +
+          "* – *" +
+          tTotal +
+          "* KES (" +
+          tCount +
+          "x)";
+      }
+    }
+
+    text +=
+      "\n\nTo see all-vehicle spend, send *expense report all*.\n" +
+      "To log a new expense, type *expense*.";
+
+    return text;
+  } catch (err) {
+    console.error("❌ Error building expense report:", err.message);
+    return (
+      "Sorry, I couldn't load your expense report due to a system error.\n" +
+      "Please try again later."
+    );
+  }
 }
 
 // ====== AI FALLBACK → n8n ======
@@ -3026,6 +3545,22 @@ async function cancelAllSessionsForUser(userWhatsapp) {
     console.error("⚠️ Could not delete service_sessions for user:", err.message);
   }
 
+  // delete active expense_sessions
+  try {
+    await pool.query(
+      `
+      DELETE FROM expense_sessions
+      WHERE user_whatsapp = $1
+      `,
+      [userWhatsapp]
+    );
+  } catch (err) {
+    console.error(
+      "⚠️ Could not delete expense_sessions for user:",
+      err.message
+    );
+  }
+
   // vehicle_document_sessions DOES have status → cancel active ones
   try {
     await pool.query(
@@ -3069,7 +3604,6 @@ async function cancelAllSessionsForUser(userWhatsapp) {
 app.get("/", (req, res) => {
   res.send("Saka360 backend is running ✅");
 });
-
 // ====== MAIN WHATSAPP HANDLER ======
 app.post("/whatsapp/inbound", async (req, res) => {
   try {
@@ -3182,6 +3716,33 @@ app.post("/whatsapp/inbound", async (req, res) => {
       return;
     }
 
+    // If user is inside an EXPENSE session
+    const activeExpenseSession = await getActiveExpenseSession(from);
+    if (activeExpenseSession) {
+      replyText = await handleExpenseSessionStep(activeExpenseSession, text);
+
+      await logChatTurn(from, "assistant", replyText);
+      console.log("💬 Reply (expense session):", replyText);
+      try {
+        if (DISABLE_TWILIO_SEND === "true") {
+          console.log("🚫 Twilio send disabled by DISABLE_TWILIO_SEND env.");
+        } else {
+          await twilioClient.messages.create({
+            from: TWILIO_WHATSAPP_NUMBER,
+            to: from,
+            body: replyText,
+          });
+        }
+      } catch (twilioErr) {
+        console.error(
+          "❌ Error sending WhatsApp message via Twilio:",
+          twilioErr.message
+        );
+      }
+      res.status(200).send("OK");
+      return;
+    }
+
     // If user is inside a VEHICLE DOCUMENT session
     const activeDocSession = await getActiveVehicleDocumentSession(from);
     if (activeDocSession) {
@@ -3270,7 +3831,7 @@ app.post("/whatsapp/inbound", async (req, res) => {
         "• *service* – log a service step by step\n" +
         "• *document* – add a vehicle document & reminder\n" +
         "• *my document* – add a personal/driver document\n" +
-        "• *expense* – log other costs (coming soon)\n" +
+        "• *expense* – log other costs (tyres, parking, repairs)\n" +
         "• *add vehicle* – register a vehicle\n" +
         "• *add driver* – invite a driver\n" +
         "• *report* – see fuel/service/expense & driver reports\n\n" +
@@ -3341,6 +3902,17 @@ app.post("/whatsapp/inbound", async (req, res) => {
       const { session, reply } = await startServiceSession(from);
       replyText = reply;
     }
+    // EXPENSE COMMAND – start step-by-step session
+    else if (
+      lower === "expense" ||
+      lower === "expenses" ||
+      lower === "log expense" ||
+      lower === "expense step-by-step" ||
+      lower === "expense step by step"
+    ) {
+      const { session, reply } = await startExpenseSession(from);
+      replyText = reply;
+    }
     // PERSONAL DOCUMENT COMMANDS – start personal-doc flow
     else if (
       lower === "my document" ||
@@ -3398,7 +3970,7 @@ app.post("/whatsapp/inbound", async (req, res) => {
         "• *driver report* – driver licence compliance\n\n" +
         "Please choose one of those.";
     }
-    // SIMPLE REPORT COMMANDS (placeholder)
+    // SIMPLE REPORT COMMANDS
     else if (lower.startsWith("fuel report")) {
       const wantsAll = lower.includes("all");
       if (wantsAll) {
@@ -3490,3 +4062,4 @@ const serverPort = PORT || 3000;
 app.listen(serverPort, () => {
   console.log(`🚀 Saka360 backend listening on port ${serverPort}`);
 });
+
