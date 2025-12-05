@@ -2564,6 +2564,346 @@ async function handleVehicleDocumentSessionStep(session, incomingText) {
   );
 }
 
+// ====== PERSONAL DOCUMENT SESSION HELPERS ======
+
+async function getActivePersonalDocumentSession(userWhatsapp) {
+  try {
+    const res = await pool.query(
+      `
+      SELECT *
+      FROM personal_document_sessions
+      WHERE user_whatsapp = $1
+        AND status = 'ACTIVE'
+      ORDER BY created_at DESC
+      LIMIT 1
+      `,
+      [userWhatsapp]
+    );
+    return res.rows[0] || null;
+  } catch (err) {
+    console.error("❌ Error fetching personal_document_session:", err.message);
+    return null;
+  }
+}
+
+async function savePersonalDocumentSession(session) {
+  try {
+    await pool.query(
+      `
+      UPDATE personal_document_sessions
+      SET
+        step        = $2,
+        status      = $3,
+        doc_title   = $4,
+        doc_type    = $5,
+        cost_amount = $6,
+        expiry_date = $7,
+        notes       = $8,
+        updated_at  = NOW()
+      WHERE id = $1
+      `,
+      [
+        session.id,
+        session.step,
+        session.status || "ACTIVE",
+        session.doc_title || null,
+        session.doc_type || null,
+        session.cost_amount != null ? session.cost_amount : null,
+        session.expiry_date || null,
+        session.notes || null,
+      ]
+    );
+  } catch (err) {
+    console.error("❌ Error saving personal_document_session:", err.message);
+  }
+}
+
+async function startPersonalDocumentSession(userWhatsapp) {
+  // This is for "my document" / driver’s own docs (DL, PSV, TSV, Badge, etc.)
+  const insert = await pool.query(
+    `
+    INSERT INTO personal_document_sessions (
+      user_whatsapp,
+      step,
+      status
+    )
+    VALUES ($1, 'ask_title', 'ACTIVE')
+    RETURNING *
+    `,
+    [userWhatsapp]
+  );
+
+  const session = insert.rows[0];
+
+  const reply =
+    "📄 Let's add your *personal/driver document*.\n\n" +
+    "What document is this?\n" +
+    "Examples:\n" +
+    "• *DL Main*\n" +
+    "• *PSV Badge*\n" +
+    "• *TSV Certificate*\n" +
+    "• *ID card*";
+
+  return { session, reply };
+}
+
+async function handlePersonalDocumentSessionStep(session, userWhatsapp, incomingText) {
+  const text = String(incomingText || "").trim();
+  const lower = text.toLowerCase();
+
+  // Global cancel for this session
+  if (["cancel", "stop", "reset"].includes(lower)) {
+    session.status = "CANCELLED";
+    await savePersonalDocumentSession(session);
+    return (
+      "✅ I’ve cancelled your personal document entry.\n" +
+      "You can start again with *my document*."
+    );
+  }
+
+  if (session.step === "ask_title") {
+    if (!text) {
+      return (
+        "Please tell me the *document name*.\n" +
+        "Examples: *DL Main*, *PSV Badge*, *TSV Certificate*, *ID card*"
+      );
+    }
+
+    session.doc_title = text;
+    session.step = "ask_type";
+    await savePersonalDocumentSession(session);
+
+    return (
+      "What *type/category* is this document?\n" +
+      "Examples: *DL*, *PSV*, *TSV*, *Badge*, *ID*.\n" +
+      "Reply *skip* if you want to leave this blank."
+    );
+  }
+
+  if (session.step === "ask_type") {
+    if (lower === "skip") {
+      session.doc_type = null;
+    } else {
+      session.doc_type = text;
+    }
+
+    session.step = "ask_cost";
+    await savePersonalDocumentSession(session);
+
+    return (
+      "How much did you pay for this document? (KES)\n" +
+      "Reply *0* if it was free or you don’t want to record the cost."
+    );
+  }
+
+  if (session.step === "ask_cost") {
+    const amount = parseNumber(text);
+    if (isNaN(amount) || amount < 0) {
+      return "That amount doesn't look valid. Please send a number in KES (e.g. *2500* or *0*).";
+    }
+
+    session.cost_amount = amount;
+    session.step = "ask_expiry";
+    await savePersonalDocumentSession(session);
+
+    return (
+      "When does this document *expire*?\n" +
+      "Use *YYYY-MM-DD* format (e.g. *2026-01-01*).\n" +
+      "Reply *skip* if there is *no expiry date*."
+    );
+  }
+
+  if (session.step === "ask_expiry") {
+    if (lower === "skip") {
+      session.expiry_date = null;
+    } else {
+      const m = text.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+      if (!m) {
+        return (
+          "That date doesn't look valid.\n" +
+          "Please send in *YYYY-MM-DD* format (e.g. *2026-01-01*),\n" +
+          "or reply *skip* if there is no expiry."
+        );
+      }
+      session.expiry_date = text;
+    }
+
+    session.step = "ask_notes";
+    await savePersonalDocumentSession(session);
+
+    return (
+      "Any notes about this document?\n" +
+      "Examples: *renew every year*, *for Nairobi only*, *attached to employer*, etc.\n" +
+      "Reply *skip* to leave notes blank."
+    );
+  }
+
+  if (session.step === "ask_notes") {
+    if (lower === "skip") {
+      session.notes = null;
+    } else {
+      session.notes = text;
+    }
+
+    session.step = "confirm";
+    await savePersonalDocumentSession(session);
+
+    const titleStr = session.doc_title ? `*${session.doc_title}*` : "_not set_";
+    const typeStr = session.doc_type ? `*${session.doc_type}*` : "_not set_";
+    const costStr =
+      session.cost_amount != null ? `*${session.cost_amount}* KES` : "_not recorded_";
+    const expStr = session.expiry_date ? `*${session.expiry_date}*` : "_none set_";
+    const notesStr = session.notes ? session.notes : "_none_";
+
+    return (
+      "Please confirm this personal document:\n\n" +
+      "Title: " +
+      titleStr +
+      "\n" +
+      "Type: " +
+      typeStr +
+      "\n" +
+      "Cost: " +
+      costStr +
+      "\n" +
+      "Expiry: " +
+      expStr +
+      "\n" +
+      "Notes: " +
+      notesStr +
+      "\n\n" +
+      "Reply *YES* to save or *NO* to cancel."
+    );
+  }
+
+  if (session.step === "confirm") {
+    if (["no", "n"].includes(lower)) {
+      session.status = "CANCELLED";
+      await savePersonalDocumentSession(session);
+      return (
+        "Okay, I’ve *cancelled* that personal document.\n" +
+        "You can start again with *my document*."
+      );
+    }
+
+    if (!["yes", "y"].includes(lower)) {
+      const titleStr = session.doc_title ? `*${session.doc_title}*` : "_not set_";
+      const typeStr = session.doc_type ? `*${session.doc_type}*` : "_not set_";
+      const costStr =
+        session.cost_amount != null ? `*${session.cost_amount}* KES` : "_not recorded_";
+      const expStr = session.expiry_date ? `*${session.expiry_date}*` : "_none set_";
+      const notesStr = session.notes ? session.notes : "_none_";
+
+      return (
+        "Please confirm this personal document:\n\n" +
+        "Title: " +
+        titleStr +
+        "\n" +
+        "Type: " +
+        typeStr +
+        "\n" +
+        "Cost: " +
+        costStr +
+        "\n" +
+        "Expiry: " +
+        expStr +
+        "\n" +
+        "Notes: " +
+        notesStr +
+        "\n\n" +
+        "Reply *YES* to save or *NO* to cancel."
+      );
+    }
+
+    // YES → save to personal_documents
+    try {
+      let driverId = null;
+      let driverWhatsapp = userWhatsapp;
+
+      // If this WhatsApp has a driver profile, attach it
+      const driver = await findDriverByWhatsapp(userWhatsapp);
+      if (driver) {
+        driverId = driver.id;
+        driverWhatsapp = driver.driver_whatsapp || userWhatsapp;
+      }
+
+      await pool.query(
+        `
+        INSERT INTO personal_documents (
+          owner_whatsapp,
+          driver_whatsapp,
+          driver_id,
+          doc_title,
+          doc_type,
+          cost_amount,
+          currency,
+          expiry_date,
+          notes
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, 'KES', $7, $8)
+        `,
+        [
+          userWhatsapp,
+          driverWhatsapp,
+          driverId,
+          session.doc_title || null,
+          session.doc_type || null,
+          session.cost_amount != null ? session.cost_amount : null,
+          session.expiry_date || null,
+          session.notes || null,
+        ]
+      );
+
+      session.status = "COMPLETED";
+      await savePersonalDocumentSession(session);
+
+      const titleStr = session.doc_title ? `*${session.doc_title}*` : "_not set_";
+      const typeStr = session.doc_type ? `*${session.doc_type}*` : "_not set_";
+      const costStr =
+        session.cost_amount != null ? `*${session.cost_amount}* KES` : "_not recorded_";
+      const expStr = session.expiry_date ? `*${session.expiry_date}*` : "_none set_";
+      const notesStr = session.notes ? session.notes : "_none_";
+
+      return (
+        "✅ Personal document saved.\n\n" +
+        "Title: " +
+        titleStr +
+        "\n" +
+        "Type: " +
+        typeStr +
+        "\n" +
+        "Cost: " +
+        costStr +
+        "\n" +
+        "Expiry: " +
+        expStr +
+        "\n" +
+        "Notes: " +
+        notesStr +
+        "\n\n" +
+        "I'll keep this in your personal/driver compliance records."
+      );
+    } catch (err) {
+      console.error("❌ Error saving personal document:", err.message);
+      session.status = "ERROR";
+      await savePersonalDocumentSession(session);
+      return (
+        "Sorry, I couldn't save that document due to a system error.\n" +
+        "Please try again later."
+      );
+    }
+  }
+
+  console.warn("⚠️ Personal document session in unknown step:", session.step);
+  session.status = "ERROR";
+  await savePersonalDocumentSession(session);
+  return (
+    "Something went wrong with this personal document.\n" +
+    "Please start again with *my document*."
+  );
+}
+
+
 
 // ====== SERVICE SESSION HELPERS ====== (unchanged from your version – kept for brevity)
 // ... [SERVICE helpers from your current file stay exactly as-is here]
@@ -3130,15 +3470,13 @@ async function buildServiceReport(userWhatsapp, options = {}) {
     heading = "📊 *Service summary – all vehicles*";
   }
 
-  // NOTE: this assumes your table is called service_logs and has a 'cost' column.
-  // If your column is named differently (e.g. 'amount'), just change SUM(cost) accordingly.
   const summaryRes = await pool.query(
     `
     SELECT
-      COUNT(*)::BIGINT        AS count,
-      COALESCE(SUM(cost), 0)  AS total_cost,
-      MIN(created_at)         AS first_at,
-      MAX(created_at)         AS last_at
+      COUNT(*)::BIGINT            AS count,
+      COALESCE(SUM(total_cost),0) AS total_cost,
+      MIN(created_at)             AS first_at,
+      MAX(created_at)             AS last_at
     FROM service_logs
     WHERE ${where}
     `,
@@ -3171,11 +3509,12 @@ async function buildServiceReport(userWhatsapp, options = {}) {
   const firstStr = firstAt ? firstAt.toISOString().slice(0, 10) : "n/a";
   const lastStr = lastAt ? lastAt.toISOString().slice(0, 10) : "n/a";
 
-  // NOTE: assumes columns service_type, cost, odometer exist.
-  // If your names differ, tweak to match your table schema.
   const latestRes = await pool.query(
     `
-    SELECT service_type, cost, odometer, created_at
+    SELECT service_type,
+           total_cost,
+           odometer,
+           created_at
     FROM service_logs
     WHERE ${where}
     ORDER BY created_at DESC
@@ -3208,9 +3547,8 @@ async function buildServiceReport(userWhatsapp, options = {}) {
       const d = s.created_at ? new Date(s.created_at) : null;
       const dStr = d ? d.toISOString().slice(0, 10) : "n/a";
       const type = s.service_type || "Service";
-      const cost = s.cost != null ? Number(s.cost) : 0;
-      const odoStr =
-        s.odometer != null ? ` @ *${s.odometer}* km` : "";
+      const cost = s.total_cost != null ? Number(s.total_cost) : 0;
+      const odoStr = s.odometer != null ? ` @ *${s.odometer}* km` : "";
 
       text +=
         "\n• " +
@@ -3227,7 +3565,7 @@ async function buildServiceReport(userWhatsapp, options = {}) {
     const byVehicleRes = await pool.query(
       `
       SELECT v.registration,
-             COALESCE(SUM(s.cost), 0) AS total_cost
+             COALESCE(SUM(s.total_cost), 0) AS total_cost
       FROM service_logs s
       JOIN vehicles v ON v.id = s.vehicle_id
       WHERE s.user_whatsapp = $1
