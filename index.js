@@ -1967,7 +1967,7 @@ async function handleServiceSessionStep(session, incomingText) {
     const partsStr =
       session.parts_cost != null ? `*${session.parts_cost}* KES` : "_0_";
     const totalStr =
-      session.total_cost != null ? `*${session.total_cost}* KES` : "_0_`;
+      session.total_cost != null ? `*${session.total_cost}* KES` : "_0_";
     const garageStr = session.garage ? session.garage : "_not set_";
     const odoStr =
       session.odometer != null ? `*${session.odometer}*` : "_not set_";
