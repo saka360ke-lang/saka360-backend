@@ -3598,6 +3598,164 @@ async function buildServiceReport(userWhatsapp, options = {}) {
   return text;
 }
 
+// REAL expense report – current vehicle vs all vehicles
+async function buildExpenseReport(userWhatsapp, options = {}) {
+  const allVehicles = !!options.allVehicles;
+
+  let where = "user_whatsapp = $1";
+  const params = [userWhatsapp];
+  let heading = "";
+  let vehicle = null;
+
+  if (!allVehicles) {
+    const vRes = await ensureCurrentVehicle(userWhatsapp);
+    if (vRes.status === "NO_VEHICLES") {
+      return (
+        "You don't have any vehicles yet.\n\n" +
+        "Add one with:\n" +
+        "*add vehicle KDA 123A*"
+      );
+    } else if (vRes.status === "NEED_SET_CURRENT") {
+      const listText = formatVehiclesList(vRes.list, true);
+      return (
+        "You have multiple vehicles. Please choose which one you want an expense report for.\n\n" +
+        listText +
+        "\n\nReply with e.g. *switch to 1*, then send *expense report* again."
+      );
+    }
+    vehicle = vRes.vehicle;
+    where += " AND vehicle_id = $2";
+    params.push(vehicle.id);
+    heading = "💸 *Expense summary – " + vehicle.registration + "*";
+  } else {
+    heading = "💸 *Expense summary – all vehicles*";
+  }
+
+  const summaryRes = await pool.query(
+    `
+    SELECT
+      COUNT(*)::BIGINT         AS count,
+      COALESCE(SUM(amount),0)  AS total_amount,
+      MIN(created_at)          AS first_at,
+      MAX(created_at)          AS last_at
+    FROM expense_logs
+    WHERE ${where}
+    `,
+    params
+  );
+
+  const row = summaryRes.rows[0] || {};
+  const count = parseInt(row.count || "0", 10);
+  const totalAmount = parseFloat(row.total_amount || "0");
+
+  if (!count || count === 0) {
+    if (allVehicles) {
+      return (
+        heading +
+        "\n\nYou don't have any expense logs yet.\n\n" +
+        "Start with *expense* to log your first cost."
+      );
+    }
+    return (
+      heading +
+      "\n\nYou don't have any expense logs for your *current vehicle* yet.\n\n" +
+      "Start with *expense* to log your first cost."
+    );
+  }
+
+  const avgPerExpense = totalAmount / count;
+  const firstAt = row.first_at ? new Date(row.first_at) : null;
+  const lastAt = row.last_at ? new Date(row.last_at) : null;
+
+  const firstStr = firstAt ? firstAt.toISOString().slice(0, 10) : "n/a";
+  const lastStr = lastAt ? lastAt.toISOString().slice(0, 10) : "n/a";
+
+  const latestRes = await pool.query(
+    `
+    SELECT title, amount, odometer, created_at
+    FROM expense_logs
+    WHERE ${where}
+    ORDER BY created_at DESC
+    LIMIT 5
+    `,
+    params
+  );
+
+  let text =
+    heading +
+    "\n\n" +
+    "Period: *" +
+    firstStr +
+    "* → *" +
+    lastStr +
+    "*\n" +
+    "Expenses: *" +
+    count +
+    "*\n" +
+    "Total amount: *" +
+    totalAmount.toFixed(0) +
+    "* KES\n" +
+    "Average per expense: *" +
+    avgPerExpense.toFixed(0) +
+    "* KES\n";
+
+  if (latestRes.rows.length > 0) {
+    text += "\n💸 *Last 5 expenses*:";
+    latestRes.rows.forEach((e) => {
+      const d = e.created_at ? new Date(e.created_at) : null;
+      const dStr = d ? d.toISOString().slice(0, 10) : "n/a";
+      const title = e.title || "Expense";
+      const amount = e.amount != null ? Number(e.amount) : 0;
+      const odoStr = e.odometer != null ? ` @ *${e.odometer}* km` : "";
+
+      text +=
+        "\n• " +
+        dStr +
+        " – *" +
+        amount.toFixed(0) +
+        "* KES – " +
+        title +
+        odoStr;
+    });
+  }
+
+  if (allVehicles) {
+    const byVehicleRes = await pool.query(
+      `
+      SELECT v.registration,
+             COALESCE(SUM(e.amount), 0) AS total_amount
+      FROM expense_logs e
+      JOIN vehicles v ON v.id = e.vehicle_id
+      WHERE e.user_whatsapp = $1
+      GROUP BY v.registration
+      ORDER BY total_amount DESC
+      LIMIT 5
+      `,
+      [userWhatsapp]
+    );
+
+    if (byVehicleRes.rows.length > 0) {
+      text += "\n\n🚗 *Top vehicles by other expenses*:";
+      byVehicleRes.rows.forEach((r) => {
+        const reg = r.registration || "Vehicle";
+        const t = r.total_amount != null ? Number(r.total_amount) : 0;
+        text +=
+          "\n• *" +
+          reg +
+          "* – *" +
+          t.toFixed(0) +
+          "* KES total";
+      });
+    }
+  }
+
+  text +=
+    "\n\nYou can log a new expense anytime with *expense*.\n" +
+    "Use *expense report* for the current vehicle, or *expense report all* for your whole fleet.";
+
+  return text;
+}
+
 // ====== AI FALLBACK → n8n ======
 async function callN8nAi(from, text) {
   if (!N8N_WEBHOOK_URL) {
