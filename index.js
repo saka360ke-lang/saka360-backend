@@ -2565,7 +2565,6 @@ async function handleVehicleDocumentSessionStep(session, incomingText) {
 }
 
 
-
 // ====== SERVICE SESSION HELPERS ====== (unchanged from your version – kept for brevity)
 // ... [SERVICE helpers from your current file stay exactly as-is here]
 // (Keep all: getActiveServiceSession, saveServiceSession, startServiceSession, handleServiceSessionStep)
