@@ -2178,6 +2178,393 @@ async function handleServiceSessionStep(session, incomingText) {
   );
 }
 
+// ====== VEHICLE DOCUMENT SESSION HELPERS ======
+
+async function getActiveVehicleDocumentSession(userWhatsapp) {
+  try {
+    const res = await pool.query(
+      `
+      SELECT *
+      FROM vehicle_document_sessions
+      WHERE user_whatsapp = $1
+        AND status = 'active'
+      ORDER BY created_at DESC
+      LIMIT 1
+      `,
+      [userWhatsapp]
+    );
+    return res.rows[0] || null;
+  } catch (err) {
+    console.error("❌ Error fetching vehicle_document_session:", err.message);
+    return null;
+  }
+}
+
+async function saveVehicleDocumentSession(session) {
+  try {
+    await pool.query(
+      `
+      UPDATE vehicle_document_sessions
+      SET
+        step = $2,
+        title = $3,
+        cost = $4,
+        expiry_date = $5,
+        notes = $6,
+        status = $7,
+        updated_at = NOW()
+      WHERE id = $1
+      `,
+      [
+        session.id,
+        session.step,
+        session.title || null,
+        session.cost != null ? session.cost : null,
+        session.expiry_date || null,
+        session.notes || null,
+        session.status || "active",
+      ]
+    );
+  } catch (err) {
+    console.error("❌ Error saving vehicle_document_session:", err.message);
+  }
+}
+
+async function startVehicleDocumentSession(userWhatsapp) {
+  const vRes = await ensureCurrentVehicle(userWhatsapp);
+
+  if (vRes.status === "NO_VEHICLES") {
+    return {
+      session: null,
+      reply:
+        "You don't have any vehicles yet.\n\n" +
+        "Add one with:\n" +
+        "*add vehicle KDA 123A*",
+    };
+  }
+
+  if (vRes.status === "NEED_SET_CURRENT") {
+    const listText = formatVehiclesList(vRes.list, true);
+    return {
+      session: null,
+      reply:
+        "You have multiple vehicles. Please choose which one you want to add a document for.\n\n" +
+        listText +
+        "\n\nReply with e.g. *switch to 1*, then send *add document* again.",
+    };
+  }
+
+  const vehicle = vRes.vehicle;
+
+  const insert = await pool.query(
+    `
+    INSERT INTO vehicle_document_sessions (
+      user_whatsapp,
+      vehicle_id,
+      step,
+      status
+    )
+    VALUES ($1, $2, 'ask_title', 'active')
+    RETURNING *
+    `,
+    [userWhatsapp, vehicle.id]
+  );
+
+  const session = insert.rows[0];
+
+  const reply =
+    "📄 Let's add a document for *" +
+    vehicle.registration +
+    "*.\n\n" +
+    "What document is this?\n" +
+    "Example: *Insurance - Britam Comprehensive*, *Inspection certificate*";
+
+  return { session, reply };
+}
+
+async function handleVehicleDocumentSessionStep(session, incomingText) {
+  const text = String(incomingText || "").trim();
+  const lower = text.toLowerCase();
+
+  if (["cancel", "stop", "reset"].includes(lower)) {
+    session.status = "cancelled";
+    await saveVehicleDocumentSession(session);
+    return (
+      "✅ I’ve cancelled your document entry.\n" +
+      "You can start again with *document* or *add document*."
+    );
+  }
+
+  let vehicleReg = "this vehicle";
+  try {
+    const vRes = await pool.query(
+      `SELECT registration FROM vehicles WHERE id = $1`,
+      [session.vehicle_id]
+    );
+    if (vRes.rows[0] && vRes.rows[0].registration) {
+      vehicleReg = vRes.rows[0].registration;
+    }
+  } catch (err) {
+    console.error(
+      "⚠️ Error fetching vehicle for document session:",
+      err.message
+    );
+  }
+
+  if (session.step === "ask_title") {
+    if (!text) {
+      return (
+        "Please enter the *document name*.\n" +
+        "Example: *Insurance - CIC Comprehensive*"
+      );
+    }
+
+    session.title = text;
+    session.step = "ask_cost";
+    await saveVehicleDocumentSession(session);
+
+    return (
+      "How much did you pay for this document? (KES)\n" +
+      "Reply *0* if it was free."
+    );
+  }
+
+  if (session.step === "ask_cost") {
+    const amount = parseNumber(text);
+    if (isNaN(amount) || amount < 0) {
+      return "That amount doesn't look valid. Please send a number in KES (e.g. *6500*).";
+    }
+
+    session.cost = amount;
+    session.step = "ask_expiry";
+    await saveVehicleDocumentSession(session);
+
+    return (
+      "When does this document *expire*?\n" +
+      "Please send in *YYYY-MM-DD* format (e.g. *2026-01-01*).\n" +
+      "Reply *skip* if there is no expiry date."
+    );
+  }
+
+  if (session.step === "ask_expiry") {
+    if (lower === "skip") {
+      session.expiry_date = null;
+    } else {
+      const m = text.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+      if (!m) {
+        return (
+          "That date doesn't look valid.\n" +
+          "Please send in *YYYY-MM-DD* format (e.g. *2026-01-01*),\n" +
+          "or reply *skip* if there is no expiry."
+        );
+      }
+      session.expiry_date = text;
+    }
+
+    session.step = "ask_notes";
+    await saveVehicleDocumentSession(session);
+
+    return (
+      "Any notes about this document? (e.g. *third party cover*, *fleet insurance*, etc.)\n" +
+      "Reply *skip* to leave notes blank."
+    );
+  }
+
+  if (session.step === "ask_notes") {
+    if (lower === "skip") {
+      session.notes = null;
+    } else {
+      session.notes = text;
+    }
+
+    session.step = "confirm";
+    await saveVehicleDocumentSession(session);
+
+    const expStr = session.expiry_date
+      ? `*${session.expiry_date}*`
+      : "_none set_";
+    const costStr =
+      session.cost != null ? `*${session.cost}* KES` : "_not recorded_";
+    const notesStr = session.notes ? session.notes : "_none_";
+
+    return (
+      "Please confirm this document entry:\n\n" +
+      "Vehicle: *" +
+      vehicleReg +
+      "*\n" +
+      "Title: *" +
+      session.title +
+      "*\n" +
+      "Cost: " +
+      costStr +
+      "\n" +
+      "Expiry: " +
+      expStr +
+      "\n" +
+      "Notes: " +
+      notesStr +
+      "\n\n" +
+      "Reply *YES* to save or *NO* to cancel."
+    );
+  }
+
+  if (session.step === "confirm") {
+    if (["yes", "y"].includes(lower)) {
+      try {
+        const docRes = await pool.query(
+          `
+          INSERT INTO vehicle_documents (
+            vehicle_id,
+            title,
+            cost,
+            expiry_date,
+            notes
+          )
+          VALUES ($1, $2, $3, $4, $5)
+          RETURNING *
+          `,
+          [
+            session.vehicle_id,
+            session.title,
+            session.cost != null ? session.cost : null,
+            session.expiry_date || null,
+            session.notes || null,
+          ]
+        );
+
+        const doc = docRes.rows[0];
+
+        if (session.cost && Number(session.cost) > 0) {
+          try {
+            const messageText =
+              "Vehicle document: " +
+              session.title +
+              " (" +
+              session.cost +
+              " KES)";
+
+            await pool.query(
+              `
+              INSERT INTO expense_logs (
+                user_whatsapp,
+                vehicle_id,
+                title,
+                amount,
+                odometer,
+                notes,
+                message_text
+              )
+              VALUES ($1, $2, $3, $4, NULL, $5, $6)
+              `,
+              [
+                session.user_whatsapp,
+                session.vehicle_id,
+                "Document: " + session.title,
+                session.cost,
+                session.notes || null,
+                messageText,
+              ]
+            );
+          } catch (err) {
+            console.error(
+              "⚠️ Could not insert expense for vehicle document:",
+              err.message
+            );
+          }
+        }
+
+        if (session.expiry_date) {
+          try {
+            await pool.query(
+              `
+              INSERT INTO reminders (
+                user_whatsapp,
+                vehicle_id,
+                reminder_type,
+                label,
+                due_date,
+                is_done
+              )
+              VALUES ($1, $2, $3, $4, $5, FALSE)
+              `,
+              [
+                session.user_whatsapp,
+                session.vehicle_id,
+                "vehicle_document",
+                session.title,
+                session.expiry_date,
+              ]
+            );
+          } catch (err) {
+            console.error(
+              "⚠️ Could not insert reminder for vehicle document:",
+              err.message
+            );
+          }
+        }
+
+        session.status = "completed";
+        await saveVehicleDocumentSession(session);
+
+        const costStr =
+          doc.cost != null ? `*${doc.cost}* KES` : "_not recorded_";
+        const expStr = doc.expiry_date
+          ? `*${String(doc.expiry_date).slice(0, 10)}*`
+          : "_none set_";
+        const notesStr = doc.notes ? doc.notes : "_none_";
+
+        return (
+          "✅ Document saved.\n\n" +
+          "Vehicle: *" +
+          vehicleReg +
+          "*\n" +
+          "Title: *" +
+          doc.title +
+          "*\n" +
+          "Cost: " +
+          costStr +
+          "\n" +
+          "Expiry: " +
+          expStr +
+          "\n" +
+          "Notes: " +
+          notesStr +
+          "\n\n" +
+          "I'll include this in your *vehicle compliance* and *expense* summaries."
+        );
+      } catch (err) {
+        console.error("❌ Error saving vehicle document:", err.message);
+        session.status = "error";
+        await saveVehicleDocumentSession(session);
+        return (
+          "Sorry, I couldn't save that document due to a system error.\n" +
+          "Please try again later."
+        );
+      }
+    }
+
+    if (["no", "n"].includes(lower)) {
+      session.status = "cancelled";
+      await saveVehicleDocumentSession(session);
+      return (
+        "Okay, I’ve *cancelled* that document entry.\n" +
+        "You can start again with *document* or *add document*."
+      );
+    }
+
+    return 'Please reply with *YES* to save or *NO* to cancel this document entry.';
+  }
+
+  console.warn("⚠️ Vehicle document session in unknown step:", session.step);
+  session.status = "error";
+  await saveVehicleDocumentSession(session);
+  return (
+    "Something went wrong with this document entry.\n" +
+    "Please start again with *document* or *add document*."
+  );
+}
+
+
 
 // ====== SERVICE SESSION HELPERS ====== (unchanged from your version – kept for brevity)
 // ... [SERVICE helpers from your current file stay exactly as-is here]
