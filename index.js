@@ -1649,6 +1649,536 @@ async function handleFuelSessionStep(session, incomingText) {
   );
 }
 
+// ====== SERVICE SESSION HELPERS ======
+async function getActiveServiceSession(userWhatsapp) {
+  try {
+    const res = await pool.query(
+      `
+      SELECT *
+      FROM service_sessions
+      WHERE user_whatsapp = $1
+        AND step NOT IN ('completed', 'cancelled', 'error')
+      ORDER BY created_at DESC
+      LIMIT 1
+      `,
+      [userWhatsapp]
+    );
+    return res.rows[0] || null;
+  } catch (err) {
+    console.error("❌ Error fetching service_session:", err.message);
+    return null;
+  }
+}
+
+async function saveServiceSession(session) {
+  try {
+    await pool.query(
+      `
+      UPDATE service_sessions
+      SET
+        step = $2,
+        service_type = $3,
+        labour_cost = $4,
+        parts_cost = $5,
+        total_cost = $6,
+        garage = $7,
+        odometer = $8,
+        notes = $9,
+        reminder_type = $10,
+        reminder_value = $11,
+        updated_at = NOW()
+      WHERE id = $1
+      `,
+      [
+        session.id,
+        session.step,
+        session.service_type || null,
+        session.labour_cost != null ? session.labour_cost : null,
+        session.parts_cost != null ? session.parts_cost : null,
+        session.total_cost != null ? session.total_cost : null,
+        session.garage || null,
+        session.odometer != null ? session.odometer : null,
+        session.notes || null,
+        session.reminder_type || null,
+        session.reminder_value || null,
+      ]
+    );
+  } catch (err) {
+    console.error("❌ Error saving service_session:", err.message);
+  }
+}
+
+async function startServiceSession(userWhatsapp) {
+  const vRes = await ensureCurrentVehicle(userWhatsapp);
+
+  if (vRes.status === "NO_VEHICLES") {
+    return {
+      session: null,
+      reply:
+        "You don't have any vehicles yet.\n\n" +
+        "Add one with:\n" +
+        "*add vehicle KDA 123A*",
+    };
+  }
+
+  if (vRes.status === "NEED_SET_CURRENT") {
+    const listText = formatVehiclesList(vRes.list, true);
+    return {
+      session: null,
+      reply:
+        "You have multiple vehicles. Please choose which one you want to log a service for.\n\n" +
+        listText +
+        "\n\nReply with e.g. *switch to 1*, then send *service* again.",
+    };
+  }
+
+  const vehicle = vRes.vehicle;
+
+  const insert = await pool.query(
+    `
+    INSERT INTO service_sessions (
+      user_whatsapp,
+      vehicle_id,
+      step
+    )
+    VALUES ($1, $2, 'ask_type')
+    RETURNING *
+    `,
+    [userWhatsapp, vehicle.id]
+  );
+
+  const session = insert.rows[0];
+
+  const reply =
+    "🛠️ Let's log a service for *" +
+    vehicle.registration +
+    "*.\n" +
+    "First, what kind of service was this?\n" +
+    "For example: *major*, *minor*, *oil change*, *grease service*, *tyre rotation*...";
+
+  return { session, reply };
+}
+
+async function handleServiceSessionStep(session, incomingText) {
+  const text = String(incomingText || "").trim();
+  const lower = text.toLowerCase();
+
+  if (["cancel", "stop", "reset"].includes(lower)) {
+    session.step = "cancelled";
+    await saveServiceSession(session);
+    return (
+      "✅ I’ve cancelled your service entry.\n" +
+      "You can start again with *service*."
+    );
+  }
+
+  let vehicleReg = "this vehicle";
+  let driverId = null;
+  try {
+    const vRes = await pool.query(
+      `SELECT registration, driver_id FROM vehicles WHERE id = $1`,
+      [session.vehicle_id]
+    );
+    if (vRes.rows[0]) {
+      if (vRes.rows[0].registration) {
+        vehicleReg = vRes.rows[0].registration;
+      }
+      if (vRes.rows[0].driver_id) {
+        driverId = vRes.rows[0].driver_id;
+      }
+    }
+  } catch (err) {
+    console.error("⚠️ Error fetching vehicle for service session:", err.message);
+  }
+
+  if (session.step === "ask_type") {
+    if (!text) {
+      return (
+        "What kind of service was this?\n" +
+        "For example: *major*, *minor*, *oil change*, *grease service*, *tyre rotation*..."
+      );
+    }
+
+    session.service_type = text;
+    session.step = "ask_labour";
+    await saveServiceSession(session);
+
+    return (
+      "Got it 👍\n" +
+      "How much did you pay for *labour only*? (KES)\n" +
+      "Example: *8500*"
+    );
+  }
+
+  if (session.step === "ask_labour") {
+    const labour = parseNumber(text);
+    if (isNaN(labour) || labour < 0) {
+      return "That labour amount doesn't look valid. Please send a number in KES (e.g. *8500*).";
+    }
+
+    session.labour_cost = labour;
+    session.step = "ask_parts";
+    await saveServiceSession(session);
+
+    return (
+      "Thanks.\n" +
+      "Now how much did you pay for *parts/materials*? (KES)\n" +
+      "Reply *0* if there were no parts."
+    );
+  }
+
+  if (session.step === "ask_parts") {
+    const parts = parseNumber(text);
+    if (isNaN(parts) || parts < 0) {
+      return "That parts amount doesn't look valid. Please send a number in KES (e.g. *12000*).";
+    }
+
+    session.parts_cost = parts;
+    const labour = session.labour_cost || 0;
+    session.total_cost = labour + parts;
+
+    session.step = "ask_garage";
+    await saveServiceSession(session);
+
+    return (
+      "Great.\n" +
+      "Which garage or place did you service at?\n" +
+      "Example: *Toyo Motors*, *Shell Ngong Road*.\n" +
+      "Reply *skip* to leave this blank."
+    );
+  }
+
+  if (session.step === "ask_garage") {
+    if (lower === "skip") {
+      session.garage = null;
+    } else {
+      session.garage = text;
+    }
+
+    session.step = "ask_odo";
+    await saveServiceSession(session);
+
+    return (
+      "What was the *odometer reading* after the service?\n" +
+      "Example: *145000*"
+    );
+  }
+
+  if (session.step === "ask_odo") {
+    const odoNum = parseNumber(text);
+    if (isNaN(odoNum) || odoNum < 0) {
+      return "That odometer value doesn't look valid. Please send a number like *145000*.";
+    }
+
+    session.odometer = Math.round(odoNum);
+    session.step = "ask_notes";
+    await saveServiceSession(session);
+
+    return (
+      "Any notes about what was done? (e.g. *changed oil & filters, rotated tyres*)\n" +
+      "Reply *skip* to leave notes blank."
+    );
+  }
+
+  if (session.step === "ask_notes") {
+    if (lower === "skip") {
+      session.notes = null;
+    } else {
+      session.notes = text;
+    }
+
+    session.step = "ask_reminder_type";
+    await saveServiceSession(session);
+
+    return (
+      "Would you like a *reminder* for the next service?\n\n" +
+      "Reply with one of:\n" +
+      "• *none* – no reminder\n" +
+      "• *km* – remind after a certain mileage (e.g. 5000 km)\n" +
+      "• *date* – remind on a specific date (YYYY-MM-DD)"
+    );
+  }
+
+  if (session.step === "ask_reminder_type") {
+    if (["none", "no"].includes(lower)) {
+      session.reminder_type = null;
+      session.reminder_value = null;
+      session.step = "confirm";
+      await saveServiceSession(session);
+    } else if (lower === "km") {
+      session.reminder_type = "km";
+      session.step = "ask_reminder_value";
+      await saveServiceSession(session);
+      return (
+        "How many *km* until the next service reminder?\n" +
+        "Example: *5000* (for 5,000 km from now)."
+      );
+    } else if (lower === "date") {
+      session.reminder_type = "date";
+      session.step = "ask_reminder_value";
+      await saveServiceSession(session);
+      return (
+        "On which *date* should I remind you?\n" +
+        "Use *YYYY-MM-DD* format (e.g. *2026-01-01*)."
+      );
+    } else {
+      return (
+        "I didn't understand that reminder type.\n\n" +
+        "Reply:\n" +
+        "• *none* – no reminder\n" +
+        "• *km* – remind after a certain mileage\n" +
+        "• *date* – remind on a specific date (YYYY-MM-DD)"
+      );
+    }
+  }
+
+  if (session.step === "ask_reminder_value") {
+    if (session.reminder_type === "km") {
+      const km = parseNumber(text);
+      if (isNaN(km) || km <= 0) {
+        return "That doesn't look like a valid km value. Please send a positive number (e.g. *5000*).";
+      }
+
+      session.reminder_value = String(Math.round(km));
+      session.step = "confirm";
+      await saveServiceSession(session);
+    } else if (session.reminder_type === "date") {
+      const m = text.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+      if (!m) {
+        return (
+          "That date doesn't look valid.\n" +
+          "Please send in *YYYY-MM-DD* format (e.g. *2026-01-01*)."
+        );
+      }
+      session.reminder_value = text;
+      session.step = "confirm";
+      await saveServiceSession(session);
+    } else {
+      session.reminder_type = null;
+      session.reminder_value = null;
+      session.step = "confirm";
+      await saveServiceSession(session);
+    }
+  }
+
+  if (session.step === "confirm") {
+    const labourStr =
+      session.labour_cost != null ? `*${session.labour_cost}* KES` : "_0_";
+    const partsStr =
+      session.parts_cost != null ? `*${session.parts_cost}* KES` : "_0_";
+    const totalStr =
+      session.total_cost != null ? `*${session.total_cost}* KES` : "_0_`;
+    const garageStr = session.garage ? session.garage : "_not set_";
+    const odoStr =
+      session.odometer != null ? `*${session.odometer}*` : "_not set_";
+    const notesStr = session.notes ? session.notes : "_none_";
+
+    let reminderStr = "_none_";
+    if (session.reminder_type === "km" && session.reminder_value) {
+      reminderStr = "After *" + session.reminder_value + "* km";
+    } else if (session.reminder_type === "date" && session.reminder_value) {
+      reminderStr = "On *" + session.reminder_value + "*";
+    }
+
+    if (!["yes", "y", "no", "n"].includes(lower)) {
+      return (
+        "Please confirm this service entry:\n\n" +
+        "Vehicle: *" +
+        vehicleReg +
+        "*\n" +
+        "Service type: *" +
+        session.service_type +
+        "*\n" +
+        "Labour: " +
+        labourStr +
+        "\n" +
+        "Parts: " +
+        partsStr +
+        "\n" +
+        "Total: " +
+        totalStr +
+        "\n" +
+        "Garage: *" +
+        garageStr +
+        "*\n" +
+        "Odometer: " +
+        odoStr +
+        "\n" +
+        "Notes: " +
+        notesStr +
+        "\n" +
+        "Reminder: " +
+        reminderStr +
+        "\n\n" +
+        "Reply *YES* to save or *NO* to cancel."
+      );
+    }
+
+    if (["no", "n"].includes(lower)) {
+      session.step = "cancelled";
+      await saveServiceSession(session);
+      return (
+        "Okay, I’ve *cancelled* that service entry.\n" +
+        "You can start again with *service*."
+      );
+    }
+
+    if (["yes", "y"].includes(lower)) {
+      try {
+        const messageText =
+          "Service: " +
+          (session.service_type || "n/a") +
+          ", labour " +
+          (session.labour_cost || 0) +
+          " KES, parts " +
+          (session.parts_cost || 0) +
+          " KES, total " +
+          (session.total_cost || 0) +
+          " KES, garage " +
+          (session.garage || "n/a") +
+          ", odometer " +
+          (session.odometer != null ? session.odometer : "n/a");
+
+        await pool.query(
+          `
+          INSERT INTO service_logs (
+            user_whatsapp,
+            vehicle_id,
+            driver_id,
+            service_type,
+            labour_cost,
+            parts_cost,
+            total_cost,
+            garage,
+            odometer,
+            notes,
+            reminder_type,
+            reminder_value,
+            message_text
+          )
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+          `,
+          [
+            session.user_whatsapp,
+            session.vehicle_id,
+            driverId,
+            session.service_type || null,
+            session.labour_cost != null ? session.labour_cost : null,
+            session.parts_cost != null ? session.parts_cost : null,
+            session.total_cost != null ? session.total_cost : null,
+            session.garage || null,
+            session.odometer != null ? session.odometer : null,
+            session.notes || null,
+            session.reminder_type || null,
+            session.reminder_value || null,
+            messageText,
+          ]
+        );
+
+        if (session.reminder_type && session.reminder_value) {
+          try {
+            if (session.reminder_type === "km") {
+              await pool.query(
+                `
+                INSERT INTO reminders (
+                  user_whatsapp,
+                  vehicle_id,
+                  reminder_type,
+                  label,
+                  due_odo,
+                  is_done
+                )
+                VALUES ($1, $2, 'service_km', $3, $4, FALSE)
+                `,
+                [
+                  session.user_whatsapp,
+                  session.vehicle_id,
+                  session.service_type || "Service",
+                  session.reminder_value,
+                ]
+              );
+            } else if (session.reminder_type === "date") {
+              await pool.query(
+                `
+                INSERT INTO reminders (
+                  user_whatsapp,
+                  vehicle_id,
+                  reminder_type,
+                  label,
+                  due_date,
+                  is_done
+                )
+                VALUES ($1, $2, 'service_date', $3, $4, FALSE)
+                `,
+                [
+                  session.user_whatsapp,
+                  session.vehicle_id,
+                  session.service_type || "Service",
+                  session.reminder_value,
+                ]
+              );
+            }
+          } catch (err) {
+            console.error("⚠️ Could not insert service reminder:", err.message);
+          }
+        }
+
+        session.step = "completed";
+        await saveServiceSession(session);
+
+        return (
+          "✅ Service entry saved.\n\n" +
+          "Vehicle: *" +
+          vehicleReg +
+          "*\n" +
+          "Service type: *" +
+          session.service_type +
+          "*\n" +
+          "Labour: " +
+          labourStr +
+          "\n" +
+          "Parts: " +
+          partsStr +
+          "\n" +
+          "Total: " +
+          totalStr +
+          "\n" +
+          "Garage: *" +
+          garageStr +
+          "*\n" +
+          "Odometer: " +
+          odoStr +
+          "\n" +
+          "Notes: " +
+          notesStr +
+          "\n" +
+          "Reminder: " +
+          reminderStr +
+          "\n\n" +
+          "This will appear in your service and compliance reports."
+        );
+      } catch (err) {
+        console.error("❌ Error saving service log:", err.message);
+        session.step = "error";
+        await saveServiceSession(session);
+        return (
+          "Sorry, I couldn't save that service entry due to a system error.\n" +
+          "Please try again later."
+        );
+      }
+    }
+  }
+
+  console.warn("⚠️ Service session in unknown step:", session.step);
+  session.step = "error";
+  await saveServiceSession(session);
+  return (
+    "Something went wrong with this service entry.\n" +
+    "Please start again with *service*."
+  );
+}
+
+
 // ====== SERVICE SESSION HELPERS ====== (unchanged from your version – kept for brevity)
 // ... [SERVICE helpers from your current file stay exactly as-is here]
 // (Keep all: getActiveServiceSession, saveServiceSession, startServiceSession, handleServiceSessionStep)
