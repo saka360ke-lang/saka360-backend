@@ -198,21 +198,37 @@ async function ensurePersonalDocumentsTables() {
 ensurePersonalDocumentsTables();
 
 // Ensure expense tables (logs + sessions)
+// Ensure expense_logs & expense_sessions tables (idempotent + add missing columns)
 async function ensureExpenseTables() {
   try {
+    // Base definition for fresh installs
     await pool.query(`
       CREATE TABLE IF NOT EXISTS expense_logs (
         id            SERIAL PRIMARY KEY,
         user_whatsapp TEXT NOT NULL,
-        vehicle_id    INTEGER NOT NULL,
-        driver_id     INTEGER,
-        title         TEXT,
-        amount        NUMERIC,
+        vehicle_id    INTEGER REFERENCES vehicles(id) ON DELETE SET NULL,
+        driver_id     INTEGER REFERENCES drivers(id) ON DELETE SET NULL,
+        title         TEXT NOT NULL,
+        amount        NUMERIC(12,2) NOT NULL,
         odometer      INTEGER,
         notes         TEXT,
         message_text  TEXT,
         created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
+    `);
+
+    // Ensure all expected columns exist, even if table was created earlier
+    await pool.query(`
+      ALTER TABLE expense_logs
+        ADD COLUMN IF NOT EXISTS user_whatsapp TEXT,
+        ADD COLUMN IF NOT EXISTS vehicle_id INTEGER REFERENCES vehicles(id) ON DELETE SET NULL,
+        ADD COLUMN IF NOT EXISTS driver_id INTEGER REFERENCES drivers(id) ON DELETE SET NULL,
+        ADD COLUMN IF NOT EXISTS title TEXT,
+        ADD COLUMN IF NOT EXISTS amount NUMERIC(12,2),
+        ADD COLUMN IF NOT EXISTS odometer INTEGER,
+        ADD COLUMN IF NOT EXISTS notes TEXT,
+        ADD COLUMN IF NOT EXISTS message_text TEXT,
+        ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
     `);
 
     await pool.query(`
@@ -222,12 +238,25 @@ async function ensureExpenseTables() {
         vehicle_id    INTEGER NOT NULL,
         step          TEXT NOT NULL,
         title         TEXT,
-        amount        NUMERIC,
+        amount        NUMERIC(12,2),
         odometer      INTEGER,
         notes         TEXT,
         created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
+    `);
+
+    await pool.query(`
+      ALTER TABLE expense_sessions
+        ADD COLUMN IF NOT EXISTS user_whatsapp TEXT,
+        ADD COLUMN IF NOT EXISTS vehicle_id INTEGER,
+        ADD COLUMN IF NOT EXISTS step TEXT,
+        ADD COLUMN IF NOT EXISTS title TEXT,
+        ADD COLUMN IF NOT EXISTS amount NUMERIC(12,2),
+        ADD COLUMN IF NOT EXISTS odometer INTEGER,
+        ADD COLUMN IF NOT EXISTS notes TEXT,
+        ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
     `);
 
     console.log("💸 expense_logs & expense_sessions tables are ready.");
