@@ -2000,17 +2000,8 @@ async function handleEditLastCommand(userWhatsapp, fullText) {
 
 // ====== REPORTS ======
 
-// Simple placeholder fuel/service reports (you can upgrade later if you like)
+// REAL fuel report – current vehicle vs all vehicles
 async function buildFuelReport(userWhatsapp, options = {}) {
-  return "Fuel report coming soon. For now I track fuel entries, but reporting is still being wired.";
-}
-
-async function buildServiceReport(userWhatsapp, options = {}) {
-  return "Service report coming soon. For now I track service entries, but reporting is still being wired.";
-}
-
-// REAL expense report – current vehicle vs all vehicles
-async function buildExpenseReport(userWhatsapp, options = {}) {
   const allVehicles = !!options.allVehicles;
 
   let where = "user_whatsapp = $1";
@@ -2029,27 +2020,28 @@ async function buildExpenseReport(userWhatsapp, options = {}) {
     } else if (vRes.status === "NEED_SET_CURRENT") {
       const listText = formatVehiclesList(vRes.list, true);
       return (
-        "You have multiple vehicles. Please choose which one you want an expense report for.\n\n" +
+        "You have multiple vehicles. Please choose which one you want a fuel report for.\n\n" +
         listText +
-        "\n\nReply with e.g. *switch to 1*, then send *expense report* again."
+        "\n\nReply with e.g. *switch to 1*, then send *fuel report* again."
       );
     }
     vehicle = vRes.vehicle;
     where += " AND vehicle_id = $2";
     params.push(vehicle.id);
-    heading = "📊 *Expense summary – " + vehicle.registration + "*";
+    heading = "📊 *Fuel summary – " + vehicle.registration + "*";
   } else {
-    heading = "📊 *Expense summary – all vehicles*";
+    heading = "📊 *Fuel summary – all vehicles*";
   }
 
   const summaryRes = await pool.query(
     `
     SELECT
-      COUNT(*)::BIGINT AS count,
-      COALESCE(SUM(amount), 0) AS total_amount,
-      MIN(created_at) AS first_at,
-      MAX(created_at) AS last_at
-    FROM expense_logs
+      COUNT(*)::BIGINT           AS count,
+      COALESCE(SUM(total_cost), 0)    AS total_spend,
+      COALESCE(SUM(litres), 0)       AS total_litres,
+      MIN(created_at)            AS first_at,
+      MAX(created_at)            AS last_at
+    FROM fuel_logs
     WHERE ${where}
     `,
     params
@@ -2057,24 +2049,29 @@ async function buildExpenseReport(userWhatsapp, options = {}) {
 
   const row = summaryRes.rows[0] || {};
   const count = parseInt(row.count || "0", 10);
-  const total = parseFloat(row.total_amount || "0");
+  const totalSpend = parseFloat(row.total_spend || "0");
+  const totalLitres = parseFloat(row.total_litres || "0");
 
   if (!count || count === 0) {
     if (allVehicles) {
       return (
         heading +
-        "\n\nYou don't have any expense logs yet.\n\n" +
-        "Start with *expense* to log your first one."
+        "\n\nYou don't have any fuel logs yet.\n\n" +
+        "Start with *fuel* to log your first refill."
       );
     }
     return (
       heading +
-      "\n\nYou don't have any expense logs for your *current vehicle* yet.\n\n" +
-      "Start with *expense* to log your first one."
+      "\n\nYou don't have any fuel logs for your *current vehicle* yet.\n\n" +
+      "Start with *fuel* to log your first refill."
     );
   }
 
-  const avg = total / count;
+  const avgPerFill = totalSpend / count;
+  const avgLitresPerFill = totalLitres > 0 ? totalLitres / count : 0;
+  const avgPricePerLitre =
+    totalLitres > 0 ? totalSpend / totalLitres : 0;
+
   const firstAt = row.first_at ? new Date(row.first_at) : null;
   const lastAt = row.last_at ? new Date(row.last_at) : null;
 
@@ -2083,8 +2080,8 @@ async function buildExpenseReport(userWhatsapp, options = {}) {
 
   const latestRes = await pool.query(
     `
-    SELECT title, amount, odometer, created_at
-    FROM expense_logs
+    SELECT total_cost, litres, price_per_litre, station, odometer, created_at
+    FROM fuel_logs
     WHERE ${where}
     ORDER BY created_at DESC
     LIMIT 5
@@ -2100,33 +2097,45 @@ async function buildExpenseReport(userWhatsapp, options = {}) {
     "* → *" +
     lastStr +
     "*\n" +
-    "Entries: *" +
+    "Refills: *" +
     count +
     "*\n" +
     "Total spend: *" +
-    total.toFixed(0) +
+    totalSpend.toFixed(0) +
     "* KES\n" +
-    "Average per entry: *" +
-    avg.toFixed(0) +
+    "Total litres: *" +
+    totalLitres.toFixed(1) +
+    "* L\n" +
+    "Avg per refill: *" +
+    avgPerFill.toFixed(0) +
+    "* KES\n" +
+    "Avg litres/refill: *" +
+    avgLitresPerFill.toFixed(1) +
+    "* L\n" +
+    "Avg price/litre: *" +
+    avgPricePerLitre.toFixed(1) +
     "* KES\n";
 
   if (latestRes.rows.length > 0) {
-    text += "\n🧾 *Last 5 expenses*:";
-    latestRes.rows.forEach((e) => {
-      const d = e.created_at ? new Date(e.created_at) : null;
+    text += "\n⛽ *Last 5 refills*:";
+    latestRes.rows.forEach((f) => {
+      const d = f.created_at ? new Date(f.created_at) : null;
       const dStr = d ? d.toISOString().slice(0, 10) : "n/a";
-      const title = e.title || "Expense";
-      const amount = e.amount != null ? Number(e.amount) : 0;
+      const amount = f.total_cost != null ? Number(f.total_cost) : 0;
+      const litres = f.litres != null ? Number(f.litres) : 0;
+      const station = f.station || "n/a";
       const odoStr =
-        e.odometer != null ? ` @ *${e.odometer}* km` : "";
+        f.odometer != null ? ` @ *${f.odometer}* km` : "";
 
       text +=
         "\n• " +
         dStr +
         " – *" +
         amount.toFixed(0) +
-        "* KES – " +
-        title +
+        "* KES, *" +
+        litres.toFixed(1) +
+        "* L – " +
+        station +
         odoStr;
     });
   }
@@ -2134,31 +2143,203 @@ async function buildExpenseReport(userWhatsapp, options = {}) {
   if (allVehicles) {
     const byVehicleRes = await pool.query(
       `
-      SELECT v.registration, COALESCE(SUM(e.amount), 0) AS total_amount
-      FROM expense_logs e
-      JOIN vehicles v ON v.id = e.vehicle_id
-      WHERE e.user_whatsapp = $1
+      SELECT v.registration,
+             COALESCE(SUM(f.total_cost), 0) AS total_spend,
+             COALESCE(SUM(f.litres), 0)     AS total_litres
+      FROM fuel_logs f
+      JOIN vehicles v ON v.id = f.vehicle_id
+      WHERE f.user_whatsapp = $1
       GROUP BY v.registration
-      ORDER BY total_amount DESC
+      ORDER BY total_spend DESC
       LIMIT 5
       `,
       [userWhatsapp]
     );
 
     if (byVehicleRes.rows.length > 0) {
-      text += "\n\n🚗 *Top vehicles by expense*:";
+      text += "\n\n🚗 *Top vehicles by fuel spend*:";
       byVehicleRes.rows.forEach((r) => {
         const reg = r.registration || "Vehicle";
-        const t = r.total_amount != null ? Number(r.total_amount) : 0;
+        const t = r.total_spend != null ? Number(r.total_spend) : 0;
+        const l = r.total_litres != null ? Number(r.total_litres) : 0;
         text +=
-          "\n• *" + reg + "* – *" + t.toFixed(0) + "* KES total";
+          "\n• *" +
+          reg +
+          "* – *" +
+          t.toFixed(0) +
+          "* KES, *" +
+          l.toFixed(1) +
+          "* L";
       });
     }
   }
 
   text +=
-    "\n\nYou can log a new expense anytime with *expense*.\n" +
-    "Use *expense report* for the current vehicle, or *expense report all* for your whole fleet.";
+    "\n\nYou can log a new refill anytime with *fuel*.\n" +
+    "Use *fuel report* for the current vehicle, or *fuel report all* for your whole fleet.";
+
+  return text;
+}
+
+// REAL service report – current vehicle vs all vehicles
+async function buildServiceReport(userWhatsapp, options = {}) {
+  const allVehicles = !!options.allVehicles;
+
+  let where = "user_whatsapp = $1";
+  const params = [userWhatsapp];
+  let heading = "";
+  let vehicle = null;
+
+  if (!allVehicles) {
+    const vRes = await ensureCurrentVehicle(userWhatsapp);
+    if (vRes.status === "NO_VEHICLES") {
+      return (
+        "You don't have any vehicles yet.\n\n" +
+        "Add one with:\n" +
+        "*add vehicle KDA 123A*"
+      );
+    } else if (vRes.status === "NEED_SET_CURRENT") {
+      const listText = formatVehiclesList(vRes.list, true);
+      return (
+        "You have multiple vehicles. Please choose which one you want a service report for.\n\n" +
+        listText +
+        "\n\nReply with e.g. *switch to 1*, then send *service report* again."
+      );
+    }
+    vehicle = vRes.vehicle;
+    where += " AND vehicle_id = $2";
+    params.push(vehicle.id);
+    heading = "📊 *Service summary – " + vehicle.registration + "*";
+  } else {
+    heading = "📊 *Service summary – all vehicles*";
+  }
+
+  // NOTE: this assumes your table is called service_logs and has a 'cost' column.
+  // If your column is named differently (e.g. 'amount'), just change SUM(cost) accordingly.
+  const summaryRes = await pool.query(
+    `
+    SELECT
+      COUNT(*)::BIGINT        AS count,
+      COALESCE(SUM(cost), 0)  AS total_cost,
+      MIN(created_at)         AS first_at,
+      MAX(created_at)         AS last_at
+    FROM service_logs
+    WHERE ${where}
+    `,
+    params
+  );
+
+  const row = summaryRes.rows[0] || {};
+  const count = parseInt(row.count || "0", 10);
+  const totalCost = parseFloat(row.total_cost || "0");
+
+  if (!count || count === 0) {
+    if (allVehicles) {
+      return (
+        heading +
+        "\n\nYou don't have any service logs yet.\n\n" +
+        "Start with *service* to log your first one."
+      );
+    }
+    return (
+      heading +
+      "\n\nYou don't have any service logs for your *current vehicle* yet.\n\n" +
+      "Start with *service* to log your first one."
+    );
+  }
+
+  const avgPerService = totalCost / count;
+  const firstAt = row.first_at ? new Date(row.first_at) : null;
+  const lastAt = row.last_at ? new Date(row.last_at) : null;
+
+  const firstStr = firstAt ? firstAt.toISOString().slice(0, 10) : "n/a";
+  const lastStr = lastAt ? lastAt.toISOString().slice(0, 10) : "n/a";
+
+  // NOTE: assumes columns service_type, cost, odometer exist.
+  // If your names differ, tweak to match your table schema.
+  const latestRes = await pool.query(
+    `
+    SELECT service_type, cost, odometer, created_at
+    FROM service_logs
+    WHERE ${where}
+    ORDER BY created_at DESC
+    LIMIT 5
+    `,
+    params
+  );
+
+  let text =
+    heading +
+    "\n\n" +
+    "Period: *" +
+    firstStr +
+    "* → *" +
+    lastStr +
+    "*\n" +
+    "Services: *" +
+    count +
+    "*\n" +
+    "Total service cost: *" +
+    totalCost.toFixed(0) +
+    "* KES\n" +
+    "Average per service: *" +
+    avgPerService.toFixed(0) +
+    "* KES\n";
+
+  if (latestRes.rows.length > 0) {
+    text += "\n🛠️ *Last 5 services*:";
+    latestRes.rows.forEach((s) => {
+      const d = s.created_at ? new Date(s.created_at) : null;
+      const dStr = d ? d.toISOString().slice(0, 10) : "n/a";
+      const type = s.service_type || "Service";
+      const cost = s.cost != null ? Number(s.cost) : 0;
+      const odoStr =
+        s.odometer != null ? ` @ *${s.odometer}* km` : "";
+
+      text +=
+        "\n• " +
+        dStr +
+        " – *" +
+        cost.toFixed(0) +
+        "* KES – " +
+        type +
+        odoStr;
+    });
+  }
+
+  if (allVehicles) {
+    const byVehicleRes = await pool.query(
+      `
+      SELECT v.registration,
+             COALESCE(SUM(s.cost), 0) AS total_cost
+      FROM service_logs s
+      JOIN vehicles v ON v.id = s.vehicle_id
+      WHERE s.user_whatsapp = $1
+      GROUP BY v.registration
+      ORDER BY total_cost DESC
+      LIMIT 5
+      `,
+      [userWhatsapp]
+    );
+
+    if (byVehicleRes.rows.length > 0) {
+      text += "\n\n🚗 *Top vehicles by service cost*:";
+      byVehicleRes.rows.forEach((r) => {
+        const reg = r.registration || "Vehicle";
+        const t = r.total_cost != null ? Number(r.total_cost) : 0;
+        text +=
+          "\n• *" +
+          reg +
+          "* – *" +
+          t.toFixed(0) +
+          "* KES total";
+      });
+    }
+  }
+
+  text +=
+    "\n\nYou can log a new service anytime with *service*.\n" +
+    "Use *service report* for the current vehicle, or *service report all* for your whole fleet.";
 
   return text;
 }
