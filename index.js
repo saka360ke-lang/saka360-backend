@@ -154,15 +154,13 @@ async function ensureVehicleDocumentTables() {
 ensureVehicleDocumentTables();
 
 // Ensure personal_documents & personal_document_sessions tables
-// Ensure personal_documents & personal_document_sessions tables
 async function ensurePersonalDocumentsTables() {
   try {
-    // Base definition (fresh installs)
+    // Base definition (old installs will already have a subset of these columns)
     await pool.query(`
       CREATE TABLE IF NOT EXISTS personal_documents (
         id              SERIAL PRIMARY KEY,
-        owner_whatsapp  TEXT NOT NULL,
-        driver_whatsapp TEXT,
+        user_whatsapp   TEXT NOT NULL,
         driver_id       INTEGER REFERENCES drivers(id) ON DELETE SET NULL,
         doc_title       TEXT NOT NULL,
         doc_type        TEXT,
@@ -176,11 +174,10 @@ async function ensurePersonalDocumentsTables() {
       );
     `);
 
-    // Make sure all expected columns exist even if table was created earlier
+    // Ensure missing columns exist (for older schemas)
     await pool.query(`
       ALTER TABLE personal_documents
-        ADD COLUMN IF NOT EXISTS owner_whatsapp  TEXT,
-        ADD COLUMN IF NOT EXISTS driver_whatsapp TEXT,
+        ADD COLUMN IF NOT EXISTS user_whatsapp   TEXT,
         ADD COLUMN IF NOT EXISTS driver_id       INTEGER REFERENCES drivers(id) ON DELETE SET NULL,
         ADD COLUMN IF NOT EXISTS doc_title       TEXT,
         ADD COLUMN IF NOT EXISTS doc_type        TEXT,
@@ -2681,7 +2678,6 @@ async function savePersonalDocumentSession(session) {
 }
 
 async function startPersonalDocumentSession(userWhatsapp) {
-  // This is for "my document" / driver’s own docs (DL, PSV, TSV, Badge, etc.)
   const insert = await pool.query(
     `
     INSERT INTO personal_document_sessions (
@@ -2689,7 +2685,7 @@ async function startPersonalDocumentSession(userWhatsapp) {
       step,
       status
     )
-    VALUES ($1, 'ask_title', 'ACTIVE')
+    VALUES ($1, 'ASK_TITLE', 'ACTIVE')
     RETURNING *
     `,
     [userWhatsapp]
@@ -2698,7 +2694,7 @@ async function startPersonalDocumentSession(userWhatsapp) {
   const session = insert.rows[0];
 
   const reply =
-    "📄 Let's add your *personal/driver document*.\n\n" +
+    "📄 Let's add your *personal/driver document*.\n" +
     "What document is this?\n" +
     "Examples:\n" +
     "• *DL Main*\n" +
@@ -2709,30 +2705,33 @@ async function startPersonalDocumentSession(userWhatsapp) {
   return { session, reply };
 }
 
-async function handlePersonalDocumentSessionStep(session, userWhatsapp, incomingText) {
+async function handlePersonalDocumentSessionStep(session, from, incomingText) {
   const text = String(incomingText || "").trim();
   const lower = text.toLowerCase();
+  const step = (session.step || "").toUpperCase(); // make step comparison case-insensitive
 
-  // Global cancel for this session
+  // Global cancel within this flow
   if (["cancel", "stop", "reset"].includes(lower)) {
     session.status = "CANCELLED";
+    session.step = "CANCELLED";
     await savePersonalDocumentSession(session);
     return (
-      "✅ I’ve cancelled your personal document entry.\n" +
+      "✅ I’ve cancelled your current personal document entry.\n" +
       "You can start again with *my document*."
     );
   }
 
-  if (session.step === "ask_title") {
+  // STEP: ASK_TITLE
+  if (step === "ASK_TITLE") {
     if (!text) {
       return (
-        "Please tell me the *document name*.\n" +
-        "Examples: *DL Main*, *PSV Badge*, *TSV Certificate*, *ID card*"
+        "Please tell me what this document is.\n" +
+        "Example: *DL Main*, *PSV Badge*, *TSV Licence*, *Good Conduct*"
       );
     }
 
     session.doc_title = text;
-    session.step = "ask_type";
+    session.step = "ASK_TYPE";
     await savePersonalDocumentSession(session);
 
     return (
@@ -2742,14 +2741,15 @@ async function handlePersonalDocumentSessionStep(session, userWhatsapp, incoming
     );
   }
 
-  if (session.step === "ask_type") {
-    if (lower === "skip") {
-      session.doc_type = null;
-    } else {
-      session.doc_type = text;
+  // STEP: ASK_TYPE
+  if (step === "ASK_TYPE") {
+    let docType = text;
+    if (lower === "skip" || !text) {
+      docType = null;
     }
 
-    session.step = "ask_cost";
+    session.doc_type = docType;
+    session.step = "ASK_COST";
     await savePersonalDocumentSession(session);
 
     return (
@@ -2758,14 +2758,24 @@ async function handlePersonalDocumentSessionStep(session, userWhatsapp, incoming
     );
   }
 
-  if (session.step === "ask_cost") {
-    const amount = parseNumber(text);
-    if (isNaN(amount) || amount < 0) {
-      return "That amount doesn't look valid. Please send a number in KES (e.g. *2500* or *0*).";
+  // STEP: ASK_COST
+  if (step === "ASK_COST") {
+    let costAmount = null;
+
+    if (!(lower === "skip" || lower === "0")) {
+      const parsed = parseNumber(text);
+      if (isNaN(parsed) || parsed < 0) {
+        return (
+          "That amount doesn’t look right.\n" +
+          "Please send a number like *3000* or *0* if it was free.\n" +
+          "You can also reply *skip* to leave it blank."
+        );
+      }
+      costAmount = parsed;
     }
 
-    session.cost_amount = amount;
-    session.step = "ask_expiry";
+    session.cost_amount = costAmount;
+    session.step = "ASK_EXPIRY";
     await savePersonalDocumentSession(session);
 
     return (
@@ -2775,22 +2785,24 @@ async function handlePersonalDocumentSessionStep(session, userWhatsapp, incoming
     );
   }
 
-  if (session.step === "ask_expiry") {
-    if (lower === "skip") {
-      session.expiry_date = null;
-    } else {
-      const m = text.match(/^(\d{4})-(\d{2})-(\d{2})$/);
-      if (!m) {
+  // STEP: ASK_EXPIRY
+  if (step === "ASK_EXPIRY") {
+    let expiryDate = null;
+
+    if (lower !== "skip") {
+      const match = text.match(/^\d{4}-\d{2}-\d{2}$/);
+      if (!match) {
         return (
-          "That date doesn't look valid.\n" +
-          "Please send in *YYYY-MM-DD* format (e.g. *2026-01-01*),\n" +
+          "That date doesn’t look right.\n" +
+          "Please send in *YYYY-MM-DD* format, e.g. *2026-01-01*,\n" +
           "or reply *skip* if there is no expiry."
         );
       }
-      session.expiry_date = text;
+      expiryDate = text;
     }
 
-    session.step = "ask_notes";
+    session.expiry_date = expiryDate;
+    session.step = "ASK_NOTES";
     await savePersonalDocumentSession(session);
 
     return (
@@ -2800,48 +2812,58 @@ async function handlePersonalDocumentSessionStep(session, userWhatsapp, incoming
     );
   }
 
-  if (session.step === "ask_notes") {
+  // STEP: ASK_NOTES
+  if (step === "ASK_NOTES") {
+    let notes = text;
     if (lower === "skip") {
-      session.notes = null;
-    } else {
-      session.notes = text;
+      notes = "";
     }
 
-    session.step = "confirm";
+    session.notes = notes;
+    session.step = "CONFIRM";
     await savePersonalDocumentSession(session);
 
-    const titleStr = session.doc_title ? `*${session.doc_title}*` : "_not set_";
-    const typeStr = session.doc_type ? `*${session.doc_type}*` : "_not set_";
-    const costStr =
-      session.cost_amount != null ? `*${session.cost_amount}* KES` : "_not recorded_";
-    const expStr = session.expiry_date ? `*${session.expiry_date}*` : "_none set_";
-    const notesStr = session.notes ? session.notes : "_none_";
+    const title = session.doc_title || "(no title)";
+    const docType = session.doc_type || "n/a";
+    const cost = session.cost_amount != null ? session.cost_amount : null;
+    const expRaw = session.expiry_date || null;
+    const notesText =
+      session.notes && session.notes.trim().length
+        ? session.notes.trim()
+        : "none";
 
-    return (
-      "Please confirm this personal document:\n\n" +
-      "Title: " +
-      titleStr +
-      "\n" +
-      "Type: " +
-      typeStr +
-      "\n" +
-      "Cost: " +
-      costStr +
-      "\n" +
-      "Expiry: " +
-      expStr +
-      "\n" +
-      "Notes: " +
-      notesStr +
-      "\n\n" +
-      "Reply *YES* to save or *NO* to cancel."
-    );
+    let msg =
+      "Please confirm this personal document:\n" +
+      "Title: *" +
+      title +
+      "*\n" +
+      "Type: *" +
+      docType +
+      "*\n";
+
+    if (cost != null) {
+      msg += "Cost: *" + cost.toFixed(2) + "* KES\n";
+    } else {
+      msg += "Cost: *not recorded*\n";
+    }
+
+    if (expRaw) {
+      msg += "Expiry: *" + expRaw + "*\n";
+    } else {
+      msg += "Expiry: *none set*\n";
+    }
+
+    msg += "Notes: " + notesText + "\n";
+    msg += "Reply *YES* to save or *NO* to cancel.";
+
+    return msg;
   }
 
-    if (session.step === "CONFIRM") {
-    // user is deciding YES / NO
+  // STEP: CONFIRM
+  if (step === "CONFIRM") {
     if (lower === "no") {
       session.status = "CANCELLED";
+      session.step = "CANCELLED";
       await savePersonalDocumentSession(session);
       return "Okay, I’ve cancelled this personal document entry. No changes were saved.";
     }
@@ -2850,38 +2872,48 @@ async function handlePersonalDocumentSessionStep(session, userWhatsapp, incoming
       return "Please reply *YES* to save or *NO* to cancel this personal document entry.";
     }
 
-    // lower === "yes" → save to DB
+    // User confirmed → save to personal_documents + optional reminder
     try {
-      const docTitle   = session.doc_title || "(no title)";
-      const docType    = session.doc_type || null;
+      const docTitle = session.doc_title || "(no title)";
+      const docType = session.doc_type || null;
       const costAmount =
         session.cost_amount != null ? session.cost_amount : null;
       const expiryDate = session.expiry_date || null;
-      const notes      = session.notes || null;
+      const notes = session.notes && session.notes.trim().length
+        ? session.notes.trim()
+        : null;
 
-      // Optional: try to map this WhatsApp to a driver row (used for reminders only)
+      // Try link to driver (optional)
       const driver = await findDriverByWhatsapp(from); // may be null
 
-      // IMPORTANT: use user_whatsapp to match your existing DB schema
       const insertRes = await pool.query(
         `
         INSERT INTO personal_documents (
           user_whatsapp,
+          driver_id,
           doc_title,
           doc_type,
           cost_amount,
           expiry_date,
           notes
         )
-        VALUES ($1,$2,$3,$4,$5,$6)
+        VALUES ($1,$2,$3,$4,$5,$6,$7)
         RETURNING id
         `,
-        [from, docTitle, docType, costAmount, expiryDate, notes]
+        [
+          from,
+          driver ? driver.id : null,
+          docTitle,
+          docType,
+          costAmount,
+          expiryDate,
+          notes,
+        ]
       );
 
       const personalDocId = insertRes.rows[0].id;
 
-      // If we have an expiry date, create a reminder linked to this driver (if found)
+      // Create reminder if expiry is set
       if (expiryDate) {
         try {
           const remRes = await pool.query(
@@ -2905,26 +2937,17 @@ async function handlePersonalDocumentSessionStep(session, userWhatsapp, incoming
               expiryDate,
             ]
           );
-
           const reminderId = remRes.rows[0].id;
 
-          // Try to update personal_documents.reminder_id if that column exists
-          try {
-            await pool.query(
-              `
-              UPDATE personal_documents
-              SET reminder_id = $1,
-                  updated_at = NOW()
-              WHERE id = $2
-              `,
-              [reminderId, personalDocId]
-            );
-          } catch (err) {
-            console.warn(
-              "⚠️ Could not update reminder_id on personal_documents (column may not exist):",
-              err.message
-            );
-          }
+          await pool.query(
+            `
+            UPDATE personal_documents
+            SET reminder_id = $1,
+                updated_at = NOW()
+            WHERE id = $2
+            `,
+            [reminderId, personalDocId]
+          );
         } catch (err) {
           console.warn(
             "⚠️ Could not insert reminder for personal document:",
@@ -2933,33 +2956,29 @@ async function handlePersonalDocumentSessionStep(session, userWhatsapp, incoming
         }
       }
 
-      // Mark the session as done
       session.status = "DONE";
+      session.step = "DONE";
       await savePersonalDocumentSession(session);
 
-      const expShort = expiryDate ? String(expiryDate).slice(5, 10) : null;
+      const expShort = expiryDate ? String(expiryDate).slice(0, 10) : "none";
 
       let doneMsg =
         "✅ Personal document saved.\n\n" +
-        "Title: *" + docTitle + "*\n" +
-        "Type: *" + (docType || "n/a") + "*\n";
+        "Title: *" +
+        docTitle +
+        "*\n" +
+        "Type: *" +
+        (docType || "n/a") +
+        "*\n";
 
       if (costAmount != null) {
         doneMsg += "Cost: *" + costAmount + "* KES\n";
-      } else {
-        doneMsg += "Cost: *not recorded*\n";
       }
 
-      if (expShort) {
-        doneMsg += "Expiry: *" + expShort + "*\n";
-      } else if (expiryDate) {
-        doneMsg += "Expiry: *" + String(expiryDate).slice(0, 10) + "*\n";
-      } else {
-        doneMsg += "Expiry: *none set*\n";
-      }
+      doneMsg += "Expiry: *" + expShort + "*\n";
 
-      if (notes && notes.trim().length) {
-        doneMsg += "Notes: " + notes.trim() + "\n";
+      if (notes) {
+        doneMsg += "Notes: " + notes + "\n";
       }
 
       doneMsg +=
@@ -2969,24 +2988,28 @@ async function handlePersonalDocumentSessionStep(session, userWhatsapp, incoming
     } catch (err) {
       console.error("❌ Error saving personal document:", err.message);
       session.status = "ERROR";
+      session.step = "ERROR";
       await savePersonalDocumentSession(session);
       return (
-        "Sorry, I couldn't save that personal document due to a system error.\n" +
+        "Sorry, I couldn't save that document due to a system error.\n" +
         "Please try again later."
       );
     }
   }
 
-  console.warn("⚠️ Personal document session in unknown step:", session.step);
+  // Fallback for any unexpected step
+  console.warn(
+    "⚠️ Personal document session in unknown step:",
+    session.step
+  );
   session.status = "ERROR";
+  session.step = "ERROR";
   await savePersonalDocumentSession(session);
   return (
     "Something went wrong with this personal document.\n" +
     "Please start again with *my document*."
   );
 }
-
-
 
 // ====== SERVICE SESSION HELPERS ====== (unchanged from your version – kept for brevity)
 // ... [SERVICE helpers from your current file stay exactly as-is here]
