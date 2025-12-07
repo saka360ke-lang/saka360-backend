@@ -2838,119 +2838,140 @@ async function handlePersonalDocumentSessionStep(session, userWhatsapp, incoming
     );
   }
 
-  if (session.step === "confirm") {
-    if (["no", "n"].includes(lower)) {
+    if (session.step === "CONFIRM") {
+    // user is deciding YES / NO
+    if (lower === "no") {
       session.status = "CANCELLED";
       await savePersonalDocumentSession(session);
-      return (
-        "Okay, I’ve *cancelled* that personal document.\n" +
-        "You can start again with *my document*."
-      );
+      return "Okay, I’ve cancelled this personal document entry. No changes were saved.";
     }
 
-    if (!["yes", "y"].includes(lower)) {
-      const titleStr = session.doc_title ? `*${session.doc_title}*` : "_not set_";
-      const typeStr = session.doc_type ? `*${session.doc_type}*` : "_not set_";
-      const costStr =
-        session.cost_amount != null ? `*${session.cost_amount}* KES` : "_not recorded_";
-      const expStr = session.expiry_date ? `*${session.expiry_date}*` : "_none set_";
-      const notesStr = session.notes ? session.notes : "_none_";
-
-      return (
-        "Please confirm this personal document:\n\n" +
-        "Title: " +
-        titleStr +
-        "\n" +
-        "Type: " +
-        typeStr +
-        "\n" +
-        "Cost: " +
-        costStr +
-        "\n" +
-        "Expiry: " +
-        expStr +
-        "\n" +
-        "Notes: " +
-        notesStr +
-        "\n\n" +
-        "Reply *YES* to save or *NO* to cancel."
-      );
+    if (lower !== "yes") {
+      return "Please reply *YES* to save or *NO* to cancel this personal document entry.";
     }
 
-    // YES → save to personal_documents
+    // lower === "yes" → save to DB
     try {
-      let driverId = null;
-      let driverWhatsapp = userWhatsapp;
+      const docTitle   = session.doc_title || "(no title)";
+      const docType    = session.doc_type || null;
+      const costAmount =
+        session.cost_amount != null ? session.cost_amount : null;
+      const expiryDate = session.expiry_date || null;
+      const notes      = session.notes || null;
 
-      // If this WhatsApp has a driver profile, attach it
-      const driver = await findDriverByWhatsapp(userWhatsapp);
-      if (driver) {
-        driverId = driver.id;
-        driverWhatsapp = driver.driver_whatsapp || userWhatsapp;
-      }
+      // Optional: try to map this WhatsApp to a driver row (used for reminders only)
+      const driver = await findDriverByWhatsapp(from); // may be null
 
-      await pool.query(
+      // IMPORTANT: use user_whatsapp to match your existing DB schema
+      const insertRes = await pool.query(
         `
         INSERT INTO personal_documents (
-          owner_whatsapp,
-          driver_whatsapp,
-          driver_id,
+          user_whatsapp,
           doc_title,
           doc_type,
           cost_amount,
-          currency,
           expiry_date,
           notes
         )
-        VALUES ($1, $2, $3, $4, $5, $6, 'KES', $7, $8)
+        VALUES ($1,$2,$3,$4,$5,$6)
+        RETURNING id
         `,
-        [
-          userWhatsapp,
-          driverWhatsapp,
-          driverId,
-          session.doc_title || null,
-          session.doc_type || null,
-          session.cost_amount != null ? session.cost_amount : null,
-          session.expiry_date || null,
-          session.notes || null,
-        ]
+        [from, docTitle, docType, costAmount, expiryDate, notes]
       );
 
-      session.status = "COMPLETED";
+      const personalDocId = insertRes.rows[0].id;
+
+      // If we have an expiry date, create a reminder linked to this driver (if found)
+      if (expiryDate) {
+        try {
+          const remRes = await pool.query(
+            `
+            INSERT INTO reminders (
+              user_whatsapp,
+              driver_id,
+              reminder_type,
+              label,
+              due_date,
+              is_done
+            )
+            VALUES ($1,$2,$3,$4,$5,FALSE)
+            RETURNING id
+            `,
+            [
+              from,
+              driver ? driver.id : null,
+              "personal_document",
+              docTitle,
+              expiryDate,
+            ]
+          );
+
+          const reminderId = remRes.rows[0].id;
+
+          // Try to update personal_documents.reminder_id if that column exists
+          try {
+            await pool.query(
+              `
+              UPDATE personal_documents
+              SET reminder_id = $1,
+                  updated_at = NOW()
+              WHERE id = $2
+              `,
+              [reminderId, personalDocId]
+            );
+          } catch (err) {
+            console.warn(
+              "⚠️ Could not update reminder_id on personal_documents (column may not exist):",
+              err.message
+            );
+          }
+        } catch (err) {
+          console.warn(
+            "⚠️ Could not insert reminder for personal document:",
+            err.message
+          );
+        }
+      }
+
+      // Mark the session as done
+      session.status = "DONE";
       await savePersonalDocumentSession(session);
 
-      const titleStr = session.doc_title ? `*${session.doc_title}*` : "_not set_";
-      const typeStr = session.doc_type ? `*${session.doc_type}*` : "_not set_";
-      const costStr =
-        session.cost_amount != null ? `*${session.cost_amount}* KES` : "_not recorded_";
-      const expStr = session.expiry_date ? `*${session.expiry_date}*` : "_none set_";
-      const notesStr = session.notes ? session.notes : "_none_";
+      const expShort = expiryDate ? String(expiryDate).slice(5, 10) : null;
 
-      return (
+      let doneMsg =
         "✅ Personal document saved.\n\n" +
-        "Title: " +
-        titleStr +
-        "\n" +
-        "Type: " +
-        typeStr +
-        "\n" +
-        "Cost: " +
-        costStr +
-        "\n" +
-        "Expiry: " +
-        expStr +
-        "\n" +
-        "Notes: " +
-        notesStr +
-        "\n\n" +
-        "I'll keep this in your personal/driver compliance records."
-      );
+        "Title: *" + docTitle + "*\n" +
+        "Type: *" + (docType || "n/a") + "*\n";
+
+      if (costAmount != null) {
+        doneMsg += "Cost: *" + costAmount + "* KES\n";
+      } else {
+        doneMsg += "Cost: *not recorded*\n";
+      }
+
+      if (expShort) {
+        doneMsg += "Expiry: *" + expShort + "*\n";
+      } else if (expiryDate) {
+        doneMsg += "Expiry: *" + String(expiryDate).slice(0, 10) + "*\n";
+      } else {
+        doneMsg += "Expiry: *none set*\n";
+      }
+
+      if (notes && notes.trim().length) {
+        doneMsg += "Notes: " + notes.trim() + "\n";
+      }
+
+      doneMsg +=
+        "\nI’ll include this in your *personal compliance* and reminder summaries.";
+
+      return doneMsg;
     } catch (err) {
       console.error("❌ Error saving personal document:", err.message);
       session.status = "ERROR";
       await savePersonalDocumentSession(session);
       return (
-        "Sorry, I couldn't save that document due to a system error.\n" +
+        "Sorry, I couldn't save that personal document due to a system error.\n" +
         "Please try again later."
       );
     }
