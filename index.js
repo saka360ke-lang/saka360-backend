@@ -154,13 +154,15 @@ async function ensureVehicleDocumentTables() {
 ensureVehicleDocumentTables();
 
 // Ensure personal_documents & personal_document_sessions tables
+// Ensure personal_documents & personal_document_sessions tables
 async function ensurePersonalDocumentsTables() {
   try {
+    // Base definition (fresh installs)
     await pool.query(`
       CREATE TABLE IF NOT EXISTS personal_documents (
         id              SERIAL PRIMARY KEY,
         owner_whatsapp  TEXT NOT NULL,
-        driver_whatsapp TEXT NOT NULL,
+        driver_whatsapp TEXT,
         driver_id       INTEGER REFERENCES drivers(id) ON DELETE SET NULL,
         doc_title       TEXT NOT NULL,
         doc_type        TEXT,
@@ -172,6 +174,23 @@ async function ensurePersonalDocumentsTables() {
         created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
+    `);
+
+    // Make sure all expected columns exist even if table was created earlier
+    await pool.query(`
+      ALTER TABLE personal_documents
+        ADD COLUMN IF NOT EXISTS owner_whatsapp  TEXT,
+        ADD COLUMN IF NOT EXISTS driver_whatsapp TEXT,
+        ADD COLUMN IF NOT EXISTS driver_id       INTEGER REFERENCES drivers(id) ON DELETE SET NULL,
+        ADD COLUMN IF NOT EXISTS doc_title       TEXT,
+        ADD COLUMN IF NOT EXISTS doc_type        TEXT,
+        ADD COLUMN IF NOT EXISTS cost_amount     NUMERIC(12,2),
+        ADD COLUMN IF NOT EXISTS currency        TEXT NOT NULL DEFAULT 'KES',
+        ADD COLUMN IF NOT EXISTS expiry_date     DATE,
+        ADD COLUMN IF NOT EXISTS notes           TEXT,
+        ADD COLUMN IF NOT EXISTS reminder_id     INTEGER REFERENCES reminders(id) ON DELETE SET NULL,
+        ADD COLUMN IF NOT EXISTS created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        ADD COLUMN IF NOT EXISTS updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW();
     `);
 
     await pool.query(`
@@ -188,6 +207,20 @@ async function ensurePersonalDocumentsTables() {
         created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
+    `);
+
+    await pool.query(`
+      ALTER TABLE personal_document_sessions
+        ADD COLUMN IF NOT EXISTS user_whatsapp   TEXT,
+        ADD COLUMN IF NOT EXISTS step            TEXT,
+        ADD COLUMN IF NOT EXISTS status          TEXT NOT NULL DEFAULT 'ACTIVE',
+        ADD COLUMN IF NOT EXISTS doc_title       TEXT,
+        ADD COLUMN IF NOT EXISTS doc_type        TEXT,
+        ADD COLUMN IF NOT EXISTS cost_amount     NUMERIC(12,2),
+        ADD COLUMN IF NOT EXISTS expiry_date     DATE,
+        ADD COLUMN IF NOT EXISTS notes           TEXT,
+        ADD COLUMN IF NOT EXISTS created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        ADD COLUMN IF NOT EXISTS updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW();
     `);
 
     console.log("📄 personal_documents & personal_document_sessions tables are ready.");
